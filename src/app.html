@@ -16,7 +16,7 @@
       <button class="today-btn" id="todayBtn" hidden>Сегодня</button>
       <button class="icon-btn" id="nextMonth" aria-label="Следующий месяц" data-icon="ChevronRight"></button>
     </nav>
-    <button class="btn btn-primary" id="addBtn"><span data-icon="Plus"></span>Новая операция</button>
+    <button class="btn btn-primary" id="addBtn" aria-label="Новая операция"><span data-icon="Plus"></span>Новая операция</button>
   </header>
 
   <div class="notice" id="notice" hidden></div>
@@ -117,7 +117,7 @@
       <button type="button" class="btn btn-sm btn-danger-solid" id="txConfirmYes">Удалить</button>
     </div>
     <div class="dlg-foot">
-      <button type="button" class="btn btn-danger" id="txDelete" hidden><span data-icon="Trash2"></span>Удалить</button>
+      <button type="button" class="btn btn-danger" id="txDelete" aria-label="Удалить операцию" hidden><span data-icon="Trash2"></span>Удалить</button>
       <span class="spacer"></span>
       <button type="button" class="btn btn-quiet" data-close>Отмена</button>
       <button type="submit" class="btn btn-primary" id="txSave">Сохранить</button>
@@ -142,7 +142,7 @@
     <p class="hint">Прогресс складывается из этой суммы и всех операций «В копилку».</p>
     <p class="err" id="goalErr" hidden></p>
     <div class="dlg-foot">
-      <button type="button" class="btn btn-danger" id="goalDelete" hidden><span data-icon="Trash2"></span>Убрать цель</button>
+      <button type="button" class="btn btn-danger" id="goalDelete" aria-label="Убрать цель" hidden><span data-icon="Trash2"></span>Убрать цель</button>
       <span class="spacer"></span>
       <button type="button" class="btn btn-quiet" data-close>Отмена</button>
       <button type="submit" class="btn btn-primary">Сохранить</button>

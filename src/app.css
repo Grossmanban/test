@@ -438,13 +438,13 @@ dialog {
   overflow-y: auto; overscroll-behavior: contain;
 }
 dialog::backdrop { background: rgba(5, 14, 11, 0.5); }
-.dlg { --dlg-pt: 22px; --dlg-px: 22px; --dlg-pb: 22px; display: grid; gap: 18px; padding: var(--dlg-pt) var(--dlg-px) var(--dlg-pb); }
+.dlg { --dlg-pt: 22px; --dlg-px: 22px; --dlg-pb: 22px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; padding: var(--dlg-pt) var(--dlg-px) var(--dlg-pb); }
 .dlg-head {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   position: sticky; top: 0; z-index: 2; background: var(--surface);
   margin: calc(-1 * var(--dlg-pt)) calc(-1 * var(--dlg-px)) -8px; padding: var(--dlg-pt) var(--dlg-px) 8px;
 }
-.dlg-head h2 { margin: 0; font-family: var(--font-display); font-size: 17px; font-weight: 600; }
+.dlg-head h2 { margin: 0; min-width: 0; font-family: var(--font-display); font-size: 17px; font-weight: 600; overflow-wrap: anywhere; -webkit-hyphens: auto; hyphens: auto; }
 .dlg-kb-save { display: none; margin-left: auto; }
 @media (pointer: coarse) { dialog.kb-open .dlg-kb-save { display: inline-flex; } }
 .field { display: grid; gap: 6px; min-width: 0; }
@@ -559,15 +559,10 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
   .main { grid-template-columns: minmax(0, 1fr) minmax(0, 300px); grid-template-areas: "ledger side"; }
   .side { grid-template-columns: minmax(0, 1fr); }
 }
-@media (min-width: 641px) and (max-width: 799.98px) {
+@media (min-width: 641px) and (max-width: 1023.98px) {
   #addBtn { order: 2; }
   .month-nav { order: 3; flex: 1 1 100%; justify-content: space-between; }
   .month-label { flex: 1; }
-}
-@media (min-width: 800px) and (max-width: 960px) {
-  .topbar { column-gap: 14px; }
-  .brand p { display: none; }
-  .month-label { min-width: 128px; }
 }
 @media (max-width: 640px) {
   .app { padding-block: 14px 104px; gap: 14px; }
@@ -611,6 +606,9 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
   .dlg-head h2 { font-size: 16px; }
   .toast { bottom: calc(90px + env(safe-area-inset-bottom, 0px)); }
 }
+@media (max-width: 413.98px) {
+  .dlg-foot > .btn-danger { width: 44px; padding: 0; gap: 0; font-size: 0; }
+}
 @media (max-width: 360px) {
   .kpi { padding: 14px 12px; }
   .kpi-value { font-size: 18px; overflow-wrap: normal; white-space: nowrap; }
@@ -640,7 +638,7 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
     background: var(--bg); background: color-mix(in srgb, var(--bg) 86%, transparent);
     -webkit-backdrop-filter: blur(16px) saturate(1.5); backdrop-filter: blur(16px) saturate(1.5);
   }
-  #addBtn { order: 0; }
+  #addBtn { order: 0; width: 44px; padding: 0; gap: 0; font-size: 0; }
   .month-nav { order: 0; flex: none; }
   .brand > div { min-width: 0; }
   .brand h1 { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

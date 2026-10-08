@@ -351,7 +351,7 @@
     const dayCut = isCur ? Number(TODAY.slice(8, 10)) : 31;
     const st = monthStats(ym);
     const prev = monthStats(prevYm, isCur ? dayCut : 31);
-    const cmp = isCur ? `к 1–${Math.min(dayCut, daysIn(prevYm))} ${M_GEN[pm - 1]}` : `к ${M_DAT[pm - 1]}`;
+    const cmp = isCur ? `к${NB}1–\u2060${Math.min(dayCut, daysIn(prevYm))}${NB}${M_GEN[pm - 1]}` : `к${NB}${M_DAT[pm - 1]}`;
     const v = x => ready ? x : "—";
     const rate = st.inc > 0 ? Math.round(st.sav / st.inc * 100) : null;
     el.innerHTML = `
@@ -460,7 +460,7 @@
     if (g.deadline) {
       const mLeft = monthsBetween(CUR_YM, g.deadline);
       const [dy, dm] = dParts(g.deadline);
-      deadlineHtml = `${dParts(g.deadline)[2]} ${M_GEN[dm - 1]} ${dy}<small>${mLeft > 0 ? `осталось ${mLeft} мес.` : "срок наступил"}</small>`;
+      deadlineHtml = `${dParts(g.deadline)[2]} ${M_GEN[dm - 1]} ${dy}<small>${mLeft > 0 ? `осталось ${mLeft}${NB}мес.` : "срок наступил"}</small>`;
       if (left > 0 && mLeft > 0) {
         const leftAtMonthStart = r2(Math.max(0, g.target - (saved - thisMonthSaved)));
         perMonth = Math.ceil(leftAtMonthStart / mLeft / 100) * 100;
