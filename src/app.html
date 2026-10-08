@@ -1,0 +1,199 @@
+<div class="app">
+  <header class="topbar">
+    <div class="brand-row">
+      <div class="brand">
+        <div class="brand-mark" data-icon="Wallet"></div>
+        <div>
+          <h1>Домашняя бухгалтерия</h1>
+          <p>Доходы, расходы и цель накоплений в рублях</p>
+        </div>
+      </div>
+      <div class="top-tools" id="pwaTop"></div>
+    </div>
+    <nav class="month-nav" aria-label="Выбор месяца">
+      <button class="icon-btn" id="prevMonth" aria-label="Предыдущий месяц" data-icon="ChevronLeft"></button>
+      <div class="month-label" id="monthLabel" aria-live="polite">—</div>
+      <button class="today-btn" id="todayBtn" hidden>Сегодня</button>
+      <button class="icon-btn" id="nextMonth" aria-label="Следующий месяц" data-icon="ChevronRight"></button>
+    </nav>
+    <button class="btn btn-primary" id="addBtn"><span data-icon="Plus"></span>Новая операция</button>
+  </header>
+
+  <div class="notice" id="notice" hidden></div>
+  <div id="pwaBanner"></div>
+
+  <section class="overview" aria-label="Сводка">
+    <article class="balance-card" id="balanceCard">
+      <canvas id="guilloche" aria-hidden="true"></canvas>
+      <div class="bc-top">
+        <span class="bc-label" id="bcLabel">Остаток на счёте</span>
+        <button class="bc-edit" id="editStart" aria-label="Изменить начальный остаток"><span data-icon="Pencil"></span><span class="bc-edit-text">Начальный остаток</span></button>
+      </div>
+      <p class="bc-amount" id="bcAmount">—</p>
+      <div class="bc-sub" id="bcSub"></div>
+      <div class="spark" id="spark">
+        <svg id="sparkSvg" role="img" aria-label="Остаток по дням месяца"></svg>
+        <div class="spark-axis" id="sparkAxis"></div>
+      </div>
+    </article>
+    <div class="kpis" id="kpis"></div>
+  </section>
+
+  <div class="main">
+    <section class="card ledger" aria-labelledby="ledgerTitle">
+      <div class="card-head">
+        <div>
+          <h2 id="ledgerTitle">Операции</h2>
+          <p class="meta" id="ledgerMeta">—</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="seg" role="group" aria-label="Тип операций" id="typeFilter">
+          <button aria-pressed="true" data-f="all">Все</button>
+          <button aria-pressed="false" data-f="income">Доходы</button>
+          <button aria-pressed="false" data-f="expense">Расходы</button>
+          <button aria-pressed="false" data-f="saving">Копилка</button>
+        </div>
+        <label class="search">
+          <span class="sr">Поиск по операциям</span>
+          <span data-icon="Search"></span>
+          <input id="search" type="search" placeholder="Поиск: такси, 1500" enterkeyhint="search" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off">
+        </label>
+        <span id="catChipSlot"></span>
+      </div>
+      <div id="ledgerBody"></div>
+    </section>
+
+    <aside class="side">
+      <section class="card" aria-labelledby="catTitle">
+        <div class="card-head">
+          <div>
+            <h2 id="catTitle">Расходы по категориям</h2>
+            <div class="cat-total num" id="catTotal">—</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="limitsBtn"><span data-icon="SlidersHorizontal"></span>Лимиты</button>
+        </div>
+        <div id="planLine"></div>
+        <div class="cat-list" id="catList"></div>
+      </section>
+
+      <section class="card" aria-labelledby="goalTitle" id="goalCard"></section>
+    </aside>
+  </div>
+</div>
+
+<button class="btn btn-primary fab" id="fab" aria-label="Новая операция"><span data-icon="Plus"></span>Операция</button>
+
+<!-- Transaction dialog -->
+<dialog id="txDlg" aria-labelledby="txDlgTitle">
+  <form class="dlg" id="txForm" novalidate>
+    <div class="dlg-head">
+      <h2 id="txDlgTitle">Новая операция</h2>
+      <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
+      <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
+    </div>
+    <div class="seg seg-wide" role="radiogroup" aria-label="Тип операции">
+      <label><input type="radio" name="type" value="expense" id="tExp"><span><span data-icon="ArrowUpRight"></span>Расход</span></label>
+      <label><input type="radio" name="type" value="income" id="tInc"><span><span data-icon="ArrowDownLeft"></span>Доход</span></label>
+      <label><input type="radio" name="type" value="saving" id="tSav"><span><span data-icon="PiggyBank"></span>В копилку</span></label>
+    </div>
+    <label class="field">
+      <span>Сумма</span>
+      <div class="money-input amount-big"><input class="input num" id="txAmount" inputmode="decimal" autocomplete="off" placeholder="0"></div>
+    </label>
+    <fieldset id="catField">
+      <legend class="legend">Категория</legend>
+      <div class="chips" id="catChips"></div>
+    </fieldset>
+    <p class="hint" id="savingHint" hidden></p>
+    <div class="row2">
+      <label class="field"><span>Дата</span><input class="input" type="date" id="txDate" required></label>
+      <label class="field"><span>Комментарий</span><input class="input" id="txNote" maxlength="80" enterkeyhint="done" autocomplete="off" placeholder="Например: продукты на неделю"></label>
+    </div>
+    <p class="err" id="txErr" hidden></p>
+    <div class="confirm" id="txConfirm" hidden>
+      <span>Удалить операцию без возможности вернуть?</span><span class="spacer"></span>
+      <button type="button" class="btn btn-sm btn-quiet" id="txConfirmNo">Оставить</button>
+      <button type="button" class="btn btn-sm btn-danger-solid" id="txConfirmYes">Удалить</button>
+    </div>
+    <div class="dlg-foot">
+      <button type="button" class="btn btn-danger" id="txDelete" hidden><span data-icon="Trash2"></span>Удалить</button>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-quiet" data-close>Отмена</button>
+      <button type="submit" class="btn btn-primary" id="txSave">Сохранить</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Goal dialog -->
+<dialog id="goalDlg" aria-labelledby="goalDlgTitle">
+  <form class="dlg" id="goalForm" novalidate>
+    <div class="dlg-head">
+      <h2 id="goalDlgTitle">Цель накоплений</h2>
+      <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
+      <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
+    </div>
+    <label class="field"><span>На что копите</span><input class="input" id="gName" maxlength="60" placeholder="Например: подушка безопасности" autocomplete="off"></label>
+    <div class="row2">
+      <label class="field"><span>Нужная сумма</span><div class="money-input"><input class="input num" id="gTarget" inputmode="decimal" autocomplete="off" placeholder="300 000"></div></label>
+      <label class="field"><span>Срок (необязательно)</span><input class="input" type="date" id="gDeadline"></label>
+    </div>
+    <label class="field"><span>Уже отложено до начала учёта</span><div class="money-input"><input class="input num" id="gInitial" inputmode="decimal" autocomplete="off" placeholder="0"></div></label>
+    <p class="hint">Прогресс складывается из этой суммы и всех операций «В копилку».</p>
+    <p class="err" id="goalErr" hidden></p>
+    <div class="dlg-foot">
+      <button type="button" class="btn btn-danger" id="goalDelete" hidden><span data-icon="Trash2"></span>Убрать цель</button>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-quiet" data-close>Отмена</button>
+      <button type="submit" class="btn btn-primary">Сохранить</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Limits dialog -->
+<dialog id="limitsDlg" aria-labelledby="limitsDlgTitle">
+  <form class="dlg" id="limitsForm" novalidate>
+    <div class="dlg-head">
+      <div>
+        <h2 id="limitsDlgTitle">Лимиты на месяц</h2>
+        <p class="hint" style="margin-top:4px">Пустое поле — без лимита. Лимиты действуют для каждого месяца.</p>
+      </div>
+      <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
+      <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
+    </div>
+    <div class="limit-list" id="limitList"></div>
+    <p class="err" id="limitsErr" hidden></p>
+    <div class="dlg-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-quiet" data-close>Отмена</button>
+      <button type="submit" class="btn btn-primary">Сохранить лимиты</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Start balance dialog -->
+<dialog id="startDlg" aria-labelledby="startDlgTitle">
+  <form class="dlg" id="startForm" novalidate>
+    <div class="dlg-head">
+      <h2 id="startDlgTitle">Начальный остаток</h2>
+      <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
+      <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
+    </div>
+    <div class="seg seg-wide seg-2" role="radiogroup" aria-label="Знак остатка">
+      <label><input type="radio" name="startSign" value="1" checked><span>Есть на счёте</span></label>
+      <label><input type="radio" name="startSign" value="-1"><span>Долг (минус)</span></label>
+    </div>
+    <label class="field"><span>Сумма до первой записи</span><div class="money-input amount-big"><input class="input num" id="startAmount" inputmode="decimal" autocomplete="off" placeholder="0"></div></label>
+    <p class="hint">От этой суммы считается остаток после каждой операции.</p>
+    <p class="err" id="startErr" hidden></p>
+    <div class="dlg-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-quiet" data-close>Отмена</button>
+      <button type="submit" class="btn btn-primary">Сохранить</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden></div>
+<div class="sr" id="live" role="status" aria-live="polite"></div>
+<div class="tip" id="tip" hidden></div>
