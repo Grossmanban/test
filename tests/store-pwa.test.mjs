@@ -46,7 +46,7 @@ class Device {
   get sync() { return this.snap.sync; }
   kv() { return this.win.idb.dump(); }
   async signIn(email, pw = PW) { await this.store.sync.signIn(email, pw); await this.store.sync.syncNow(); return this; }
-  client() { return this.server.clients.filter(c => c.win === this.win).at(-1); }
+  client() { return this.server.clients.filter(c => c.win === this.win && c.options.auth.storageKey === "budget-pwa-auth").at(-1); }
 }
 const tx = (over = {}) => ({ type: "expense", amount: 100, category: "groceries", note: "", date: "2026-10-08", createdAt: 1, ...over });
 const without = (o, ...keys) => { const c = { ...o }; for (const k of keys) delete c[k]; return c; };
@@ -133,10 +133,12 @@ test("first run seeds the example budget as device-only records", async () => {
   assert.equal(d.kv().tx.ex01.localOnly, true);
   assert.equal(d.sync.pending, 0);
 
-  // editing an example (the UI drops the flag) makes it a normal record
-  await d.store.saveTx("ex02", without(d.find("ex02"), "id", "example"));
-  assert.deepEqual([d.kv().tx.ex02.localOnly, d.kv().tx.ex02.dirty], [false, true]);
-  assert.equal(d.find("ex02").example, undefined);
+  // editing an example (the UI drops the flag) makes it a normal record with an id of its own
+  const own = await d.store.saveTx("ex02", without(d.find("ex02"), "id", "example"));
+  assert.notEqual(own, "ex02");
+  assert.equal(d.kv().tx.ex02, undefined);
+  assert.deepEqual([d.kv().tx[own].localOnly, d.kv().tx[own].dirty], [false, true]);
+  assert.equal(d.find(own).example, undefined);
   assert.equal(d.sync.pending, 1);
 
   // "Удалить пример": examples deleted, example settings reset to defaults → still device-only
@@ -148,7 +150,7 @@ test("first run seeds the example budget as device-only records", async () => {
 
   // the example is not seeded again on the next start
   await d.restart();
-  assert.deepEqual(d.ids(), ["ex02"]);
+  assert.deepEqual(d.ids(), [own]);
 });
 
 test("no BudgetSeed: starts empty; the real src/seed.js seeds a valid example", async () => {
@@ -237,7 +239,7 @@ test("two tabs on one IndexedDB do not overwrite each other", async () => {
 test("configure() validates the project URL and key; config.js wins over the device", async () => {
   const server = createFakeSupabase();
   const d = await new Device({ server, config: "none" }).ready();
-  assert.deepEqual(without(d.sync, "lastSyncAt"), { available: true, configured: false, url: "", configSource: "none", user: null, phase: "off", pending: 0, error: null, recovery: false });
+  assert.deepEqual(without(d.sync, "lastSyncAt"), { available: true, configured: false, url: "", configSource: "none", user: null, phase: "off", pending: 0, error: null, recovery: false, link: null, pendingLink: null });
 
   await rejects(d.store.sync.configure({ url: "", anonKey: FAKE_ANON_KEY }), "invalid", /адрес проекта/i);
   await rejects(d.store.sync.configure({ url: "http://fake.supabase.co", anonKey: FAKE_ANON_KEY }), "invalid", /https:\/\//);
@@ -253,7 +255,7 @@ test("configure() validates the project URL and key; config.js wins over the dev
   assert.equal(d.sync.configSource, "device");
   assert.deepEqual(JSON.parse(d.win.localStorage.getItem("budget-pwa-supabase")), { url: FAKE_URL, anonKey: FAKE_ANON_KEY });
   const c = d.client();
-  assert.deepEqual(c.options, { auth: { flowType: "implicit", persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storageKey: "budget-pwa-auth" } });
+  assert.deepEqual(c.options, { auth: { flowType: "implicit", persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, storageKey: "budget-pwa-auth" } });
 
   await d.restart();                                         // device config is remembered
   assert.equal(d.sync.configSource, "device");
@@ -319,23 +321,103 @@ test("auth errors map to codes and Russian messages", async () => {
   assert.equal(o.sync.user.email, "bob@example.com");
 });
 
-test("password recovery link sets sync.recovery until the new password is saved", async () => {
+test("password recovery link: the new password is set through the link's own session; the device is not signed into it", async () => {
   const server = createFakeSupabase();
   server.addUser("anna@example.com");
   const link = server.recoveryLink("anna@example.com");
+  const linkToken = new URLSearchParams(link.slice(1)).get("access_token");
   const d = await new Device({ server, href: "https://app.example/budget/" + link }).ready();
   await waitFor(() => d.sync.recovery === true, { what: "recovery flag" });
-  assert.equal(d.sync.user.email, "anna@example.com");
-  assert.equal(d.win.location.hash, "");
+  assert.equal(d.sync.user, null, "the link's account is not adopted");
+  assert.deepEqual(d.sync.link, { type: "recovery", email: "anna@example.com" });
+  assert.equal(d.win.location.hash, "", "tokens leave the URL");
+  assert.equal(d.win.localStorage.getItem("budget-pwa-auth"), null, "the link's session is never stored as the device's");
+  assert.deepEqual(server.setSessionCalls.map(c => c.persist), [false], "checked in a memory-only client");
   await rejects(d.store.sync.updatePassword("123"), "invalid");
   assert.equal(d.sync.recovery, true);
   await d.store.sync.updatePassword("brand-new-pass");
   assert.equal(d.sync.recovery, false);
+  assert.equal(d.sync.link, null);
+  assert.equal(d.sync.user, null, "afterwards the user signs in inside the app");
+  assert.equal(server.tokens.has(linkToken), false, "the link's session was ended");
+  assert.deepEqual(d.ids(), ["ex01", "ex02", "ex03"], "local data untouched");
+  assert.equal(d.kv().meta.userId, null);
 
   const other = await new Device({ server }).ready();
   await rejects(other.store.sync.signIn("anna@example.com", PW), "auth", "Неверная почта или пароль.");
   await other.signIn("anna@example.com", "brand-new-pass");
   assert.equal(other.sync.phase, "idle");
+});
+
+test("a recovery link of this device's own account signs it in again, as before", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const d = await new Device({ server }).ready();
+  await d.signIn("anna@example.com");
+  const id = await d.store.saveTx(null, tx({ note: "not synced yet" }));
+  d.win.localStorage.removeItem("budget-pwa-auth");          // the session was lost; the user resets the password
+  d.win.navigate("https://app.example/budget/" + server.recoveryLink("anna@example.com"));
+  await d.restart();
+  await waitFor(() => d.sync.recovery && d.sync.user, { what: "recovery with the device's account" });
+  assert.equal(d.sync.user.email, "anna@example.com");
+  assert.equal(d.sync.link, null);
+  assert.equal(d.sync.error, null);
+  assert.ok(d.find(id));
+  await d.store.sync.updatePassword("brand-new-pass");
+  assert.equal(d.sync.recovery, false);
+  assert.equal(d.sync.user.email, "anna@example.com", "still signed in");
+  await d.store.sync.syncNow();
+  assert.equal(d.sync.pending, 0);
+  assert.ok(server.rows("transactions").some(r => r.id === id));
+});
+
+test("cancelRecovery keeps the password, ends a held link's session and gives the device back", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  server.addUser("bob@example.com");
+
+  // signed in as anna; a reset link of bob's account arrives (asked for or crafted, the app cannot tell)
+  const d = await new Device({ server }).ready();
+  await d.signIn("anna@example.com");
+  const link = server.recoveryLink("bob@example.com");
+  const token = new URLSearchParams(link.slice(1)).get("access_token");
+  d.win.navigate("https://app.example/budget/" + link);
+  await d.restart();
+  await waitFor(() => d.sync.recovery && d.sync.user, { what: "recovery link held" });
+  assert.deepEqual(d.sync.link, { type: "recovery", email: "bob@example.com" });
+  await d.store.sync.cancelRecovery();
+  await waitFor(() => !d.sync.recovery, { what: "recovery cleared" });
+  assert.equal(d.sync.link, null);
+  assert.equal(d.sync.user.email, "anna@example.com");
+  assert.equal(server.tokens.has(token), false, "the link's session was ended");
+  assert.equal(server.users.get("bob@example.com").password, PW, "bob's password unchanged");
+  const id = await d.store.saveTx(null, tx({ note: "after cancel" }));
+  await d.store.sync.syncNow();
+  assert.equal(d.sync.phase, "idle");
+  assert.ok(server.rows("transactions").some(r => r.id === id && r.user_id === d.sync.user.id));
+
+  // signed out: the device goes back to signing in; there is nothing left to change a password with
+  const e = await new Device({ server, href: "https://app.example/budget/" + server.recoveryLink("bob@example.com") }).ready();
+  await waitFor(() => e.sync.recovery, { what: "recovery (signed out)" });
+  await e.store.sync.cancelRecovery();
+  await waitFor(() => !e.sync.recovery, { what: "recovery cleared (signed out)" });
+  assert.deepEqual([e.sync.link, e.sync.user], [null, null]);
+  await rejects(e.store.sync.updatePassword("whatever-1"), "auth", "Сначала войдите в аккаунт.");
+  assert.equal(server.users.get("bob@example.com").password, PW);
+
+  // a reset link of this device's own account (its session was adopted): the device stays signed in
+  const f = await new Device({ server }).ready();
+  await f.signIn("anna@example.com");
+  f.win.localStorage.removeItem("budget-pwa-auth");
+  f.win.navigate("https://app.example/budget/" + server.recoveryLink("anna@example.com"));
+  await f.restart();
+  await waitFor(() => f.sync.recovery && f.sync.user, { what: "own recovery" });
+  await f.store.sync.cancelRecovery();
+  await waitFor(() => !f.sync.recovery, { what: "own recovery cleared" });
+  assert.equal(f.sync.user.email, "anna@example.com");
+  await f.store.sync.syncNow();
+  assert.equal(f.sync.phase, "idle");
+  assert.equal(server.users.get("anna@example.com").password, PW);
 });
 
 /* ── sync ─────────────────────────────────────────────────────────────── */
@@ -365,7 +447,10 @@ test("push/pull round trip between two devices; examples are never uploaded", as
   });
   assert.match(row.updated_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}\+00:00$/);
   const [srow] = server.rows("budget_settings");
-  assert.deepEqual(srow.data, { startBalance: 1000, goal: null, limits: { cafe: 3000 } });
+  assert.deepEqual(without(srow.data, "_ms"), { startBalance: 1000, goal: null, limits: { cafe: 3000 } });
+  // per-field stamps: the goal still has its (removed) example value's 0, the others were set now
+  assert.deepEqual(srow.data._ms, { startBalance: a.t, goal: 0, limits: a.t, at: a.t });
+  assert.equal(srow.client_updated_ms, a.t);
   assert.equal(server.log.filter(l => l.op === "upsert").every(l => l.onConflict === (l.table === "transactions" ? "user_id,id" : "user_id")), true);
   assert.ok(server.log.filter(l => l.op === "select").every(l => l.filters.some(f => f[0] === "eq" && f[1] === "user_id" && f[2] === uid)));
 
@@ -756,7 +841,7 @@ test("signing into an account with data removes the example; an empty account ke
   assert.equal(d.kv().settings.localOnly, false);
   await d.signIn("partial@example.com");
   assert.deepEqual(d.snap.settings, { startBalance: 1234, goal: null, limits: {} });
-  assert.deepEqual(server.rows("budget_settings", d.sync.user.id)[0].data, { startBalance: 1234, goal: null, limits: {} });
+  assert.deepEqual(without(server.rows("budget_settings", d.sync.user.id)[0].data, "_ms"), { startBalance: 1234, goal: null, limits: {} });
 });
 
 test("signing in after anonymous use keeps and uploads the local records", async () => {
@@ -959,8 +1044,8 @@ test("backup import merges by timestamp: newer wins, untimed records lose to exi
       { ...base, id: "e3", note: "back", updatedAt: 9000 },         // newer than the tombstone: comes back
       { ...base, id: "ex01", note: "no timestamp" },               // skipped: untimed vs existing example
       { ...base, id: "n1", note: "new, untimed" },                 // added
-      { ...base, id: "n2", note: "dup older", updatedAt: 10 },     // duplicate id: the newer copy is used
-      { ...base, id: "n2", note: "dup newer", updatedAt: 20, example: true },
+      { ...base, id: "n2", note: "dup older", updatedAt: 10 },     // duplicate id: the newer copy is used,
+      { ...base, id: "n2", note: "dup newer", updatedAt: 20, example: true },   // but example records are never imported
     ],
   }));
   assert.deepEqual(res, { added: 3, updated: 1, skipped: 3, settingsUpdated: true });
@@ -969,8 +1054,8 @@ test("backup import merges by timestamp: newer wins, untimed records lose to exi
   assert.equal(d.find("e3").note, "back");
   assert.notEqual(d.find("ex01").note, "no timestamp");
   assert.equal(d.find("n1").note, "new, untimed");
-  assert.equal(d.find("n2").note, "dup newer");
-  assert.equal(d.find("n2").example, true);
+  assert.equal(d.find("n2").note, "dup older");
+  assert.equal(d.find("n2").example, undefined);
   assert.equal(d.snap.settings.startBalance, 99);
   const kv = d.kv();
   for (const id of [e2, "e3", "n1", "n2"]) assert.deepEqual([kv.tx[id].dirty, kv.tx[id].localOnly], [true, false], id);
@@ -995,4 +1080,456 @@ test("imported records are uploaded on the next sync", async () => {
   assert.equal(a.sync.pending, 1);
   await a.store.sync.syncNow();
   assert.deepEqual(server.rows("transactions").map(r => [r.id, r.client_updated_ms]), [["imp1", 123]]);
+});
+
+const GOAL_IMPORT = { name: "Ремонт", target: 300000, deadline: "", initial: 0 };
+test("a backup file without settings timestamps restores settings over nothing, the example or defaults, never over the user's values", async () => {
+  const untimed = { app: "budget", version: 1, exportedAt: "2026-10-01T00:00:00Z", settings: { startBalance: 777, goal: GOAL_IMPORT, limits: { cafe: 5 } }, tx: [] };
+  const want = { startBalance: 777, goal: GOAL_IMPORT, limits: { cafe: 5 } };
+
+  // no settings at all (no example seeded; the same state as after a sign-out)
+  const none = await new Device({ seed: null }).ready();
+  assert.equal(none.snap.settings, null);
+  assert.equal((await none.store.backup.import(untimed)).settingsUpdated, true);
+  assert.deepEqual(none.snap.settings, want);
+  assert.deepEqual([none.kv().settings.dirty, none.kv().settings.localOnly], [true, false]);
+  assert.deepEqual((await none.store.backup.import(untimed)).settingsUpdated, false, "the same file again changes nothing");
+
+  // the example settings
+  const ex = await new Device().ready();
+  assert.equal((await ex.store.backup.import(untimed)).settingsUpdated, true);
+  assert.deepEqual(ex.snap.settings, want);
+
+  // the device-only defaults left by «Удалить пример»
+  const cleared = await new Device().ready();
+  await cleared.store.deleteMany(cleared.snap.tx.map(t => t.id));
+  await cleared.store.saveSettings({ startBalance: 0, goal: null, limits: {} });
+  assert.equal(cleared.kv().settings.localOnly, true);
+  assert.equal((await cleared.store.backup.import(untimed)).settingsUpdated, true);
+  assert.deepEqual(cleared.snap.settings, want);
+
+  // a value the user set on this device wins; fields still at their defaults are filled from the file
+  const own = await new Device({ seed: null }).ready();
+  await own.store.saveSettings({ startBalance: 5000, goal: null, limits: {} });
+  assert.equal((await own.store.backup.import(untimed)).settingsUpdated, true);
+  assert.deepEqual(own.snap.settings, { startBalance: 5000, goal: GOAL_IMPORT, limits: { cafe: 5 } });
+  own.tick(1000);
+  await own.store.saveSettings({ startBalance: 5000, goal: null, limits: { cafe: 5 } });   // the user removes the goal
+  assert.equal((await own.store.backup.import(untimed)).settingsUpdated, false, "a removed goal is the user's value too");
+  assert.equal(own.snap.settings.goal, null);
+  // an untimed file holding only defaults changes nothing; example fields in it are never imported
+  const plain = await new Device({ seed: null }).ready();
+  await plain.store.saveSettings({ startBalance: 10, goal: null, limits: {} });
+  assert.equal((await plain.store.backup.import({ ...untimed, settings: { startBalance: 0, goal: null, limits: {} } })).settingsUpdated, false);
+  assert.equal((await plain.store.backup.import({ ...untimed, settings: { startBalance: 1, goal: GOAL_IMPORT, limits: {}, example: { goal: true } } })).settingsUpdated, false);
+  assert.deepEqual(plain.snap.settings, { startBalance: 10, goal: null, limits: {} });
+
+  // after a sign-in the account's own values win; its unset fields take the file's
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings({ startBalance: 100, goal: null, limits: {} });
+  await a.store.sync.syncNow();
+  const b = await new Device({ server, seed: null, clock: T0 + 60_000 }).ready();
+  await b.store.backup.import(untimed);
+  await b.signIn("anna@example.com");
+  await a.store.sync.syncNow();
+  for (const d of [a, b]) assert.deepEqual(d.snap.settings, { startBalance: 100, goal: GOAL_IMPORT, limits: { cafe: 5 } });
+  assert.equal(a.sync.pending + b.sync.pending, 0);
+});
+
+/* ── regressions from the sync / security review ─────────────────────── */
+
+// mirror of app.js saveSettings(patch): the UI spreads the whole snapshot settings back into the store
+const DEFAULT_SETTINGS = { startBalance: 0, goal: null, limits: {} };
+function uiSaveSettings(d, patch) {
+  const raw = d.snap.settings ? JSON.parse(JSON.stringify(d.snap.settings)) : {};
+  const next = { ...DEFAULT_SETTINGS, ...raw, ...patch };
+  if (next.example && typeof next.example === "object") {
+    for (const k of Object.keys(patch)) delete next.example[k];
+    if (!Object.keys(next.example).length) delete next.example;
+  }
+  return d.store.saveSettings(next);
+}
+// mirror of app.js clearExamples() («Удалить пример»)
+async function uiClearExamples(d) {
+  await d.store.deleteMany(d.snap.tx.filter(t => t.example === true).map(t => t.id));
+  const st = d.snap.settings && d.snap.settings.example;
+  if (st && typeof st === "object" && Object.keys(st).length) {
+    const patch = {};
+    for (const k of Object.keys(st)) if (k in DEFAULT_SETTINGS) patch[k] = DEFAULT_SETTINGS[k];
+    const raw = JSON.parse(JSON.stringify(d.snap.settings));
+    delete raw.example;
+    await d.store.saveSettings({ ...DEFAULT_SETTINGS, ...raw, ...patch });
+  }
+}
+const GOAL = { name: "Машина", target: 900000, deadline: "", initial: 50000 };
+
+test("#0 a second device used before its first sign-in keeps the account's goal and limits", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const phone = await new Device({ server, clock: T0 }).ready();
+  await phone.signIn("anna@example.com");
+  await uiClearExamples(phone);
+  phone.tick();
+  await uiSaveSettings(phone, { startBalance: 10000 });
+  await uiSaveSettings(phone, { goal: GOAL });
+  await uiSaveSettings(phone, { limits: { groceries: 20000, cafe: 5000 } });
+  await phone.store.sync.syncNow();
+
+  // iPad, an hour later: «Удалить пример», enters the start balance the toast asks for, then signs in
+  const ipad = await new Device({ server, clock: T0 + 3600_000 }).ready();
+  await uiClearExamples(ipad);
+  await uiSaveSettings(ipad, { startBalance: 12000 });
+  await ipad.signIn("anna@example.com");
+  await phone.store.sync.syncNow();
+
+  const expected = { startBalance: 12000, goal: GOAL, limits: { groceries: 20000, cafe: 5000 } };
+  assert.deepEqual(without(server.rows("budget_settings")[0].data, "_ms"), expected, "the iPad's newer start balance plus the account's goal and limits");
+  assert.deepEqual(ipad.snap.settings, expected);
+  assert.deepEqual(phone.snap.settings, expected);
+  assert.equal(ipad.sync.pending, 0);
+  assert.equal(phone.sync.pending, 0);
+});
+
+test("#0 settings stamps never come from the UI and never reach it", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings({ startBalance: 5, goal: GOAL, limits: {} });
+  await a.store.sync.syncNow();
+  assert.equal("_ms" in a.snap.settings, false);
+  assert.equal("_ms" in a.store.backup.export().settings, false);
+  const b = await new Device({ server }).ready();
+  await b.signIn("anna@example.com");
+  assert.equal("_ms" in b.snap.settings, false, "a pulled row's _ms stays inside the store");
+
+  // the UI hands back whatever it got, plus a forged _ms: the store recomputes the stamps itself
+  a.tick(60_000);
+  await a.store.saveSettings({ ...a.snap.settings, limits: { cafe: 100 }, _ms: { startBalance: 9e12, goal: 9e12, limits: 0, at: 9e12 } });
+  const kv = a.kv().settings;
+  assert.equal("_ms" in kv.data, false);
+  assert.equal(kv.fieldMs.limits, a.t);
+  assert.ok(kv.fieldMs.startBalance < a.t && kv.fieldMs.goal < a.t, "unchanged fields keep their old stamps");
+});
+
+test("#7 offline edits of different settings fields on two devices both survive", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings({ startBalance: 1000, goal: null, limits: {} });
+  await a.store.sync.syncNow();
+  const b = await new Device({ server }).ready();
+  await b.signIn("anna@example.com");
+  assert.deepEqual(b.snap.settings, { startBalance: 1000, goal: null, limits: {} });
+  a.win.setOnline(false); b.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { goal: { name: "Отпуск", target: 100000, deadline: "", initial: 0 } });
+  b.tick(120_000); await uiSaveSettings(b, { limits: { cafe: 3000 } });
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  const both = { startBalance: 1000, goal: { name: "Отпуск", target: 100000, deadline: "", initial: 0 }, limits: { cafe: 3000 } };
+  assert.deepEqual(without(server.rows("budget_settings")[0].data, "_ms"), both);
+  assert.deepEqual(a.snap.settings, both);
+  assert.deepEqual(b.snap.settings, both);
+  assert.equal(a.sync.pending + b.sync.pending, 0);
+
+  // the same field on both: the later edit wins
+  a.tick(60_000); await uiSaveSettings(a, { startBalance: 1 });
+  b.tick(60_000); await uiSaveSettings(b, { startBalance: 2 });
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  assert.equal(a.snap.settings.startBalance, 2);
+  assert.equal(b.snap.settings.startBalance, 2);
+});
+
+test("#7 rows without trustworthy field stamps (older app versions) count as changed as a whole", async () => {
+  const server = createFakeSupabase();
+  const u = server.addUser("anna@example.com");
+  const a = await new Device({ server }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings({ startBalance: 1000, goal: null, limits: {} });
+  await a.store.sync.syncNow();
+  const stale = server.rows("budget_settings")[0].data._ms;
+
+  // a newer version's row that changed only the start balance: a's pending limits survive
+  a.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { limits: { cafe: 3000 } });
+  const t1 = a.t + 60_000;
+  server.put("budget_settings", { user_id: u.id, data: { startBalance: 2000, goal: null, limits: {}, _ms: { ...stale, startBalance: t1, at: t1 } }, client_updated_ms: t1 });
+  a.win.setOnline(true);
+  a.tick(120_000); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings, { startBalance: 2000, goal: null, limits: { cafe: 3000 } });
+
+  // an old version rewrote the document and carried the stale _ms along (at ≠ client_updated_ms): its whole row is newer
+  a.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { goal: GOAL });
+  const t2 = a.t + 60_000;
+  server.put("budget_settings", { user_id: u.id, data: { startBalance: 3000, goal: null, limits: {}, _ms: stale }, client_updated_ms: t2 });
+  a.win.setOnline(true);
+  a.tick(120_000); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings, { startBalance: 3000, goal: null, limits: {} });
+
+  // a row without _ms at all, older than a's next edit: only fields changed later locally win
+  a.tick(60_000); await uiSaveSettings(a, { goal: GOAL });
+  server.put("budget_settings", { user_id: u.id, data: { startBalance: 4000, goal: null, limits: { cafe: 1 } }, client_updated_ms: a.t - 30_000 });
+  a.tick(1000); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings, { startBalance: 4000, goal: GOAL, limits: { cafe: 1 } });
+  assert.equal(a.sync.pending, 0);
+  assert.deepEqual(without(server.rows("budget_settings")[0].data, "_ms"), a.snap.settings);
+});
+
+test("#3 a backup import on a freshly signed-in device does not bring back operations deleted in the account", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server }).ready();
+  await a.signIn("anna@example.com");
+  const gone = await a.store.saveTx(null, tx({ note: "deleted after the backup", amount: 5000 }));
+  await a.store.sync.syncNow();
+  const file = JSON.parse(JSON.stringify(a.store.backup.export()));
+  a.tick(60_000); await a.store.deleteTx(gone);
+  server.backdateNextMs = 10 * 60_000;                       // the deletion is older than the pull overlap
+  await a.store.sync.syncNow();
+  a.tick(60_000); await a.store.saveTx(null, tx({ note: "later operation" }));
+  await a.store.sync.syncNow();
+
+  const b = await new Device({ server, clock: T0 + 3600_000 }).ready();
+  await b.signIn("anna@example.com");
+  assert.equal(b.find(gone), undefined);
+  assert.equal(b.kv().tx[gone].deleted, true, "the account's tombstone is kept on the new device");
+  const res = await b.store.backup.import(file);
+  assert.equal(res.added, 0);
+  for (let i = 0; i < 2; i++) { b.tick(60_000); await b.store.sync.syncNow(); }
+  assert.equal(b.find(gone), undefined);
+  assert.equal(b.sync.pending, 0);
+  assert.equal(server.rows("transactions").find(r => r.id === gone).deleted, true);
+});
+
+test("#8 the same example edited into a real record on two devices gives two records", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const phone = await new Device({ server, clock: Date.UTC(2026, 8, 20, 9) }).ready();
+  const ipad = await new Device({ server, clock: Date.UTC(2026, 9, 8, 9) }).ready();
+  const pEx = phone.find("ex01"), iEx = ipad.find("ex01");
+  phone.tick();
+  const pId = await phone.store.saveTx("ex01", { ...without(pEx, "id", "example", "updatedAt"), amount: 38000, note: "Аренда август" });
+  await phone.signIn("anna@example.com");
+  ipad.tick();
+  const iId = await ipad.store.saveTx("ex01", { ...without(iEx, "id", "example", "updatedAt"), amount: 38000, note: "Аренда сентябрь" });
+  await ipad.signIn("anna@example.com");
+  await phone.store.sync.syncNow();
+  assert.notEqual(pId, "ex01");
+  assert.notEqual(iId, "ex01");
+  assert.notEqual(pId, iId);
+  const real = server.rows("transactions").filter(r => !r.deleted && !r.example);
+  assert.deepEqual(real.map(r => r.note).sort(), ["Аренда август", "Аренда сентябрь"]);
+  assert.ok(!server.rows("transactions").some(r => r.id === "ex01"));
+  const own = d => d.snap.tx.filter(t => !t.example).map(t => t.note).sort();
+  assert.deepEqual(own(phone), ["Аренда август", "Аренда сентябрь"]);
+  assert.deepEqual(own(ipad), ["Аренда август", "Аренда сентябрь"]);
+});
+
+test("#9 restoring a backup made while the example was shown does not upload the example", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const phone = await new Device({ server }).ready();
+  const mine = await phone.store.saveTx(null, tx({ note: "моя операция" }));
+  const file = JSON.parse(JSON.stringify(phone.store.backup.export()));
+  assert.deepEqual(file.tx.filter(t => t.example).map(t => t.id), ["ex01", "ex02", "ex03"]);
+  assert.deepEqual(file.settings.example, { startBalance: true, goal: true, limits: true });
+  await phone.store.deleteMany(phone.snap.tx.filter(t => t.example).map(t => t.id));
+  await phone.signIn("anna@example.com");
+  const ipad = await new Device({ server }).ready();
+  await ipad.signIn("anna@example.com");
+  const res = await ipad.store.backup.import(file);
+  assert.equal(res.skipped, 4, "three example records skipped, the own one already there");
+  assert.equal(res.settingsUpdated, false, "example settings are not imported either");
+  await ipad.store.sync.syncNow();
+  await phone.store.sync.syncNow();
+  assert.deepEqual(server.rows("transactions").filter(r => r.example).map(r => r.id), []);
+  assert.equal(server.rows("budget_settings").length, 0);
+  assert.deepEqual(phone.ids(), [mine]);
+  assert.deepEqual(ipad.ids(), [mine]);
+});
+
+test("#10 a launch on the localStorage fallback does not bring the removed example back into IndexedDB", async () => {
+  const idb = createFakeIndexedDB();
+  const ls = new FakeStorage();
+  const win = createWindow({ idb, localStorage: ls, seed: fakeSeed });
+  const d = await new Device({ win, delays: { ...SLOW, idbTimeout: 50 } }).ready();
+  await uiClearExamples(d);
+  await uiSaveSettings(d, { goal: GOAL });
+  const mine = await d.store.saveTx(null, tx({ note: "моя" }));
+  idb.ctl.hangOpen = true;                                    // IndexedDB open hangs on the next launch (old Safari)
+  await d.restart();
+  assert.ok(d.snap.notice);
+  assert.deepEqual(d.ids(), ["ex01", "ex02", "ex03"], "the fallback launch starts from an empty localStorage");
+  d.tick(60_000);
+  await uiSaveSettings(d, { startBalance: 777 });            // one field changed during the fallback launch
+  const extra = await d.store.saveTx(null, tx({ note: "во время сбоя" }));
+  idb.ctl.hangOpen = false;
+  await d.restart();
+  assert.equal(d.snap.notice, undefined);
+  assert.deepEqual(d.ids(), [mine, extra].sort(), "own records move over, the example does not");
+  assert.deepEqual(d.snap.settings, { startBalance: 777, goal: GOAL, limits: {} }, "example settings never replace real ones");
+  assert.equal(ls.getItem("budget-pwa-data"), null);
+});
+
+test("#2 an e-mail link opened where sync is not configured waits for the project, then works", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const bob = server.addUser("bob@example.com");
+  const link = server.recoveryLink("anna@example.com");
+  const d = await new Device({ server, config: "none", href: "https://app.example/budget/" + link }).ready();
+  await sleep(10);
+  assert.equal(d.sync.configured, false);
+  assert.equal(d.sync.pendingLink, "recovery");
+  assert.equal(d.win.location.hash, link, "the link stays in the URL until the project is known");
+  assert.equal(d.server.clients.length, 0);
+  await d.store.sync.configure({ url: server.url, anonKey: server.anonKey });
+  assert.equal(d.sync.pendingLink, null);
+  assert.equal(d.win.location.hash, "");
+  assert.equal(d.sync.recovery, true);
+  assert.deepEqual(d.sync.link, { type: "recovery", email: "anna@example.com" });
+  assert.equal(d.sync.user, null);
+  await d.store.sync.updatePassword("brand-new-pass");
+  assert.equal(d.sync.recovery, false);
+  assert.equal(d.sync.user, null);
+  await d.store.sync.signIn("anna@example.com", "brand-new-pass");
+  assert.equal(d.sync.user.email, "anna@example.com");
+
+  // a sign-up confirmation link: the address is confirmed, the user signs in with the password
+  const s = server.issue(bob.id);
+  const e = await new Device({ server, config: "none", href: `https://app.example/budget/#access_token=${s.access_token}&refresh_token=${s.refresh_token}&expires_in=3600&token_type=bearer&type=signup` }).ready();
+  await sleep(10);
+  assert.equal(e.sync.pendingLink, "link");
+  await e.store.sync.configure({ url: server.url, anonKey: server.anonKey });
+  assert.deepEqual(e.sync.link, { type: "confirmed", email: "bob@example.com" });
+  assert.equal(e.sync.user, null);
+  assert.equal(server.tokens.has(s.access_token), false, "the confirmation link's session was ended");
+  await e.signIn("bob@example.com");
+  assert.equal(e.sync.link, null);
+
+  // a failed link is explained without any project config
+  const f = await new Device({ server, config: "none", href: "https://app.example/budget/#error=access_denied&error_code=otp_expired&error_description=Email+link+is+invalid+or+has+expired" }).ready();
+  await sleep(10);
+  assert.equal(f.sync.pendingLink, null);
+  assert.equal(f.sync.error, "Ссылка из письма устарела или уже использована. Запросите новое письмо.");
+
+  // no network while the link is checked: it stays in the URL and works after a reload
+  const link2 = server.recoveryLink("anna@example.com");
+  const gw = createWindow({ server, seed: fakeSeed, config: { supabaseUrl: server.url, supabaseAnonKey: server.anonKey }, href: "https://app.example/budget/" + link2 });
+  gw.netDown = true;
+  const g = await new Device({ server, win: gw }).ready();
+  await waitFor(() => g.sync.error, { what: "network error" });
+  assert.match(g.sync.error, /Нет соединения/);
+  assert.equal(g.win.location.hash, link2);
+  assert.equal(g.sync.recovery, false);
+  g.win.netDown = false;
+  await g.restart();
+  await waitFor(() => g.sync.recovery, { what: "recovery after reload" });
+  assert.equal(g.win.location.hash, "");
+  assert.equal(g.sync.error, null);
+});
+
+test("#4 a link with another account's session never signs the app into it", async () => {
+  const server = createFakeSupabase();
+  const victim = server.addUser("victim@example.com");
+  const attacker = server.addUser("attacker@example.com");
+  const crafted = () => {
+    const s = server.issue(attacker.id);
+    return { token: s.access_token, href: `https://app.example/budget/#access_token=${s.access_token}&refresh_token=${s.refresh_token}&expires_in=3600&token_type=bearer` };
+  };
+
+  // a device that was never signed in, holding a private record
+  const d = await new Device({ server }).ready();
+  const mine = await d.store.saveTx(null, tx({ note: "PRIVATE salary note", amount: 250000 }));
+  const l1 = crafted();
+  d.win.navigate(l1.href);
+  await d.restart();
+  await waitFor(() => d.sync.link, { what: "link handled" });
+  await sleep(20);
+  assert.deepEqual(d.sync.link, { type: "confirmed", email: "attacker@example.com" });
+  assert.equal(d.sync.user, null);
+  assert.equal(d.sync.recovery, false);
+  assert.equal(d.win.location.hash, "");
+  assert.equal(server.log.filter(l => l.op === "upsert").length, 0, "nothing uploaded");
+  assert.equal(server.rows("transactions", attacker.id).length, 0);
+  assert.ok(d.find(mine));
+  assert.equal(d.sync.pending, 1);
+  assert.equal(d.kv().meta.userId, null);
+  assert.equal(d.win.localStorage.getItem("budget-pwa-auth"), null);
+  assert.equal(server.tokens.has(l1.token), false, "the link's session was ended");
+
+  // a device signed in as the victim, with a change that is not synced yet
+  const v = await new Device({ server }).ready();
+  await v.signIn("victim@example.com");
+  const pending = await v.store.saveTx(null, tx({ note: "VICTIM unsynced entry" }));
+  v.win.navigate(crafted().href);
+  await v.restart();
+  await waitFor(() => v.sync.link && v.sync.user, { what: "link handled while signed in" });
+  assert.equal(v.sync.user.email, "victim@example.com");
+  assert.ok(v.find(pending));
+  assert.equal(v.kv().meta.userId, victim.id);
+  await v.store.sync.syncNow();
+  assert.ok(server.rows("transactions", victim.id).some(r => r.id === pending));
+  assert.equal(server.rows("transactions", attacker.id).length, 0);
+
+  // a recovery link of another account on a signed-in device: the password changes, the device keeps its account
+  v.win.navigate("https://app.example/budget/" + server.recoveryLink("attacker@example.com"));
+  await v.restart();
+  await waitFor(() => v.sync.recovery && v.sync.user, { what: "recovery link handled" });
+  assert.equal(v.sync.user.email, "victim@example.com");
+  assert.deepEqual(v.sync.link, { type: "recovery", email: "attacker@example.com" });
+  await v.store.sync.updatePassword("attacker-new-pass");
+  assert.equal(v.sync.recovery, false);
+  assert.equal(v.sync.user.email, "victim@example.com");
+  assert.equal(server.users.get("attacker@example.com").password, "attacker-new-pass");
+  assert.equal(server.users.get("victim@example.com").password, PW);
+});
+
+test("#5 an offline relaunch with an expired access token stays signed in, offline", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const d = await new Device({ server }).ready();
+  await d.signIn("anna@example.com");
+  const id = await d.store.saveTx(null, tx());
+  const expire = () => {
+    const s = JSON.parse(d.win.localStorage.getItem("budget-pwa-auth"));
+    s.expires_at = Math.floor(Date.now() / 1000) - 120;     // the app was closed for over an hour
+    d.win.localStorage.setItem("budget-pwa-auth", JSON.stringify(s));
+  };
+  expire();
+  d.win.navigator.onLine = false;
+  server.refreshRetryMs = 400;                               // supabase-js keeps retrying the refresh before it answers
+  const t0 = Date.now();
+  await d.restart();
+  await waitFor(() => d.sync.user && d.sync.phase === "offline", { what: "offline, still signed in" });
+  assert.ok(Date.now() - t0 < 300, "shown without waiting for getSession()");
+  await sleep(450);
+  server.refreshRetryMs = 0;
+  assert.equal(d.sync.user && d.sync.phase, "offline", "still signed in once getSession() gave up");
+  assert.equal(d.sync.user.email, "anna@example.com");
+  assert.equal(d.sync.error, null, "no «Сессия завершена»");
+  assert.equal(d.sync.pending, 1);
+  assert.ok(d.win.localStorage.getItem("budget-pwa-auth"), "the session is still stored");
+  d.win.setOnline(true);
+  await waitFor(() => d.sync.phase === "idle" && d.sync.pending === 0, { what: "sync once online" });
+  assert.ok(server.rows("transactions").some(r => r.id === id));
+
+  // online with an expired token: refreshed as usual
+  expire();
+  await d.restart();
+  await waitFor(() => d.sync.user && d.sync.phase === "idle", { what: "refreshed online" });
+  assert.equal(d.sync.error, null);
+
+  // a stored session of another account than this device's is not used offline
+  const other = await new Device({ server }).ready();
+  other.win.localStorage.setItem("budget-pwa-auth", d.win.localStorage.getItem("budget-pwa-auth"));
+  other.win.localStorage.setItem("budget-pwa-auth", JSON.stringify({ ...JSON.parse(other.win.localStorage.getItem("budget-pwa-auth")), expires_at: 1 }));
+  other.win.navigator.onLine = false;
+  await other.restart();
+  await sleep(20);
+  assert.equal(other.sync.user, null);
 });

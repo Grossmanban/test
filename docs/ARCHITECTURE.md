@@ -48,6 +48,8 @@ interface Settings {         // one document per user
   limits: Record<string /* expense category id */, number>;
   example?: { startBalance?: true; goal?: true; limits?: true };   // fields still holding example values
 }
+// The PWA store keeps a timestamp per settings field internally (see "Sync rules"); the UI never sees it,
+// and a `_ms` key handed to saveSettings() is ignored.
 ```
 
 ## Store contract (both adapters)
@@ -88,20 +90,33 @@ interface SyncState {
   lastSyncAt: number | null;   // ms epoch of last fully successful push+pull
   pending: number;             // local changes not yet pushed
   error: string | null;        // Russian, user-facing
-  recovery: boolean;           // password-recovery link opened: UI must ask for a new password
+  recovery: boolean;           // password-recovery link opened: UI asks for a new password (updatePassword) or cancelRecovery()
+  link: {                      // an e-mail link's session that was NOT adopted (another account than this device's, or none yet)
+    type: "recovery"           //   held in memory only until updatePassword() succeeds or cancelRecovery(), then ended (recovery is true meanwhile)
+        | "confirmed";         //   sign-up confirmation / magic link / e-mail change: checked and ended at once; tell the user
+    email: string;             //   that the address is confirmed and to sign in (in the installed app). Cleared by signIn/signUp.
+  } | null;
+  pendingLink: "recovery" | "link" | null;   // an e-mail link waits in the URL hash, but this browser has no project config
+                               // (iOS opens mail links in Safari, whose storage is separate from the Home Screen app's):
+                               // the UI asks for the project URL and key once; configure() then handles the link
 }
 interface SyncApi {
-  configure(cfg: { url: string; anonKey: string } | null): Promise<void>;   // null clears device config
+  configure(cfg: { url: string; anonKey: string } | null): Promise<void>;   // null clears device config; handles a pending link
   signUp(email: string, password: string): Promise<{ needsConfirm: boolean }>;
   signIn(email: string, password: string): Promise<void>;
   signOut(): Promise<void>;                 // also wipes local data of that account from the device
   resetPassword(email: string): Promise<void>;
-  updatePassword(password: string): Promise<void>;
+  updatePassword(password: string): Promise<void>;   // signed in, or through a held recovery link (snap.sync.link)
+  cancelRecovery(): Promise<void>;          // keep the password: ends a held recovery link's session, clears `recovery` and `link`
   syncNow(): Promise<void>;
 }
 interface BackupApi {
-  export(): { app: "budget"; version: 1; exportedAt: string; settings: Settings | null; tx: Tx[] };
-  import(data: unknown): Promise<{ added: number; updated: number; skipped: number }>;   // validates; newer record wins
+  export(): { app: "budget"; version: 1; exportedAt: string; settings: Settings | null; tx: Tx[];
+              settingsUpdatedAt?: number; settingsFieldsUpdatedAt?: { startBalance: number; goal: number; limits: number } };
+  import(data: unknown): Promise<{ added: number; updated: number; skipped: number; settingsUpdated: boolean }>;
+  // validates; newer record wins; settings merge field by field; example records and example settings fields are skipped;
+  // a file without settingsUpdatedAt / settingsFieldsUpdatedAt (hand-made, other tools): its non-default settings fields
+  // get stamp 1 — they replace examples, defaults and missing settings, never a value the user set (stamp > 1)
 }
 ```
 
@@ -109,11 +124,16 @@ Sync rules (implemented in `store-pwa.js`, schema in `supabase/schema.sql`):
 - Local-first: every write lands in IndexedDB first and resolves when the IndexedDB transaction completes; sync runs afterwards.
 - Each local record carries `updatedMs` (client clock, strictly increasing per record), `dirty`, `deleted` (tombstone) and `localOnly` (example records that are never uploaded).
 - Push: upsert dirty, non-`localOnly` records with `onConflict: "user_id,id"`. The server keeps the row with the larger `client_updated_ms` (BEFORE UPDATE trigger returns NULL for older writes).
-- Pull: rows with `updated_at > cursor − 2 min`, ordered by `updated_at`, paged by 1000. Merge: remote wins unless the local copy is dirty and newer (`updatedMs > client_updated_ms`).
-- Signing into an account that already has live non-example rows removes the local example records.
-- Sign-in after anonymous local use keeps local records and uploads them. Sign-in as a different user than last time wipes local data first.
+- Pull: rows with `updated_at > cursor − 2 min`, ordered by `updated_at`, paged by 1000. Merge: remote wins unless the local copy is dirty and newer (`updatedMs > client_updated_ms`). Remote tombstones are stored even for ids the device never had, so a later backup import cannot bring a deleted record back.
+- Settings merge per field (last writer wins for `startBalance`, `goal` and `limits` separately). Each local settings record has `fieldMs`; on the server the stamps travel inside the document as `data._ms = { startBalance, goal, limits, at }`, with `at` = the row's `client_updated_ms`. A row whose `_ms` is missing, malformed or has another `at` (written by an older app version) counts every field as changed at `client_updated_ms`. `saveSettings` stamps only the fields whose value changed; example values and values reset by «Удалить пример» carry 0, so they never beat a real value (at equal stamps a non-example value beats an example one). When the merged result differs from the server's row it stays dirty with `updatedMs` above both, so the union is pushed; the server stays whole-row LWW.
+- Signing into an account that already has live non-example rows removes the local example records (settings fields still holding example values are reset to defaults).
+- Sign-in after anonymous local use keeps local records and uploads them; settings fields left at their defaults get stamp 0 first, so they never override the account's values. Sign-in as a different user than last time wipes local data first.
+- An example record edited into a real one (the UI drops `example`) is stored under a fresh id: example ids are the same on every device. Backup import skips example records and example settings fields.
+- localStorage fallback data is migrated into IndexedDB on the next launch; its example records/settings are skipped when IndexedDB was already seeded, and settings are merged per field.
 - Triggers: start-up, 1.5 s after a local write, `online`, `visibilitychange → visible`, every 60 s while visible, Supabase Realtime change events (debounced).
-- supabase-js client: `flowType: "implicit"` (email links open in Safari, outside the installed app, so a PKCE verifier stored in the app would be missing), `persistSession`, `autoRefreshToken`, `detectSessionInUrl`, `storageKey: "budget-pwa-auth"`.
+- supabase-js client: `flowType: "implicit"` (email links open in Safari, outside the installed app, so a PKCE verifier stored in the app would be missing), `persistSession`, `autoRefreshToken`, `detectSessionInUrl: false`, `storageKey: "budget-pwa-auth"`.
+- E-mail links (`#access_token=…&type=…`) are read by the store, removed from the URL, and checked in a separate memory-only client (`persistSession: false`). The session is adopted only when its user id equals `meta.userId` (this device's own account; e.g. a password reset where the app is signed in). Any other account is never adopted, so a crafted link cannot sign the app into a stranger's account, upload this device's data there or wipe unsynced changes: a `type=recovery` session is kept only for `updatePassword()` and then signed out (`scope: "local"`); any other link is signed out at once and reported as `snap.sync.link = { type: "confirmed" }`. Local data and `meta.userId` are untouched. `cancelRecovery()` drops a held recovery link without changing the password (the UI offers «Отмена», so a link nobody here asked for cannot lock the dialog in the password form). The UI pre-fills a link's e-mail into the sign-in form only when this browser asked for a link to that address (sign-up or password reset in the last 7 days, `localStorage["budget-pwa-mail-asked"]`): a link someone else sent names their account. Without a project config the hash stays in place and `snap.sync.pendingLink` is set. `#error=…` links set `error`.
+- Start-up while offline: when `getSession()` has no session because the expired token cannot be refreshed (offline / retryable error), the stored session of this device's account (`localStorage["budget-pwa-auth"]`) keeps it signed in with phase `offline`; supabase-js refreshes it once online.
 
 ## `window.BudgetApp` (exposed by `app.js` for `pwa.js`)
 

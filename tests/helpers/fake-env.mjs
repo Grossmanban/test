@@ -55,6 +55,19 @@ export function createWindow({
   win.document = new Emitter();
   win.document.visibilityState = "visible";
   win.location = { href: u.href, origin: u.origin, protocol: u.protocol, pathname: u.pathname, search: u.search, hash: u.hash };
+  win.history = {
+    state: null,
+    replaceState(state, _title, url) {
+      const n = new URL(url, win.location.href);
+      this.state = state;
+      Object.assign(win.location, { href: n.href, pathname: n.pathname, search: n.search, hash: n.hash });
+    },
+  };
+  // "the user opens a link": a new URL for the next store started on this window
+  win.navigate = href => {
+    const n = new URL(href, win.location.href);
+    Object.assign(win.location, { href: n.href, origin: n.origin, protocol: n.protocol, pathname: n.pathname, search: n.search, hash: n.hash });
+  };
   win.crypto = globalThis.crypto;
   win.BUDGET_CONFIG = config || { supabaseUrl: "", supabaseAnonKey: "" };
   if (seed) win.BudgetSeed = seed;

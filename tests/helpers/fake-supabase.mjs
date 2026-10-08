@@ -61,10 +61,12 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
     rateLimitAuth: false,
     realtime: true,
     backdateNextMs: 0,           // next write gets updated_at this far in the past (a long transaction)
+    refreshRetryMs: 0,           // how long getSession() keeps retrying an expired session's refresh offline
     hooks: { beforeUpsert: null, beforeSelect: null },
     changeListeners: new Set(),  // (table, [{ eventType, row, old }]) for adapters (e.g. a WebSocket mock)
     log: [],                     // { op, table, uid, rows | range }
     signOutScopes: [],
+    setSessionCalls: [],         // { access_token, persist } for every auth.setSession()
     emails: [],
     clients: [],
     channels: new Set(),
@@ -340,10 +342,49 @@ class FakeAuth {
   _down() { return this.client._down(); }
   onAuthStateChange(cb) {
     this.listeners.add(cb);
-    setTimeout(() => { if (this.listeners.has(cb)) cb("INITIAL_SESSION", this.session); }, 1);
+    // like supabase-js: INITIAL_SESSION carries what getSession() returns (null for an expired session offline)
+    setTimeout(async () => {
+      if (!this.listeners.has(cb)) return;
+      const r = await this.getSession();
+      if (this.listeners.has(cb)) cb("INITIAL_SESSION", r.data.session);
+    }, 1);
     return { data: { subscription: { id: String(++seq), unsubscribe: () => this.listeners.delete(cb) } } };
   }
-  async getSession() { return { data: { session: this.session }, error: null }; }
+  // like supabase-js: a session that expires within 90 s is refreshed first; offline that fails with a
+  // retryable error, "no session" is returned and the stored session is kept for later
+  async getSession() {
+    const s = this.session;
+    if (s && s.expires_at && s.expires_at * 1000 - Date.now() < 90_000) {
+      await null;
+      if (this._down()) {
+        // supabase-js retries a failing refresh with back-off for up to ~30 s before it answers
+        if (this.server.refreshRetryMs) await new Promise(r => setTimeout(r, this.server.refreshRetryMs));
+        return { data: { session: null }, error: retryable() };
+      }
+      const uid = this.server.refresh.get(s.refresh_token);
+      if (!uid) { this._save(null); this._emit("SIGNED_OUT", null); return { data: { session: null }, error: authApi("Invalid Refresh Token: Refresh Token Not Found", 400, "refresh_token_not_found") }; }
+      this.server.refresh.delete(s.refresh_token);
+      const fresh = this.server.issue(uid);
+      this._save(fresh);
+      this._emit("TOKEN_REFRESHED", fresh);
+      return { data: { session: fresh }, error: null };
+    }
+    return { data: { session: s }, error: null };
+  }
+  // like supabase-js: the access token is checked with the server (GET /user), then the session is stored
+  async setSession({ access_token, refresh_token } = {}) {
+    await null;
+    this.server.setSessionCalls.push({ access_token, persist: this.persist });
+    if (!access_token || !refresh_token) return { data: { session: null, user: null }, error: new AuthError("AuthSessionMissingError", "Auth session missing!", 400, undefined) };
+    if (this._down()) return { data: { session: null, user: null }, error: retryable() };
+    const uid = this.server.tokens.get(access_token);
+    if (!uid) return { data: { session: null, user: null }, error: authApi("invalid JWT: unable to parse or verify signature, token has invalid claims: token is expired", 403, "bad_jwt") };
+    const u = [...this.server.users.values()].find(x => x.id === uid);
+    const session = { access_token, refresh_token, token_type: "bearer", expires_in: 3600, user: { id: uid, email: u.email, aud: "authenticated" } };
+    this._save(session);
+    this._emit("SIGNED_IN", session);
+    return { data: { session, user: session.user }, error: null };
+  }
   async signUp({ email, password, options = {} }) {
     await null;
     if (this._down()) return { data: { user: null, session: null }, error: retryable() };
@@ -378,7 +419,7 @@ class FakeAuth {
     if (this.session) {
       const uid = this.server.tokens.get(this.session.access_token);
       if (scope === "global" && uid) this.server.revokeUser(uid);
-      else this.server.tokens.delete(this.session.access_token);
+      else { this.server.tokens.delete(this.session.access_token); this.server.refresh.delete(this.session.refresh_token); }
     }
     this._save(null);
     this._emit("SIGNED_OUT", null);

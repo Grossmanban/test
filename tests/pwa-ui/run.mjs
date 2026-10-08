@@ -435,6 +435,110 @@ async function iosShare() {
   await ctx.close();
 }
 
+/* ── e-mail links: «Отмена» in the password form; a link's address is pre-filled only when this browser asked for it ── */
+async function links(devName, theme, desktopUa = false) {
+  const tag = `links-${devName}-${theme}${desktopUa ? "-chrome" : ""}`;
+  console.log(`· ${tag}`);
+  const { ctx, page, errors } = await newPage(desktopUa ? { ...DEVICES[devName], userAgent: UA.chrome } : DEVICES[devName], theme);
+  const coarse = await page.evaluate(() => matchMedia("(pointer: coarse)").matches);
+  const CFG = { configured: true, url: "https://abcd.supabase.co", configSource: "device", user: null, phase: "off", error: null, recovery: false, link: null };
+  const ANNA = { id: "u1", email: "anna@example.com" };
+  const stranger = "stranger@example.com";
+  const title = () => page.locator("#pwaTitle").innerText();
+  const waitTitle = t => page.waitForFunction(t => document.querySelector("#pwaDlg").open && document.querySelector("#pwaTitle").textContent === t, t);
+  const view = async () => (await page.locator("#pwaView").innerText()).replace(/\s+/g, " ");
+  const called = name => page.evaluate(n => window.__mock.calls.filter(c => c.name === n).length, name);
+  const reload = async () => {
+    await closeDialog(page);
+    await page.reload();
+    await page.waitForFunction(() => window.__mock && document.querySelector("#pwaSync"));
+  };
+
+  // 1. a confirmation link nobody here asked for: the note names the address, the sign-in form is not pre-filled
+  await setSync(page, { ...CFG, link: { type: "confirmed", email: stranger } });
+  await waitTitle("Вход в аккаунт");
+  await settle(page);
+  check((await view()).includes(`Почта ${stranger} подтверждена`), `${tag}: confirmation note names the link's address`);
+  check(await page.inputValue("#pwaEmail") === "", `${tag}: an address this browser did not ask for is not pre-filled`);
+  check((await view()).includes("с почтой и паролем своего аккаунта"), `${tag}: the note does not point at the link's address`);
+  await closeDialog(page);
+
+  // 2. a recovery link of another account while signed in: «Отмена» keeps the password and gives the account view back
+  await setSync(page, { ...CFG, user: ANNA, phase: "idle", lastSyncAt: Date.now(), recovery: true, link: { type: "recovery", email: stranger } });
+  await waitTitle("Новый пароль");
+  await settle(page);
+  check(await page.getAttribute("#pwaSync", "aria-label") === "Синхронизация: задайте новый пароль", `${tag}: button asks for the new password`);
+  check((await view()).includes(`Смена пароля для ${stranger}`) && (await view()).includes("вошли как anna@example.com"), `${tag}: recovery form names the link's account and the device's`);
+  check((await view()).includes("Не просили сменить пароль? Нажмите «Отмена»"), `${tag}: a link this browser did not ask for says how to back out`);
+  check(await page.locator('[data-act="rec-cancel"]').isVisible(), `${tag}: «Отмена» in the password form`);
+  await layoutChecks(page, `${tag} recovery link`, coarse);
+  await shotDialog(page, `${tag}-recovery-link`);
+  await page.click('[data-act="rec-cancel"]');
+  await waitTitle("Аккаунт");
+  await settle(page);
+  check(await called("cancelRecovery") === 1 && await called("updatePassword") === 0, `${tag}: «Отмена» calls cancelRecovery, not updatePassword`);
+  check((await page.locator("#pwaFlash").innerText()).includes("Пароль не изменён."), `${tag}: «Пароль не изменён.»`);
+  check(await page.locator("#pwaStatus").isVisible() && await page.locator('[data-act="out-ask"]').isVisible(), `${tag}: sync status and «Выйти» are back`);
+  check(await page.getAttribute("#pwaSync", "aria-label") === "Синхронизация: всё сохранено", `${tag}: button back to the sync status`);
+  await closeDialog(page);
+
+  // 3. a reset of this device's own account (no held link): cancellable too, no «не просили» line
+  await setSync(page, { recovery: true });
+  await waitTitle("Новый пароль");
+  await settle(page);
+  check(!(await view()).includes("Не просили"), `${tag}: own account: no «не просили» line`);
+  await page.click('[data-act="rec-cancel"]');
+  await waitTitle("Аккаунт");
+  check(await called("cancelRecovery") === 2, `${tag}: own account: cancelRecovery called`);
+  await closeDialog(page);
+
+  // 4. signed out, a recovery link of a stranger: after the new password the sign-in form stays empty
+  await setSync(page, { ...CFG, recovery: true, link: { type: "recovery", email: stranger } });
+  await waitTitle("Новый пароль");
+  await settle(page);
+  await page.fill("#pwaNew", "new-secret-1");
+  await page.fill("#pwaNew2", "new-secret-1");
+  await page.click('#pwaForm button[type="submit"]');
+  await waitTitle("Вход в аккаунт");
+  await settle(page);
+  check((await page.locator("#pwaFlash").innerText()).includes(`Пароль для ${stranger} изменён`), `${tag}: stranger's reset: done message`);
+  check(await page.inputValue("#pwaEmail") === "", `${tag}: stranger's reset: the address is not pre-filled`);
+
+  // 5. this browser asked for the links (sign-up, password reset): the address is pre-filled after a reload
+  await page.fill("#pwaEmail", "Anna@Example.com");
+  await page.click('[data-act="forgot"]');
+  await page.waitForFunction(() => /смены пароля отправлено/.test(document.querySelector("#pwaFlash").textContent));
+  await page.locator('label:has(#pwaModeUp)').scrollIntoViewIfNeeded();
+  await page.click('label:has(#pwaModeUp)');
+  await page.waitForFunction(() => document.querySelector("#pwaTitle").textContent === "Новый аккаунт");
+  await page.fill("#pwaEmail", "bob@example.com");
+  await page.fill("#pwaPass", "correct horse 42");
+  await page.click('#pwaForm button[type="submit"]');
+  await waitTitle("Подтвердите почту");
+  await reload();
+  await setSync(page, { ...CFG, link: { type: "confirmed", email: "bob@example.com" } });
+  await waitTitle("Вход в аккаунт");
+  await settle(page);
+  check(await page.inputValue("#pwaEmail") === "bob@example.com", `${tag}: confirmation of an address asked for here: pre-filled`);
+  check((await view()).includes("с этой почтой и паролем"), `${tag}: … and the note points at it`);
+  await reload();
+  await setSync(page, { ...CFG, recovery: true, link: { type: "recovery", email: "anna@example.com" } });
+  await waitTitle("Новый пароль");
+  await settle(page);
+  check(!(await view()).includes("Не просили"), `${tag}: reset asked for here: no «не просили» line`);
+  await page.fill("#pwaNew", "new-secret-2");
+  await page.fill("#pwaNew2", "new-secret-2");
+  await page.click('#pwaForm button[type="submit"]');
+  await waitTitle("Вход в аккаунт");
+  await settle(page);
+  check(await page.inputValue("#pwaEmail") === "anna@example.com", `${tag}: reset asked for here: the address is pre-filled for signing in`);
+  check(await title() === "Вход в аккаунт", `${tag}: sign-in view after the reset`);
+
+  await collectIcons(page);
+  check(errors.length === 0, `${tag}: no page errors (${errors.join(" | ")})`);
+  await ctx.close();
+}
+
 /* ── real app.js + icons.js (integration smoke test) ── */
 async function realApp() {
   const tag = "real-app";
@@ -467,7 +571,10 @@ try {
     if (only && only !== dev) continue;
     for (const theme of DEVICES[dev].light ? ["light"] : ["light", "dark"]) await scenario(dev, theme);
   }
-  if (!only) { await desktop("light"); await desktop("dark"); await iosShare(); }
+  if (!only) {
+    await desktop("light"); await desktop("dark"); await iosShare();
+    await links("phone", "dark"); await links("se", "light"); await links("phone", "light", true);
+  }
   if (real) await realApp();
   // every icon requested while the scenarios ran (harness markup adds Wallet, ChevronLeft, ChevronRight, Plus)
   console.log(`icons requested: ${[...allIcons].sort().join(", ")}`);

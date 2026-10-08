@@ -51,6 +51,22 @@
   const errMsg = e => (e && e.code && e.message ? String(e.message) : FALLBACK_ERR);
   function lsGet(k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } }
   function lsSet(k, v) { try { window.localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
+  // Addresses this browser asked an e-mail link for (sign-up, password reset), kept for a week. A link's address
+  // is pre-filled into the sign-in form only when it is one of them: a link someone else sent names their account.
+  const LS_ASKED = "budget-pwa-mail-asked";
+  const ASKED_MS = 7 * 864e5;
+  const normEmail = e => String(e || "").trim().toLowerCase();
+  function askedList() {
+    let a = null;
+    try { a = JSON.parse(lsGet(LS_ASKED) || "[]"); } catch (e) { a = null; }
+    const t = Date.now();
+    return Array.isArray(a) ? a.filter(x => x && typeof x.e === "string" && Number.isFinite(x.t) && t - x.t < ASKED_MS) : [];
+  }
+  function noteAsked(email) {
+    const e = normEmail(email);
+    if (e) lsSet(LS_ASKED, JSON.stringify(askedList().filter(x => x.e !== e).concat({ e, t: Date.now() }).slice(-5)));
+  }
+  const askedFor = email => !!normEmail(email) && askedList().some(x => x.e === normEmail(email));
 
   /* ── state ─────────────────────────────────── */
   const U = {
@@ -68,6 +84,8 @@
     bk: null,             // { kind: "good" | "err", text } backup result
     busy: false,
     recoveryOpened: false,
+    linkSeen: "",         // e-mail link note already opened for (see onSnapshot)
+    scrollKey: "",        // the dialog scrolls back to the top when this changes (another view or state)
     waiting: null,        // service worker waiting to take over
     updating: false,
     version: "",
@@ -183,6 +201,40 @@
   }
 
   /* view markup */
+  // e-mail links: iOS opens them in Safari, whose storage is separate from the Home Screen app's
+  const LINK_WHERE = IS_IOS ? "в Safari" : "в браузере";
+  const inSafariNotApp = () => IS_IOS && !isStandalone();
+  function noteHtml(ic, title, lines) {
+    return `<div class="pwa-note" role="status"><span class="pwa-note-ic">${icon(ic)}</span>
+      <div><p><b>${esc(title)}</b></p>${lines.filter(Boolean).map(l => `<p>${esc(l)}</p>`).join("")}</div></div>`;
+  }
+  // a link that waits for this browser's project config (snap.sync.pendingLink)
+  function pendingLinkHtml(sy) {
+    if (!sy.pendingLink || sy.configured) return "";
+    return sy.pendingLink === "recovery"
+      ? noteHtml("KeyRound", "Ссылка для смены пароля", [
+        `Она открылась ${LINK_WHERE}, а синхронизация настроена в приложении: у ${IS_IOS ? "Safari" : "браузера"} свои данные, адреса проекта здесь пока нет.`,
+        "Укажите ниже адрес проекта и ключ, как в приложении (это нужно один раз). После этого откроется форма нового пароля."])
+      : noteHtml("MailCheck", "Ссылка из письма", [
+        `Она открылась ${LINK_WHERE}, где синхронизация ещё не настроена.`,
+        "Если это подтверждение почты, почта уже подтверждена: вернитесь в приложение и войдите с почтой и паролем."]);
+  }
+  // a sign-up confirmation (or other e-mail link) that was checked and not used to sign in (snap.sync.link)
+  function confirmedHtml(sy) {
+    const l = sy.link;
+    if (!l || l.type !== "confirmed") return "";
+    if (sy.user) {
+      return l.email && l.email !== sy.user.email
+        ? statusBox("warn", `Ссылка из письма относится к другому аккаунту (${l.email}). Вы по-прежнему вошли как ${sy.user.email || "раньше"}.`)
+        : "";
+    }
+    // a link this browser did not ask for may name someone else's account: no nudge towards that address
+    const creds = askedFor(l.email) ? "с этой почтой и паролем" : "с почтой и паролем своего аккаунта";
+    return noteHtml("MailCheck", l.email ? `Почта ${l.email} подтверждена` : "Почта подтверждена", [
+      inSafariNotApp()
+        ? `Вернитесь в приложение на экране «Домой» и войдите там ${creds}.`
+        : `Ссылка из письма не входит в аккаунт сама. Войдите ${creds}.`]);
+  }
   const eye = id => `<button type="button" class="icon-btn pwa-eye" data-act="eye" aria-controls="${id}" aria-pressed="false" aria-label="Показать пароль">${icon("Eye")}</button>`;
   function guideHtml() {
     return `<div class="pwa-guide">
@@ -204,6 +256,7 @@
       const canOff = editing && sy.configSource === "device";
       return `<form class="pwa-form" id="pwaForm" data-form="config" novalidate>
         <div id="pwaFlash"></div>
+        ${pendingLinkHtml(sy)}
         <div id="pwaSyErr"></div>
         <p class="pwa-lead">${editing
           ? "Укажите другой проект Supabase или отключите синхронизацию на этом устройстве."
@@ -235,11 +288,12 @@
       const signup = U.authMode === "signup" && !sent;
       return `<form class="pwa-form" id="pwaForm" data-form="auth" novalidate>
         <div id="pwaFlash"></div>
+        ${sent ? "" : confirmedHtml(sy)}
         <div id="pwaSyErr"></div>
         ${sent ? `<div class="pwa-note" role="status">
             <span class="pwa-note-ic">${icon("MailCheck")}</span>
             <div><p><b>Мы отправили письмо на ${esc(sent.email)}</b></p>
-              <p>Откройте ссылку из письма, чтобы подтвердить почту. Ссылка откроется в браузере — после этого вернитесь сюда и войдите с этой почтой и паролем.</p>
+              <p>Откройте ссылку из письма, чтобы подтвердить почту. Ссылка откроется ${LINK_WHERE} и сама в аккаунт не входит: после этого вернитесь сюда и войдите с этой почтой и паролем.</p>
               <p class="hint">Письма нет? Проверьте «Спам» и подождите пару минут. Если аккаунт с этой почтой уже был, просто войдите.</p></div>
           </div>`
           : `<p class="pwa-lead">${signup
@@ -271,6 +325,7 @@
           <span class="pwa-avatar">${icon("CircleUserRound")}</span>
           <div class="pwa-user-txt"><small>Вы вошли как</small><b class="pwa-email">${esc(sy.user.email || "без почты")}</b></div>
         </div>
+        ${confirmedHtml(sy)}
         <div id="pwaStatus"></div>
         <p class="err" id="pwaErr" role="alert" hidden></p>
         <div class="pwa-actions"${U.confirmOut ? " hidden" : ""}>
@@ -292,13 +347,19 @@
       </div>`;
     }
     if (v === "recovery") {
-      const email = sy.user ? sy.user.email : "";
+      // viaLink: a reset link of an account this device does not use; the device keeps its own account (or none)
+      const viaLink = !!(sy.link && sy.link.type === "recovery");
+      const email = viaLink ? sy.link.email : sy.user ? sy.user.email : "";
       return `<form class="pwa-form" id="pwaForm" data-form="recovery" novalidate>
         <div id="pwaSyErr"></div>
         <div class="pwa-note">
           <span class="pwa-note-ic">${icon("KeyRound")}</span>
           <div><p><b>Смена пароля${email ? ` для ${esc(email)}` : ""}</b></p>
-            <p>Придумайте новый пароль. Потом войдите с ним на остальных устройствах.</p></div>
+            <p>${viaLink
+              ? `Придумайте новый пароль. Потом войдите с ним ${inSafariNotApp() ? "в приложении на экране «Домой»" : "в приложении"} и на остальных устройствах.`
+              : "Придумайте новый пароль. Потом войдите с ним на остальных устройствах."}</p>
+            ${viaLink && sy.user ? `<p>На этом устройстве вы по-прежнему вошли как ${esc(sy.user.email)}.</p>` : ""}
+            ${viaLink && !askedFor(email) ? `<p>Не просили сменить пароль? Нажмите «Отмена» — пароль останется прежним.</p>` : ""}</div>
         </div>
         ${email ? `<input type="email" class="sr" autocomplete="username" value="${esc(email)}" tabindex="-1" aria-hidden="true" readonly>` : ""}
         <div class="field"><span><label for="pwaNew">Новый пароль</label></span>
@@ -307,7 +368,10 @@
         <div class="field"><span><label for="pwaNew2">Повторите пароль</label></span>
           <input class="input" id="pwaNew2" type="password" autocomplete="new-password" enterkeyhint="done" autocapitalize="none" autocorrect="off" spellcheck="false"></div>
         <p class="err" id="pwaErr" role="alert" hidden></p>
-        <div class="pwa-stack"><button type="submit" class="btn btn-primary" data-busy="Сохраняем…">Сохранить пароль</button></div>
+        <div class="pwa-stack">
+          <button type="submit" class="btn btn-primary" data-busy="Сохраняем…">Сохранить пароль</button>
+          <button type="button" class="btn btn-quiet" data-act="rec-cancel" data-busy="Отменяем…">Отмена</button>
+        </div>
       </form>`;
     }
     return `<p class="pwa-lead">Сохраните копию бюджета в файл или загрузите сохранённую раньше.</p>`;
@@ -384,8 +448,13 @@
   function render(fresh) {
     const sy = U.sy, v = viewOf(sy);
     const key = JSON.stringify([v, U.authMode, U.sent && U.sent.email, U.confirmOut, U.confirmOff,
-      sy && [sy.configured, sy.configSource, sy.url, sy.available, sy.user && sy.user.email]]);
+      sy && [sy.configured, sy.configSource, sy.url, sy.available, sy.user && sy.user.email, sy.pendingLink, sy.link && [sy.link.type, sy.link.email]]]);
     if (fresh || key !== U.key) {
+      // another view, or the same view after configure / sign-in / sign-out / «письмо отправлено», starts at the top,
+      // where its message is (the button that led here may have been scrolled far down, e.g. iPhone landscape)
+      const scrollKey = JSON.stringify([v, !!U.sent, !!(sy && sy.configured), sy && sy.user ? sy.user.id : ""]);
+      const toTop = !fresh && scrollKey !== U.scrollKey;
+      U.scrollKey = scrollKey;
       const keep = {};
       const a = document.activeElement;
       const focusInside = !!a && viewEl.contains(a);
@@ -399,6 +468,7 @@
         const t = focusSel && viewEl.querySelector(focusSel);
         (t && !t.closest("[hidden]") ? t : $("#pwaTitle", dlg)).focus({ preventScroll: true });
       }
+      if (toTop) dlg.scrollTop = 0;
     }
     updateDynamic();
   }
@@ -465,7 +535,7 @@
     if (U.authMode === "signup" && !U.sent) {
       await run(btn, async () => {
         const res = await sync.signUp(email, pass);
-        if (res && res.needsConfirm) { U.sent = { email }; U.flash = null; render(); }
+        if (res && res.needsConfirm) { noteAsked(email); U.sent = { email }; U.flash = null; render(); }
         else toast("Аккаунт создан");
       });
     } else {
@@ -486,20 +556,44 @@
     U.email = email;
     await run(btn, async () => {
       await sync.resetPassword(email);
-      U.flash = { kind: "good", text: `Письмо со ссылкой для смены пароля отправлено на ${email}. Откройте ссылку, задайте новый пароль и затем войдите здесь.` };
+      noteAsked(email);
+      U.flash = { kind: "good", text: `Письмо со ссылкой для смены пароля отправлено на ${email}. ` + (IS_IOS && isStandalone()
+        ? "Ссылка откроется в Safari: если там попросят адрес проекта и ключ, укажите их, как здесь. Задайте новый пароль, затем вернитесь сюда и войдите с ним."
+        : "Откройте ссылку, задайте новый пароль и затем войдите здесь с новым паролем.") };
       updateDynamic();
     });
   }
   async function submitRecovery(btn) {
     const p1 = val("pwaNew"), p2 = val("pwaNew2");
     if (p1 && p1 !== p2) { setErr("Пароли не совпадают."); $("#pwaNew2", dlg).focus(); return; }
+    const sy = U.sy || {};
+    const link = sy.link && sy.link.type === "recovery" ? sy.link : null;
     await run(btn, async () => {
       await sync.updatePassword(p1);
-      U.flash = { kind: "good", text: isStandalone()
-        ? "Пароль изменён. На других устройствах войдите с новым паролем."
-        : "Пароль изменён. В приложении на экране «Домой» и на других устройствах войдите с новым паролем." };
+      if (link) {             // the link's session has ended: the user signs in with the new password
+        if (!sy.user) { U.authMode = "signin"; U.sent = null; if (askedFor(link.email)) U.email = link.email; }
+        U.flash = { kind: "good", text: `Пароль${link.email ? ` для ${link.email}` : ""} изменён. ` + (inSafariNotApp()
+          ? "Вернитесь в приложение на экране «Домой» и войдите с новым паролем."
+          : sy.user ? "Входите с ним в этот аккаунт." : "Войдите с новым паролем.") };
+      } else {
+        U.flash = { kind: "good", text: isStandalone()
+          ? "Пароль изменён. На других устройствах войдите с новым паролем."
+          : "Пароль изменён. В приложении на экране «Домой» и на других устройствах войдите с новым паролем." };
+      }
       toast("Пароль изменён");
       render();
+      // the sign-in form may already be on screen (the store's snapshot came first): prefill it now
+      const em = $("#pwaEmail", dlg);
+      if (em && !em.value && U.email) em.value = U.email;
+    });
+  }
+  // leave the password as it is (a reset link nobody here asked for must not lock the dialog in this form)
+  async function cancelRecovery(btn) {
+    await run(btn, async () => {
+      if (typeof sync.cancelRecovery === "function") await sync.cancelRecovery();
+      U.flash = { kind: "good", text: "Пароль не изменён." };
+      render();
+      $("#pwaTitle", dlg).focus();
     });
   }
   async function syncNow(btn) {
@@ -621,6 +715,7 @@
       case "export": exportBackup(b); break;
       case "import": if (!U.busy) { const f = $("#pwaFile", dlg); f.value = ""; f.click(); } break;
       case "forgot": forgot(b); break;
+      case "rec-cancel": cancelRecovery(b); break;
       case "sync": syncNow(b); break;
       case "out-ask": U.confirmOut = true; render(); { const no = $('[data-act="out-no"]', dlg); if (no) no.focus(); } break;
       case "out-no": U.confirmOut = false; render(); { const o = $('[data-act="out-ask"]', dlg); if (o) o.focus(); } break;
@@ -663,10 +758,23 @@
     U.status = snap ? snap.status : "loading";
     if (sy && sy.user && U.sent) { U.sent = null; U.authMode = "signin"; }
     renderButton();
+    let open = false;
     if (sy && sy.recovery && !U.recoveryOpened) {
       U.recoveryOpened = true;                 // a password-recovery link was opened: ask for the new password
-      if (!dlg.open) { openDlg(); return; }
+      open = true;
     } else if (!(sy && sy.recovery)) U.recoveryOpened = false;
+    // an e-mail link that needs this browser's project config, or a confirmation that did not sign in: explain once
+    const linkKey = !sy ? "" : sy.pendingLink && !sy.configured ? `pending:${sy.pendingLink}`
+      : sy.link && sy.link.type === "confirmed" ? `confirmed:${sy.link.email}` : "";
+    if (linkKey && linkKey !== U.linkSeen) {
+      U.linkSeen = linkKey;
+      if (sy.link && sy.link.type === "confirmed" && !sy.user) {
+        U.authMode = "signin"; U.sent = null;
+        if (askedFor(sy.link.email)) U.email = sy.link.email;   // never pre-fill an address this browser did not ask for
+      }
+      open = true;
+    }
+    if (open && !dlg.open) { openDlg(); return; }
     if (dlg.open) render();
   });
   renderButton();

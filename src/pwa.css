@@ -108,8 +108,11 @@
 .pwa-note p + p { margin-top: 6px; }
 .pwa-note b { color: var(--ink); }
 
-/* signed-in account */
-.pwa-user { display: flex; align-items: center; gap: 12px; min-width: 0; }
+/* signed-in account: which account this device uses is always the first thing in the view */
+.pwa-user {
+  display: flex; align-items: center; gap: 12px; min-width: 0;
+  padding: 12px 14px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--line);
+}
 .pwa-avatar {
   width: 44px; height: 44px; border-radius: 999px; flex: none; display: grid; place-items: center;
   background: var(--accent-soft); color: var(--accent);
@@ -117,7 +120,7 @@
 .pwa-avatar .ic { width: 24px; height: 24px; }
 .pwa-user-txt { display: grid; min-width: 0; }
 .pwa-user-txt small { font-size: 12.5px; color: var(--muted); }
-.pwa-email { font-size: 15.5px; font-weight: 800; overflow-wrap: anywhere; }
+.pwa-email { font-size: 17px; font-weight: 800; overflow-wrap: anywhere; }
 
 /* inline confirms (sign out, disconnect) */
 .confirm.pwa-confirm { display: grid; gap: 8px; align-items: stretch; padding: 14px; font-weight: 500; }

@@ -37,7 +37,7 @@
     status: "ready",
     sync: {
       available: true, configured: false, url: "", configSource: "none", user: null,
-      phase: "off", lastSyncAt: null, pending: 0, error: null, recovery: false,
+      phase: "off", lastSyncAt: null, pending: 0, error: null, recovery: false, link: null, pendingLink: null,
     },
     tx: [
       { id: "a1", type: "expense", amount: 1250, category: "groceries", note: "Продукты", date: "2026-10-07", createdAt: 1 },
@@ -90,6 +90,12 @@
     updatePassword: password => call("updatePassword", [password], () => {
       if (String(password).length < 6) throw err("invalid", "Пароль должен быть не короче 6 символов.");
       M.sync.recovery = false;
+      M.sync.link = null;
+      M.emit();
+    }),
+    cancelRecovery: () => call("cancelRecovery", [], () => {
+      M.sync.recovery = false;
+      if (M.sync.link && M.sync.link.type === "recovery") M.sync.link = null;
       M.emit();
     }),
     syncNow: () => call("syncNow", [], async () => {

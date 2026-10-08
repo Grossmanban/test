@@ -183,6 +183,7 @@
     if (!isObj(s)) throw bad();
     let out;
     try { out = JSON.parse(JSON.stringify(s)); } catch (e) { throw bad(); }   // keeps unknown fields, JSON-safe
+    delete out._ms;                                                         // field stamps are the store's own, never taken from outside
     const sb = s.startBalance == null ? 0 : s.startBalance;
     if (!finite(sb) || Math.abs(sb) > MAX_AMOUNT) throw bad();
     out.startBalance = r2(sb);
@@ -217,6 +218,87 @@
     if (k === "goal") return v == null;
     return !v || (isObj(v) && !Object.keys(v).length);
   }
+
+  /* ── settings: per-field last writer wins ──────
+   * The settings document has three independent fields. Each local record keeps a timestamp per field
+   * (rec.fieldMs = { startBalance, goal, limits }); on the server they travel inside the document as
+   * data._ms = { startBalance, goal, limits, at } (at = the row's client_updated_ms). Merging takes every
+   * field from the side that changed it last, so offline edits of different fields on two devices both
+   * survive. Example values and values reset by «Удалить пример» carry 0: they never beat a real value.
+   * The UI never sees _ms: settingsData() drops it and the stamps are recomputed on every save. */
+  const ZERO_MS = { startBalance: 0, goal: 0, limits: 0 };
+  // stamp of a value from a backup file without any timestamps: newer than "not the user's value" (0), older than any edit
+  const UNTIMED_MS = 1;
+  const exFlag = (d, k) => !!(d && isObj(d.example) && d.example[k] === true);
+  function sameValue(k, a, b) {
+    if (k === "startBalance") return (a || 0) === (b || 0);
+    if (k === "goal") {
+      if (a == null || b == null) return a == null && b == null;
+      return a.name === b.name && a.target === b.target && (a.deadline || "") === (b.deadline || "") && (a.initial || 0) === (b.initial || 0);
+    }
+    const ea = Object.entries(isObj(a) ? a : {}), ob = isObj(b) ? b : {};
+    return ea.length === Object.keys(ob).length && ea.every(([key, v]) => ob[key] === v);
+  }
+  const sameField = (k, da, db) => sameValue(k, da[k], db[k]) && exFlag(da, k) === exFlag(db, k);
+  const sameSettings = (da, db) => SETTINGS_KEYS.every(k => sameField(k, da, db));
+  // field stamps of a stored record; records saved before fieldMs existed count every field as changed at updatedMs
+  function fieldStamps(rec) {
+    const fm = rec && isObj(rec.fieldMs) ? rec.fieldMs : null;
+    const out = {};
+    for (const k of SETTINGS_KEYS) {
+      const v = fm && finite(fm[k]) && fm[k] >= 0 ? fm[k] : rec && !rec.localOnly ? Number(rec.updatedMs) || 0 : 0;
+      out[k] = !rec || exFlag(rec.data, k) ? 0 : v;
+    }
+    return out;
+  }
+  const docOf = rec => ({ data: rec.data, ms: fieldStamps(rec) });
+  // A server row's stamps are trusted only when _ms.at equals its client_updated_ms: an app version without
+  // per-field stamps keeps an old _ms when it rewrites the document, and its row then counts as changed as a whole.
+  function rowStamps(raw, data, cum) {
+    const m = isObj(raw) && isObj(raw._ms) ? raw._ms : null;
+    const ok = !!m && m.at === cum && SETTINGS_KEYS.every(k => finite(m[k]) && m[k] >= 0 && m[k] <= cum);
+    const out = {};
+    for (const k of SETTINGS_KEYS) out[k] = exFlag(data, k) ? 0 : ok ? m[k] : cum;
+    return out;
+  }
+  // a's value of field k beats b's: changed later, or at the same time while b still holds the example value
+  function wins(a, b, k) {
+    if (a.ms[k] !== b.ms[k]) return a.ms[k] > b.ms[k];
+    return exFlag(b.data, k) && !exFlag(a.data, k);
+  }
+  // base's document with every field that other changed later taken from other
+  function mergeFields(base, other) {
+    const data = clone(base.data), ms = Object.assign({}, base.ms);
+    const ex = Object.assign({}, isObj(data.example) ? data.example : {});
+    for (const k of SETTINGS_KEYS) {
+      if (!wins(other, base, k)) continue;
+      data[k] = clone(other.data[k]);
+      ms[k] = other.ms[k];
+      if (exFlag(other.data, k)) ex[k] = true; else delete ex[k];
+    }
+    if (Object.keys(ex).length) data.example = ex; else delete data.example;
+    return { data, ms };
+  }
+  // stamps for a document the user saved over prev: only the fields whose value changed get time t
+  function stampFields(prev, data, t) {
+    const base = prev ? docOf(prev) : { data: SETTINGS_DEFAULTS, ms: ZERO_MS };
+    const out = {};
+    for (const k of SETTINGS_KEYS) {
+      if (exFlag(data, k)) out[k] = 0;                                                  // still the example value
+      else if (sameField(k, base.data, data)) out[k] = base.ms[k];                       // unchanged
+      else if (exFlag(base.data, k) && isDefaultField(k, data[k])) out[k] = 0;          // example removed («Удалить пример»)
+      else out[k] = t;
+    }
+    return out;
+  }
+  function settingsWire(rec) {
+    const at = Math.max(0, Math.round(rec.updatedMs || 0));
+    const st = fieldStamps(rec);
+    const _ms = {};
+    for (const k of SETTINGS_KEYS) _ms[k] = Math.min(at, Math.max(0, Math.round(st[k])));
+    _ms.at = at;
+    return Object.assign(clone(rec.data), { _ms });
+  }
   // true when nothing in the settings is the user's own value: every field is an example or a default
   const onlyExampleOrDefault = d => SETTINGS_KEYS.every(k => (isObj(d.example) && d.example[k] === true) || isDefaultField(k, d[k]));
   function stripExample(d) {
@@ -225,6 +307,9 @@
     delete out.example;
     return out;
   }
+
+  // what the UI and backups see of a settings document (field stamps stay inside the store)
+  function publicSettings(d) { const out = clone(d); delete out._ms; return out; }
 
   function toTx(r) {
     const t = { id: r.id, type: r.type, amount: r.amount, category: r.category || "", note: r.note || "", date: r.date, createdAt: r.createdAt || 0 };
@@ -261,9 +346,11 @@
     return rec;
   }
   function settingsRowToRec(row) {
+    const raw = isObj(row.data) ? row.data : {};
     let data;
-    try { data = settingsData(isObj(row.data) ? row.data : {}); } catch (e) { data = clone(SETTINGS_DEFAULTS); }
-    return { data, updatedMs: Number(row.client_updated_ms) || 0, dirty: false, localOnly: false };
+    try { data = settingsData(raw); } catch (e) { data = clone(SETTINGS_DEFAULTS); }
+    const updatedMs = Number(row.client_updated_ms) || 0;
+    return { data, fieldMs: rowStamps(raw, data, updatedMs), updatedMs, dirty: false, localOnly: false };
   }
 
   /* ── error classification ──────────────────── */
@@ -373,6 +460,8 @@
       cfg: null, source: "none", cfgUrl: "",
       client: null, authSub: null, channel: null, rtSubscribed: false, gen: 0,
       user: null, phase: "off", error: null, recovery: false,
+      link: null,          // { type: "recovery" | "confirmed", email, id, client }: an e-mail link's session that was not adopted
+      pendingLink: null,   // "recovery" | "link": a link waits in the URL for this browser's project config
       running: null, followUp: null, adoptChain: Promise.resolve(), authRetried: false,
       timers: {}, interval: null, unlisten: [], bc: null,
     };
@@ -436,13 +525,15 @@
         lastSyncAt: S.meta.lastSyncAt || null,
         pending: pendingCount(),
         error: SY.error,
-        recovery: SY.recovery,
+        recovery: SY.recovery || !!(SY.link && SY.link.type === "recovery"),
+        link: SY.link ? { type: SY.link.type, email: SY.link.email } : null,
+        pendingLink: SY.pendingLink,
       };
     }
     function snapshot() {
       const tx = [];
       for (const id in S.tx) { const r = S.tx[id]; if (liveRecord(r)) tx.push(toTx(r)); }
-      const snap = { status, tx, settings: S.settings && isObj(S.settings.data) ? clone(S.settings.data) : null, readOnly: false, sync: syncState() };
+      const snap = { status, tx, settings: S.settings && isObj(S.settings.data) ? publicSettings(S.settings.data) : null, readOnly: false, sync: syncState() };
       if (notice) snap.notice = notice;
       return snap;
     }
@@ -675,7 +766,7 @@
           }
         }
         if (data && isObj(data.settings) && !st.settings) {
-          try { st.settings = { data: settingsData(data.settings), updatedMs: 0, dirty: false, localOnly: true }; } catch (e) { /* skip */ }
+          try { st.settings = { data: settingsData(data.settings), fieldMs: Object.assign({}, ZERO_MS), updatedMs: 0, dirty: false, localOnly: true }; } catch (e) { /* skip */ }
         }
         st.meta.seeded = true;
       });
@@ -686,17 +777,34 @@
       let old = null;
       try { old = JSON.parse(raw); } catch (e) { old = null; }
       if (isObj(old)) {
+        const t = now();
         await commit(ALL, st => {
+          // A fallback launch on an empty localStorage seeded the example there. When this device already had its
+          // budget (IndexedDB seeded), that example is not brought back: only the user's own records move over.
+          const seeded = st.meta.seeded;
           const otx = isObj(old.tx) ? old.tx : {};
           for (const id of Object.keys(otx)) {
             const r = otx[id], c = st.tx[id];
-            if (!isObj(r) || !ID_RE.test(id)) continue;
+            if (!isObj(r) || !ID_RE.test(id) || (r.localOnly && seeded)) continue;
             if (!c || (r.updatedMs || 0) > (c.updatedMs || 0)) st.tx[id] = r;
           }
           const os = old.settings;
-          if (isObj(os) && isObj(os.data) && (!st.settings || (os.updatedMs || 0) > (st.settings.updatedMs || 0))) st.settings = os;
+          let od = null;
+          if (isObj(os) && isObj(os.data) && !(os.localOnly && seeded)) { try { od = settingsData(os.data); } catch (e) { od = null; } }
+          if (od) {
+            const orec = { data: od, fieldMs: os.fieldMs, updatedMs: Number(os.updatedMs) || 0, dirty: !!os.dirty, localOnly: !!os.localOnly };
+            const cur = st.settings;
+            if (!cur) st.settings = orec;
+            else {
+              const m = mergeFields(docOf(cur), docOf(orec));   // per field: example values never replace real ones
+              if (!sameSettings(m.data, cur.data)) {
+                const localOnly = !!cur.localOnly && orec.localOnly;
+                st.settings = { data: m.data, fieldMs: m.ms, updatedMs: Math.max(bumpMs(t, cur), orec.updatedMs + 1), dirty: !localOnly, localOnly };
+              }
+            }
+          }
           const om = normMeta(old.meta);
-          if (!st.meta.seeded && om.seeded) st.meta = om;
+          if (!seeded && om.seeded) st.meta = om;
         });
       }
       lsDel(LS_DATA);
@@ -710,12 +818,22 @@
       if (id != null && id !== "" && !ID_RE.test(String(id))) throw fail("invalid", M.txId);
       const fields = txFields(data, Math.floor(now()));
       await boot();
-      const txId = id == null || id === "" ? mintId() : String(id);
+      const asked = id == null || id === "" ? null : String(id);
+      const fresh = mintId();
       const t = now();
-      await commit(["tx"], st => {
-        const prev = st.tx[txId];
+      const txId = await commit(["tx"], st => {
+        let key = asked || fresh;
+        let prev = st.tx[key];
+        // Example ids (ex01…) are the same on every device. An example edited into a real record gets an id of
+        // its own; otherwise the same example edited on two devices would be one record once both sign in.
+        if (prev && prev.localOnly && fields.example !== true) {
+          delete st.tx[key];
+          key = fresh;
+          prev = st.tx[key];
+        }
         const localOnly = fields.example === true && (!prev || !!prev.localOnly);
-        st.tx[txId] = Object.assign({ id: txId }, fields, { deleted: false, updatedMs: bumpMs(t, prev), dirty: !localOnly, localOnly });
+        st.tx[key] = Object.assign({ id: key }, fields, { deleted: false, updatedMs: bumpMs(t, prev), dirty: !localOnly, localOnly });
+        return key;
       });
       afterWrite();
       return txId;
@@ -757,6 +875,12 @@
       if (SY.cfg) {
         if (getFactory()) startClient();
         else SY.error = M.noLibrary;
+      } else {
+        // An e-mail link opened in a browser without this project's config (iOS: Mail opens links in Safari, whose
+        // storage is separate from the Home Screen app's). The link stays in the URL until configure() handles it.
+        const link = readLink();
+        if (link) SY.pendingLink = link.kind;
+        else if (!SY.error) SY.error = linkError();
       }
       scheduleEmit();
     }
@@ -771,8 +895,29 @@
       SY.interval = setInterval(() => { if (!destroyed && isVisible() && SY.user && !SY.running) kickSync(); }, delays.interval);
       if (SY.interval && typeof SY.interval.unref === "function") SY.interval.unref();
     }
+    // detectSessionInUrl is off: a session that arrives in the URL is handled by handleLink(), never stored as
+    // this device's session by supabase-js (that would sign the app into whatever account the link names).
     function clientOptions() {
-      return { auth: { flowType: "implicit", persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storageKey: AUTH_KEY } };
+      return { auth: { flowType: "implicit", persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, storageKey: AUTH_KEY } };
+    }
+    // a throwaway client for a link's session: memory only, no refresh timer, no broadcast to other tabs
+    function linkClientOptions() {
+      return { auth: { flowType: "implicit", persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, storageKey: AUTH_KEY + "-link" } };
+    }
+    // implicit-flow redirect of an e-mail link: #access_token=…&refresh_token=…&type=signup|recovery|magiclink|…
+    function readLink() {
+      const loc = env.location;
+      const raw = loc ? String(loc.hash || "").replace(/^#/, "") : "";
+      if (!/(^|&)access_token=/.test(raw)) return null;
+      const p = new URLSearchParams(raw);
+      return { kind: p.get("type") === "recovery" ? "recovery" : "link", access_token: p.get("access_token") || "", refresh_token: p.get("refresh_token") || "" };
+    }
+    // tokens and link errors leave the address bar (and the history entry) once they are read
+    function clearHash() {
+      const loc = env.location, h = env.history;
+      if (!loc || !loc.hash) return;
+      try { if (h && typeof h.replaceState === "function") h.replaceState(h.state, "", String(loc.pathname || "") + String(loc.search || "")); } catch (e) { /* ignore */ }
+      try { if (loc.hash) loc.hash = ""; } catch (e) { /* ignore */ }
     }
     // an e-mail link that failed (expired, already used) comes back as #error=…&error_code=…
     function linkError() {
@@ -787,7 +932,10 @@
       const factory = getFactory();
       if (!factory || !SY.cfg || destroyed) return;
       const gen = ++SY.gen;
+      const link = readLink();
       const fromLink = linkError();
+      if (fromLink) clearHash();
+      SY.pendingLink = null;
       if (fromLink) SY.error = fromLink;
       let client;
       try { client = factory(SY.cfg.url, SY.cfg.key, clientOptions()); }
@@ -800,12 +948,72 @@
         });
         SY.authSub = res && res.data && res.data.subscription;
       } catch (e) { SY.authSub = null; }
-      let session = null;
-      try { const r = await client.auth.getSession(); session = r && r.data && r.data.session; } catch (e) { session = null; }
+      // Offline launch: supabase-js retries an expired token's refresh for up to half a minute before getSession()
+      // answers. The stored session is this device's own account, so the offline state shows right away.
+      if (!isOnline()) { const stored = storedSession(); if (stored) adoptUser(stored.user, gen, true).catch(noop); }
+      let session = null, sessionError = null;
+      try { const r = await client.auth.getSession(); session = r && r.data && r.data.session; sessionError = r && r.error; }
+      catch (e) { session = null; sessionError = e; }
       if (gen !== SY.gen) return;
+      if (!(session && session.user) && (!isOnline() || (sessionError && authError(sessionError).code === "network"))) session = storedSession();
       if (session && session.user) await adoptUser(session.user, gen, true).catch(noop);
-      else if (S.meta.userId && !SY.user && !SY.error) SY.error = M.sessionEnded;   // signed in last time, session gone now
+      if (link && gen === SY.gen && !destroyed) await handleLink(link, gen);
+      if (gen !== SY.gen) return;
+      if (S.meta.userId && !SY.user && !SY.error) SY.error = M.sessionEnded;   // signed in last time, session gone now
       scheduleEmit();
+    }
+    // The access token expired while the app was closed (iOS suspends Home Screen apps, so it is not refreshed in the
+    // background) and cannot be refreshed offline: supabase-js answers "no session" but keeps the session stored and
+    // refreshes it once the network is back. Until then this device stays signed in, offline.
+    function storedSession() {
+      let s = null;
+      try { s = JSON.parse(lsGet(AUTH_KEY) || "null"); } catch (e) { s = null; }
+      const u = isObj(s) && isObj(s.user) ? s.user : null;
+      return u && typeof u.id === "string" && u.id === S.meta.userId && typeof s.refresh_token === "string" && s.refresh_token ? s : null;
+    }
+    // A session that arrived in the URL (an e-mail link) is checked with the server in a separate in-memory client.
+    // It replaces this device's session only when it is the account this device already uses. Any other account is
+    // never adopted: a crafted link would otherwise sign the app into a stranger's account and upload this device's
+    // budget there, or wipe its unsynced changes. A password-recovery session is kept only until the new password is
+    // saved (updatePassword); any other link (sign-up confirmation, …) has done its job and is signed out at once.
+    async function handleLink(link, gen) {
+      let lc = null, r = null;
+      try {
+        lc = getFactory()(SY.cfg.url, SY.cfg.key, linkClientOptions());
+        r = await lc.auth.setSession({ access_token: link.access_token, refresh_token: link.refresh_token });
+      } catch (e) { r = { error: e }; }
+      const userOf = res => (res && !res.error && res.data ? res.data.user || (res.data.session && res.data.session.user) || null : null);
+      const user = userOf(r);
+      if (gen !== SY.gen || destroyed) return;     // a newer client handles the link (still in the URL)
+      const offline = !user && !!(r && r.error) && authError(r.error).code === "network";
+      if (!offline) clearHash();                  // without a network the link stays for a reload
+      if (!user || !user.id) {
+        SY.error = offline ? M.network : M.linkExpired;
+        return;
+      }
+      const uid = String(user.id), email = String(user.email || "");
+      if (S.meta.userId && uid === S.meta.userId && SY.client) {
+        let r2 = null;
+        try { r2 = await SY.client.auth.setSession({ access_token: link.access_token, refresh_token: link.refresh_token }); } catch (e) { r2 = { error: e }; }
+        if (gen !== SY.gen) return;
+        const u2 = userOf(r2);
+        if (!u2 || String(u2.id) !== uid) { SY.error = M.linkFailed; return; }
+        if (link.kind === "recovery") SY.recovery = true;
+        await adoptUser(u2, gen, true).catch(noop);
+        return;
+      }
+      if (SY.link && SY.link.client) endLinkSession(SY.link.client);
+      if (link.kind === "recovery") SY.link = { type: "recovery", email, id: uid, client: lc };
+      else {
+        await endLinkSession(lc);
+        if (gen !== SY.gen) return;
+        SY.link = { type: "confirmed", email, id: uid, client: null };
+      }
+    }
+    // scope "local": ends only the link's own session on the server
+    function endLinkSession(lc) {
+      if (!lc || !lc.auth) return Promise.resolve();
+      return withTimeout(Promise.resolve(lc.auth.signOut({ scope: "local" })), 8000).catch(noop);
     }
     function removeAuthStorage() {
       lsDel(AUTH_KEY);
@@ -814,6 +1022,7 @@
     }
     async function stopClient(signOutLocal) {
       const client = SY.client;
+      const held = SY.link;
       SY.gen++;
       unsubscribeRealtime(client);
       try { if (SY.authSub) SY.authSub.unsubscribe(); } catch (e) { /* ignore */ }
@@ -821,7 +1030,9 @@
       SY.client = null;
       SY.user = null;
       SY.recovery = false;
+      SY.link = null;
       clearTimeout(SY.timers.write); clearTimeout(SY.timers.realtime); clearTimeout(SY.timers.retry);
+      if (held && held.client && signOutLocal) await endLinkSession(held.client);
       if (!client) return;
       if (signOutLocal) {
         // scope "local": the default ("global") would end the session on every device
@@ -845,6 +1056,11 @@
         if (st.settings && !st.settings.localOnly) st.settings.dirty = true;
         Object.assign(st.meta, { userId: null, cursorTx: null, cursorSettings: null, lastSyncAt: null });
       });
+    }
+
+    // "your e-mail is confirmed" is shown until the user signs in
+    function clearLinkNotice() {
+      if (SY.link && SY.link.type !== "recovery") { SY.link = null; scheduleEmit(); }
     }
 
     /* ── sync: accounts ──────────────────────── */
@@ -887,7 +1103,14 @@
             st.settings = null;
           } else {                                 // anonymous local use: keep everything and upload it
             for (const id in st.tx) if (!st.tx[id].localOnly) st.tx[id].dirty = true;
-            if (st.settings && !st.settings.localOnly) st.settings.dirty = true;
+            const s = st.settings;
+            if (s && !s.localOnly) {
+              // fields left at their defaults on a device that was not signed in never override the account's values
+              const ms = fieldStamps(s);
+              for (const k of SETTINGS_KEYS) if (isDefaultField(k, s.data[k])) ms[k] = 0;
+              s.fieldMs = ms;
+              s.dirty = true;
+            }
           }
           Object.assign(st.meta, { userId: uid, cursorTx: null, cursorSettings: null, lastSyncAt: null });
         });
@@ -976,7 +1199,7 @@
         ensureAlive(uid, gen);
         const first = !S.meta.cursorTx;
         const remote = await pull(client, uid, gen);
-        if (first && remote.hasData) await dropExamples(uid, remote.settingsRow);
+        if (first && remote.hasData) await dropExamples(uid);
         await push(client, uid, gen);
         const t = now();
         await commit(["meta"], st => { if (st.meta.userId === uid) st.meta.lastSyncAt = t; });
@@ -1021,7 +1244,7 @@
     }
 
     async function pull(client, uid, gen) {
-      const out = { hasData: false, settingsRow: null, again: false };
+      const out = { hasData: false, again: false };
       const cursor = S.meta.cursorTx;
       const lower = cursor ? tsShift(cursor, -OVERLAP_MS) : EPOCH;   // fixed lower bound for every page
       const seen = new Set();
@@ -1055,7 +1278,7 @@
         .gt("updated_at", sCursor ? tsShift(sCursor, -OVERLAP_MS) : EPOCH);
       if (!sres || sres.error) throw { res: sres || {} };
       const srow = Array.isArray(sres.data) && sres.data.length ? sres.data[0] : null;
-      if (srow) { out.hasData = true; out.settingsRow = srow; }
+      if (srow) out.hasData = true;
       ensureAlive(uid, gen);
       await commit(["settings", "meta"], st => {
         if (st.meta.userId !== uid) return;
@@ -1072,31 +1295,35 @@
         const rec = rowToRec(row);
         if (!rec) continue;
         const cur = st.tx[rec.id];
-        if (!cur) { if (!rec.deleted) st.tx[rec.id] = rec; continue; }
+        // tombstones are kept even for records this device never had: a later backup import must not bring them back
+        if (!cur) { st.tx[rec.id] = rec; continue; }
         if (!cur.localOnly && cur.dirty && cur.updatedMs > rec.updatedMs) continue;
         if (!cur.localOnly && !cur.dirty && cur.updatedMs === rec.updatedMs && !!cur.deleted === rec.deleted) continue;
         st.tx[rec.id] = rec;
       }
     }
+    // per field: the value changed last wins (see fieldStamps); a union that differs from the server's copy is pushed
     function mergeSettingsRow(st, row) {
       const remote = settingsRowToRec(row);
       const cur = st.settings;
-      if (cur && !cur.localOnly && cur.dirty && cur.updatedMs > remote.updatedMs) return;
-      if (cur && !cur.localOnly && !cur.dirty && cur.updatedMs === remote.updatedMs) return;
-      st.settings = remote;
+      if (!cur) { st.settings = remote; return; }
+      if (!cur.localOnly && !cur.dirty && cur.updatedMs === remote.updatedMs) return;   // our own write coming back
+      const m = mergeFields({ data: remote.data, ms: remote.fieldMs }, docOf(cur));
+      if (sameSettings(m.data, remote.data)) { st.settings = remote; return; }
+      // keep the local stamp when the local copy is the result and already newer; otherwise outdate both copies
+      const keep = !cur.localOnly && cur.updatedMs > remote.updatedMs && sameSettings(m.data, cur.data);
+      st.settings = { data: m.data, fieldMs: m.ms, updatedMs: keep ? cur.updatedMs : Math.max(bumpMs(now(), cur), remote.updatedMs + 1), dirty: true, localOnly: false };
     }
     // Signed into an account that already has data: the example budget goes away.
-    function dropExamples(uid, settingsRow) {
+    function dropExamples(uid) {
       const t = now();
       return commit(ALL, st => {
         if (st.meta.userId !== uid) return;
         for (const id of Object.keys(st.tx)) if (st.tx[id].localOnly) delete st.tx[id];
         const s = st.settings;
-        if (s && (s.localOnly || hasExampleFlags(s.data))) {
-          if (settingsRow) st.settings = settingsRowToRec(settingsRow);
-          else if (s.localOnly) st.settings = null;
-          else st.settings = { data: stripExample(s.data), updatedMs: bumpMs(t, s), dirty: true, localOnly: false };
-        }
+        // the account's settings row (if any) was merged field by field in pull(); what still holds example values is reset
+        if (s && s.localOnly) st.settings = null;
+        else if (s && hasExampleFlags(s.data)) st.settings = { data: stripExample(s.data), fieldMs: fieldStamps(s), updatedMs: bumpMs(t, s), dirty: true, localOnly: false };
       });
     }
     async function push(client, uid, gen) {
@@ -1118,7 +1345,7 @@
         ensureAlive(uid, gen);
         const ms = s.updatedMs;
         const res = await client.from("budget_settings").upsert(
-          { user_id: uid, data: s.data, client_updated_ms: Math.max(0, Math.round(ms || 0)) }, { onConflict: "user_id" });
+          { user_id: uid, data: settingsWire(s), client_updated_ms: Math.max(0, Math.round(ms || 0)) }, { onConflict: "user_id" });
         if (!res || res.error) throw { res: res || {} };
         await commit(["settings", "meta"], st => {
           if (st.meta.userId !== uid) return;
@@ -1150,12 +1377,23 @@
         try { settings = settingsData(data.settings); } catch (e) { throw fail("invalid", M.backupSettings); }
       }
       const sts = finite(data.settingsUpdatedAt) && data.settingsUpdatedAt > 0 ? Math.min(Math.round(data.settingsUpdatedAt), t) : null;
-      return { items, settings, settingsTs: sts };
+      // per-field stamps (written since they exist); older files: every field counts as changed at settingsUpdatedAt.
+      // A file with no stamps at all (made by hand or by another tool) is older than every value the user set here,
+      // but its own values still beat an example, a default or no settings at all (stamp 0): they get UNTIMED_MS.
+      const fms = isObj(data.settingsFieldsUpdatedAt) ? data.settingsFieldsUpdatedAt : {};
+      const settingsMs = {};
+      for (const k of SETTINGS_KEYS) {
+        settingsMs[k] = finite(fms[k]) && fms[k] >= 0 ? Math.min(Math.round(fms[k]), t)
+          : sts || (settings && !isDefaultField(k, settings[k]) ? UNTIMED_MS : 0);
+      }
+      return { items, settings, settingsTs: sts, settingsMs };
     }
     function importInto(st, parsed) {
       let added = 0, updated = 0, skipped = 0, settingsUpdated = false;
       const byId = new Map();
       for (const it of parsed.items) {
+        // example records are device-only seed data: importing them would upload the example into the account
+        if (it.fields.example === true) { skipped++; continue; }
         const p = byId.get(it.id);
         if (p) { skipped++; if ((it.ts || 0) > (p.ts || 0)) byId.set(it.id, it); }
         else byId.set(it.id, it);
@@ -1168,9 +1406,16 @@
         if (!cur || cur.deleted) added++; else updated++;
       }
       if (parsed.settings) {
+        // field by field, like a sync: a field from the file replaces the device's value only when it changed later;
+        // fields that still held example values in the file are not imported
         const cur = st.settings;
-        if (!cur || cur.localOnly || (parsed.settingsTs != null && parsed.settingsTs > (cur.updatedMs || 0))) {
-          st.settings = { data: parsed.settings, updatedMs: Math.max(parsed.settingsTs || 0, cur && !cur.localOnly ? cur.updatedMs + 1 : 0), dirty: true, localOnly: false };
+        const base = cur ? docOf(cur) : { data: clone(SETTINGS_DEFAULTS), ms: Object.assign({}, ZERO_MS) };
+        const ms = {};
+        for (const k of SETTINGS_KEYS) ms[k] = exFlag(parsed.settings, k) ? -1 : parsed.settingsMs[k];
+        const m = mergeFields(base, { data: parsed.settings, ms });
+        if (!sameSettings(m.data, base.data)) {
+          const top = Math.max(0, ...SETTINGS_KEYS.map(k => m.ms[k]));
+          st.settings = { data: m.data, fieldMs: m.ms, updatedMs: Math.max(top, cur ? (cur.updatedMs || 0) + 1 : 0), dirty: true, localOnly: false };
           settingsUpdated = true;
         }
       }
@@ -1181,8 +1426,11 @@
         const tx = [];
         for (const id in S.tx) { const r = S.tx[id]; if (liveRecord(r)) tx.push(toTx(r)); }
         tx.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt - b.createdAt) || (a.id < b.id ? -1 : 1)));
-        const out = { app: "budget", version: 1, exportedAt: new Date(now()).toISOString(), settings: S.settings ? clone(S.settings.data) : null, tx };
-        if (S.settings && S.settings.updatedMs > 0) out.settingsUpdatedAt = S.settings.updatedMs;
+        const out = { app: "budget", version: 1, exportedAt: new Date(now()).toISOString(), settings: S.settings ? publicSettings(S.settings.data) : null, tx };
+        if (S.settings && S.settings.updatedMs > 0) {
+          out.settingsUpdatedAt = S.settings.updatedMs;
+          out.settingsFieldsUpdatedAt = fieldStamps(S.settings);
+        }
         return out;
       },
       async import(data) {
@@ -1236,7 +1484,7 @@
         catch (e) { throw authError(e); }
         if (res && res.error) throw authError(res.error);
         const session = res && res.data && res.data.session;
-        if (session && session.user) { await adoptUser(session.user, SY.gen, true); return { needsConfirm: false }; }
+        if (session && session.user) { await adoptUser(session.user, SY.gen, true); clearLinkNotice(); return { needsConfirm: false }; }
         return { needsConfirm: true };
       },
       async signIn(email, password) {
@@ -1254,6 +1502,7 @@
         if (!user) throw fail("unknown", M.authFailed);
         SY.error = null;
         await adoptUser(user, SY.gen, true);
+        clearLinkNotice();
       },
       async signOut() {
         await boot();
@@ -1283,18 +1532,44 @@
         catch (e) { throw authError(e); }
         if (res && res.error) throw authError(res.error);
       },
+      // With a recovery link of another account than this device's (see handleLink) the password is changed through
+      // the link's own session, which then ends: this device keeps its account (or stays signed out).
       async updatePassword(password) {
         await boot();
-        const client = requireClient();
-        if (!SY.user) throw fail("auth", SY.recovery ? M.recoveryExpired : M.needSignIn);
+        const held = SY.link && SY.link.type === "recovery" && SY.link.client ? SY.link : null;
+        const client = held ? held.client : requireClient();
+        if (!held && !SY.user) throw fail("auth", SY.recovery ? M.recoveryExpired : M.needSignIn);
         if (String(password || "").length < 6) throw fail("invalid", M.shortPassword);
         if (!isOnline()) throw fail("network", M.network);
         let res;
         try { res = await client.auth.updateUser({ password: String(password) }); }
         catch (e) { throw authError(e); }
-        if (res && res.error) throw authError(res.error);
-        SY.recovery = false;
+        if (res && res.error) {
+          const e = authError(res.error);
+          if (held && e.code === "auth" && SY.link === held) {   // the link's session is gone: ask for a new e-mail
+            SY.link = null;
+            SY.error = M.recoveryExpired;
+            scheduleEmit();
+            throw fail("auth", M.recoveryExpired, res.error);
+          }
+          throw e;
+        }
+        if (held) {
+          if (SY.link === held) SY.link = null;
+          await endLinkSession(held.client);
+        } else SY.recovery = false;
         scheduleEmit();
+      },
+      // The password stays as it is: a held recovery link (another account's) is ended, and the form goes away.
+      // A link the user did not ask for must not lock the app in the password form until it is relaunched.
+      async cancelRecovery() {
+        await boot();
+        const held = SY.link && SY.link.type === "recovery" ? SY.link : null;
+        if (held) SY.link = null;
+        SY.recovery = false;
+        if (SY.error === M.recoveryExpired) SY.error = null;
+        scheduleEmit();
+        if (held && held.client) await endLinkSession(held.client);
       },
       async syncNow() {
         await boot();
@@ -1333,7 +1608,8 @@
           const prev = st.settings;
           // the example settings stay device-only until the user enters a value of their own
           const keepLocal = !!(prev && prev.localOnly) && onlyExampleOrDefault(data);
-          st.settings = { data, updatedMs: bumpMs(t, prev), dirty: !keepLocal, localOnly: keepLocal };
+          const updatedMs = bumpMs(t, prev);
+          st.settings = { data, fieldMs: stampFields(prev, data, updatedMs), updatedMs, dirty: !keepLocal, localOnly: keepLocal };
         });
         afterWrite();
       },
