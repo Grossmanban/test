@@ -107,7 +107,7 @@
     </fieldset>
     <p class="hint" id="savingHint" hidden></p>
     <div class="row2">
-      <label class="field"><span>Дата</span><input class="input" type="date" id="txDate" required></label>
+      <label class="field"><span>Дата</span><input class="input" type="date" id="txDate" min="1900-01-01" max="2199-12-31" required></label>
       <label class="field"><span>Комментарий</span><input class="input" id="txNote" maxlength="80" enterkeyhint="done" autocomplete="off" placeholder="Например: продукты на неделю"></label>
     </div>
     <p class="err" id="txErr" hidden></p>
@@ -136,7 +136,7 @@
     <label class="field"><span>На что копите</span><input class="input" id="gName" maxlength="60" placeholder="Например: подушка безопасности" autocomplete="off"></label>
     <div class="row2">
       <label class="field"><span>Нужная сумма</span><div class="money-input"><input class="input num" id="gTarget" inputmode="decimal" autocomplete="off" placeholder="300 000"></div></label>
-      <label class="field"><span>Срок (необязательно)</span><input class="input" type="date" id="gDeadline"></label>
+      <label class="field"><span>Срок (необязательно)</span><input class="input" type="date" id="gDeadline" min="1900-01-01" max="2199-12-31"></label>
     </div>
     <label class="field"><span>Уже отложено до начала учёта</span><div class="money-input"><input class="input num" id="gInitial" inputmode="decimal" autocomplete="off" placeholder="0"></div></label>
     <p class="hint">Прогресс складывается из этой суммы и всех операций «В копилку».</p>

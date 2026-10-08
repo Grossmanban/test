@@ -98,16 +98,17 @@ ${appHtml}
   writeFile(path.join(dist, "index.html"), index);
 
   // service worker: precache the app shell; the version changes whenever any shipped byte changes
-  const skip = new Set(["LICENSES.md", ".nojekyll"]);
+  // the 512px icons are only fetched by the browser at install time: keep them out of every update download
+  const skip = new Set(["LICENSES.md", ".nojekyll", "icons/icon-512.png", "icons/icon-maskable-512.png"]);
   const shipped = ["index.html", cssName, jsName, "config.js", "manifest.webmanifest",
     ...assets.filter(a => !skip.has(a) && !a.endsWith(".md"))];
-  const version = hash(shipped.map(f => f + ":" + hash(fs.readFileSync(path.join(dist, f)), 16)).join("\n"), 12);
-  const precache = ["./", ...shipped.map(f => "./" + f)];
   const swSrc = need(src("sw.js"));
+  const version = hash(swSrc + "\n" + shipped.map(f => f + ":" + hash(fs.readFileSync(path.join(dist, f)), 16)).join("\n"), 12);
+  const precache = ["./", ...shipped.map(f => "./" + f)];
   if (!swSrc.includes('"__BUILD_VERSION__"') || !swSrc.includes("__PRECACHE_LIST__")) {
     console.error("build: src/sw.js must contain \"__BUILD_VERSION__\" and __PRECACHE_LIST__"); process.exit(1);
   }
-  const sw = swSrc.replace('"__BUILD_VERSION__"', JSON.stringify(version)).replace("__PRECACHE_LIST__", JSON.stringify(precache, null, 2));
+  const sw = swSrc.replace('"__BUILD_VERSION__"', () => JSON.stringify(version)).replace("__PRECACHE_LIST__", () => JSON.stringify(precache, null, 2));
   writeFile(path.join(dist, "sw.js"), sw);
   console.log(`pwa: dist/pwa (${shipped.length + 1} files, version ${version})`);
 }

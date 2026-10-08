@@ -700,8 +700,8 @@
     const date = $("#txDate").value;
     const fail = msg => { err.textContent = msg; err.hidden = false; };
     if (amount == null || Number.isNaN(amount) || amount <= 0) { fail("Введите сумму больше нуля, например 1 250 или 349,90."); $("#txAmount").focus(); return; }
-    if (amount > 1e10) { fail("Сумма слишком большая. Проверьте, нет ли лишних цифр."); return; }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { fail("Укажите дату операции."); $("#txDate").focus(); return; }
+    if (amount >= 1e10) { fail("Сумма слишком большая. Проверьте, нет ли лишних цифр."); return; }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < "1900-01-01" || date > "2199-12-31") { fail("Укажите дату операции между 1900 и 2199 годом."); $("#txDate").focus(); return; }
     const data = {
       type, amount, date,
       category: catEl ? catEl.value : (type === "saving" ? "savings" : "other"),

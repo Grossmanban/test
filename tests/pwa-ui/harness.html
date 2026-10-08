@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>pwa.js harness</title>
+<link rel="stylesheet" href="/public/fonts.css">
+<link rel="stylesheet" href="/src/app.css">
+<link rel="stylesheet" href="/src/pwa.css">
+<style>
+  /* harness-only: a stand-in for the overview so the page is not empty */
+  .stub { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 18px; color: var(--ink-2); }
+  .stub h2 { margin: 0 0 6px; font-family: var(--font-display); font-size: 16px; color: var(--ink); }
+  .gallery { display: flex; flex-wrap: wrap; gap: 14px 18px; align-items: center; }
+  .gallery figure { margin: 0; display: grid; justify-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<!-- markup copied from src/app.html (top bar, notices) -->
+<div class="app">
+  <header class="topbar">
+    <div class="brand-row">
+      <div class="brand">
+        <div class="brand-mark" data-icon="Wallet"></div>
+        <div>
+          <h1>Домашняя бухгалтерия</h1>
+          <p>Доходы, расходы и цель накоплений в рублях</p>
+        </div>
+      </div>
+      <div class="top-tools" id="pwaTop"></div>
+    </div>
+    <nav class="month-nav" aria-label="Выбор месяца">
+      <button class="icon-btn" id="prevMonth" aria-label="Предыдущий месяц" data-icon="ChevronLeft"></button>
+      <div class="month-label" id="monthLabel">Октябрь <span>2026</span></div>
+      <button class="icon-btn" id="nextMonth" aria-label="Следующий месяц" data-icon="ChevronRight"></button>
+    </nav>
+    <button class="btn btn-primary" id="addBtn"><span data-icon="Plus"></span>Новая операция</button>
+  </header>
+
+  <div class="notice" id="notice" hidden></div>
+  <div id="pwaBanner"></div>
+
+  <section class="stub" id="stub">
+    <h2>Сводка</h2>
+    <p>Здесь в приложении карточка остатка, операции и категории. Харнесс проверяет только интерфейс pwa.js.</p>
+    <div class="gallery" id="gallery"></div>
+  </section>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<div class="sr" id="live" role="status" aria-live="polite"></div>
+
+<script src="/__lucide.js"></script>
+<script src="/tests/pwa-ui/mock-app.js"></script>
+<script src="/src/pwa.js"></script>
+</body>
+</html>

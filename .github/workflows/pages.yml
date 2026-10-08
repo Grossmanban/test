@@ -29,6 +29,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Test the store and sync engine
+        run: node --test tests/store-pwa.test.mjs
+
       - name: Build
         run: node tools/build.mjs
 

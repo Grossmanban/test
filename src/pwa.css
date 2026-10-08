@@ -1,0 +1,152 @@
+/* PWA-only UI: sync status button, account dialog, install banner (src/pwa.js).
+   Colours come only from the tokens in app.css, so light and dark themes both work. */
+
+/* ── Sync status button (top bar, #pwaTop) ─────── */
+.pwa-sync {
+  position: relative; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--line); color: var(--ink-2);
+}
+.pwa-sync-ic { display: grid; place-items: center; }
+.pwa-sync[data-tone="off"] { color: var(--muted); }
+.pwa-sync[data-tone="warn"] { color: var(--warn); }
+.pwa-sync[data-tone="err"] { color: var(--danger); }
+.pwa-dot {
+  position: absolute; right: 4px; bottom: 4px; width: 10px; height: 10px; border-radius: 999px;
+  background: var(--muted); box-shadow: 0 0 0 2px var(--surface); pointer-events: none;
+}
+.pwa-sync[data-tone="off"] .pwa-dot { display: none; }
+.pwa-sync[data-tone="ok"] .pwa-dot { background: var(--income); }
+.pwa-sync[data-tone="busy"] .pwa-dot { background: var(--accent); }
+.pwa-sync[data-tone="warn"] .pwa-dot { background: var(--warn); }
+.pwa-sync[data-tone="err"] .pwa-dot { background: var(--danger); }
+/* pending count while offline / failing: a small pill on the top-right corner */
+.pwa-dot.is-count {
+  width: auto; height: 17px; min-width: 17px; padding: 0 4px; top: -4px; right: -4px; bottom: auto;
+  color: var(--surface); font-size: 10.5px; font-weight: 800; line-height: 17px; text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+@keyframes pwa-spin { to { transform: rotate(360deg); } }
+.pwa-sync[data-phase="syncing"] .ic, .pwa-status.is-busy > .ic { animation: pwa-spin 1.4s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .pwa-sync[data-phase="syncing"] .ic, .pwa-status.is-busy > .ic { animation: none; }
+}
+
+/* ── Install banner (#pwaBanner) ───────────────── */
+#pwaBanner:empty { display: none; }
+#pwaBanner .pwa-install {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) auto auto; align-items: center;
+  gap: 10px 12px; padding: 8px 6px 8px 16px;
+}
+#pwaBanner .pwa-install > .ic { margin: 0; }
+#pwaBanner .pwa-install p { flex: none; margin: 0; }
+#pwaBanner .pwa-install .icon-btn .ic { color: var(--ink-2); }
+#pwaBanner .pwa-install .btn .ic { color: currentColor; }
+.pwa-share { display: inline-block; vertical-align: -3px; margin: 0 2px; }
+.pwa-share .ic { width: 16px; height: 16px; }
+@media (max-width: 640px) {
+  #pwaBanner .pwa-install { grid-template-columns: 18px minmax(0, 1fr) auto; align-items: start; }
+  #pwaBanner .pwa-install > .ic { margin-top: 2px; }
+  #pwaBanner .pwa-install p { align-self: center; }
+  #pwaBanner .pwa-install .btn { grid-column: 2; grid-row: 2; justify-self: start; }
+  #pwaBanner .pwa-install .icon-btn { grid-column: 3; grid-row: 1; margin: -6px 0; }
+}
+
+/* ── Account dialog ────────────────────────────── */
+.pwa-dlg .dlg { gap: 18px; }
+#pwaTitle:focus { outline: none; }
+.pwa-view, .pwa-form { display: grid; gap: 14px; min-width: 0; }
+.pwa-view:empty, #pwaUpdate:empty, #pwaBkMsg:empty, #pwaFlash:empty, #pwaSyErr:empty, #pwaOutWarn:empty { display: none; }
+.pwa-lead { margin: 0; font-size: 14.5px; color: var(--ink-2); }
+.pwa-dlg a { color: var(--accent); font-weight: 700; text-underline-offset: 2px; }
+.pwa-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pwa-actions .spacer { flex: 1; }
+.pwa-stack { display: grid; gap: 4px; }
+.pwa-stack .btn-quiet { justify-self: center; }
+.pwa-two { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); gap: 8px; }
+.pwa-link {
+  border: 0; background: none; padding: 0; color: var(--accent); font-weight: 700; font-size: inherit;
+  text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.pwa-proj { overflow-wrap: anywhere; }
+.pwa-proj b { color: var(--ink-2); }
+
+/* guide link + copyable address */
+.pwa-guide {
+  display: grid; gap: 6px; padding: 12px 8px 8px 14px; border-radius: 14px;
+  background: var(--surface-2); border: 1px solid var(--line);
+}
+.pwa-guide .hint { color: var(--ink-2); padding-right: 6px; }
+.pwa-url { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.pwa-url code {
+  flex: 1; min-width: 0; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--ink); overflow-wrap: anywhere; -webkit-user-select: all; user-select: all;
+}
+
+/* password field with show / hide */
+.pwa-pass { position: relative; }
+.pwa-pass .input { padding-right: 48px; }
+.pwa-pass .pwa-eye { position: absolute; top: 0; bottom: 0; right: 4px; margin: auto 0; }
+
+/* status lines (reuse .status from app.css, plus an error and a busy tone) */
+.pwa-dlg .status { margin: 0; }
+.pwa-status > div { display: grid; gap: 2px; min-width: 0; flex: 1; }
+.pwa-status b { font-weight: 700; overflow-wrap: anywhere; }
+.pwa-dlg .status.is-err { background: var(--danger-soft); }
+.pwa-dlg .status.is-err .ic { color: var(--danger); }
+.pwa-dlg .status.is-busy { background: var(--surface-2); }
+.pwa-dlg .status.is-busy .ic { color: var(--accent); }
+.pwa-update { align-items: center; flex-wrap: wrap; }
+.pwa-update .btn { margin-left: auto; }
+
+/* e-mail sent / password recovery note */
+.pwa-note {
+  display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 12px; align-items: start;
+  padding: 14px; border-radius: 14px; background: var(--accent-soft);
+}
+.pwa-note-ic { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: var(--surface); color: var(--accent); }
+.pwa-note p { margin: 0; font-size: 14px; color: var(--ink-2); overflow-wrap: anywhere; }
+.pwa-note p + p { margin-top: 6px; }
+.pwa-note b { color: var(--ink); }
+
+/* signed-in account */
+.pwa-user { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.pwa-avatar {
+  width: 44px; height: 44px; border-radius: 999px; flex: none; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+}
+.pwa-avatar .ic { width: 24px; height: 24px; }
+.pwa-user-txt { display: grid; min-width: 0; }
+.pwa-user-txt small { font-size: 12.5px; color: var(--muted); }
+.pwa-email { font-size: 15.5px; font-weight: 800; overflow-wrap: anywhere; }
+
+/* inline confirms (sign out, disconnect) */
+.confirm.pwa-confirm { display: grid; gap: 8px; align-items: stretch; padding: 14px; font-weight: 500; }
+.pwa-confirm p { margin: 0; font-size: 14px; color: var(--ink-2); }
+.pwa-confirm .pwa-confirm-q { color: var(--ink); font-weight: 800; }
+.pwa-confirm .pwa-actions { margin-top: 4px; }
+.pwa-loud {
+  display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px; border-radius: 10px;
+  background: var(--surface); border: 1.5px solid var(--danger);
+}
+.pwa-confirm .pwa-loud { color: var(--danger); font-weight: 700; }
+.pwa-loud .ic { margin-top: 1px; }
+
+/* backup section */
+.pwa-sec { display: grid; gap: 12px; padding-top: 18px; border-top: 1px solid var(--line); }
+.pwa-sec h3 { margin: 0; font-size: 15px; font-weight: 800; }
+.pwa-ver { text-align: center; font-size: 12px; }
+
+/* phones: no sticky footer in this sheet, so it keeps its own bottom padding */
+@media (max-width: 640px), (max-height: 500px) {
+  .pwa-dlg .dlg { --dlg-pb: calc(18px + env(safe-area-inset-bottom, 0px)); }
+}
+@media (max-width: 640px) {
+  .pwa-actions .btn:not(.btn-sm) { flex: 1 1 auto; }
+  .pwa-actions .spacer { display: none; }
+  .pwa-confirm .pwa-actions .btn { flex: 1 1 auto; }
+}
+@media (pointer: coarse) {
+  .pwa-pass .pwa-eye { right: 0; }
+  .pwa-link { padding: 13px 4px; margin: -13px -4px; }
+  .pwa-dlg .btn-sm:not(.dlg-kb-save), #pwaBanner .btn-sm { height: 44px; }
+}
