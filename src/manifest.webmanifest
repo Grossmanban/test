@@ -1,0 +1,20 @@
+{
+  "name": "Домашняя бухгалтерия",
+  "short_name": "Бюджет",
+  "description": "Личный бюджет в рублях: доходы, расходы, лимиты по категориям и цель накоплений. Работает без интернета, синхронизируется между устройствами через ваш Supabase.",
+  "lang": "ru",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#edf1ef",
+  "theme_color": "#edf1ef",
+  "categories": ["finance", "productivity"],
+  "prefer_related_applications": false,
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

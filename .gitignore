@@ -1,3 +1,21 @@
+# build output (node tools/build.mjs)
 dist/
+
+# dependencies, if anyone installs tooling locally
 node_modules/
+
+# OS / editor noise
 .DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# test scratch: screenshots, Playwright reports, temp clusters, logs
+test-results/
+playwright-report/
+tests/**/shots/
+tests/**/out/
+tests/**/tmp/
+*.log
+.tmp/
