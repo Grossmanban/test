@@ -1,5 +1,5 @@
 /*
- * store-pwa.js: the PWA storage adapter for «Домашняя бухгалтерия».
+ * store-pwa.js: the PWA storage adapter for «Money honey».
  *
  * window.createBudgetStore(opts) → Store (docs/ARCHITECTURE.md: Store, store.sync,
  * store.backup, snap.sync). Local-first: every write lands in IndexedDB first
@@ -37,17 +37,27 @@
   const OVERLAP_MS = 2 * 60 * 1000;
   const MAX_AMOUNT = 9999999999.99;           // schema: amount > 0 and amount < 1e10
   const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+  const GOAL_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;   // Goal.id = Tx.goalId = transactions.goal_id (schema check)
+  const CAT_ID_RE = /^c_[a-z0-9]{4,20}$/;       // CustomCategory.id
+  const LIMIT_KEY_RE = /^[A-Za-z0-9_-]{1,32}$/; // limits: expense category id (built-in or custom)
+  const ICON_RE = /^[A-Za-z0-9_-]{1,40}$/;      // lucide icon name
+  const MAX_GOALS = 20, MAX_CATEGORIES = 60, MAX_LIMITS = 100;
+  const MAX_DATE_MS = 8.64e15;
+  // Settings documents larger than this are refused by saveSettings / backup import. Measured like the server's
+  // check (octet_length(data::text) <= 65536, jsonb text has ", " and ": " separators), with room left for _ms.
+  const MAX_SETTINGS_BYTES = 60000;
   const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const TYPES = ["income", "expense", "saving"];
-  const SETTINGS_KEYS = ["startBalance", "goal", "limits"];
-  const SETTINGS_DEFAULTS = { startBalance: 0, goal: null, limits: {} };
+  const SETTINGS_KEYS = ["startBalance", "goals", "limits", "categories"];
+  const SETTINGS_DEFAULTS = { startBalance: 0, goals: [], limits: {}, categories: [] };
+  const BACKUP_VERSION = 2;                   // 2: settings v2 (goals, categories), tx.goalId; files of version 1 import too
   const ID_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const STALE = { stale: true };              // thrown to abandon a sync whose account is gone
 
   const M = {
     txInvalid: "Не удалось сохранить: проверьте данные операции.",
     txType: "Не удалось сохранить: неизвестный тип операции.",
-    txAmount: "Сумма должна быть больше нуля и меньше 10 000 000 000 ₽.",
+    txAmount: "Сумма должна быть больше нуля и меньше 10 000 000 000 ₪.",
     txDate: "Укажите дату операции.",
     txId: "Не удалось сохранить: неверный идентификатор операции.",
     settingsInvalid: "Не удалось сохранить: проверьте введённые значения.",
@@ -80,6 +90,7 @@
     noLibrary: "Модуль синхронизации не загрузился. Обновите страницу.",
     badKey: "Неверный ключ проекта. Проверьте ключ в настройках синхронизации.",
     noSchema: "В проекте Supabase нет таблиц бюджета. Выполните supabase/schema.sql в SQL Editor.",
+    oldSchema: "Схема базы в проекте Supabase устарела. Выполните supabase/schema.sql в SQL Editor ещё раз: записи сохранятся.",
     serverReadOnly: "Проект Supabase сейчас открыт только для чтения (закончилось место). Изменения сохраняются на устройстве.",
     serverFull: "В проекте Supabase закончилось место. Изменения сохраняются на устройстве.",
     serverRejected: "Сервер отклонил данные. Проверьте, что схема базы обновлена (supabase/schema.sql).",
@@ -158,6 +169,23 @@
 
   /* ── validation of what the UI / a backup file hands us ─────────────── */
   function badTx(reason, message) { const e = fail("invalid", message); e.reason = reason; return e; }
+  // Text as the server takes it: no NUL (Postgres text and jsonb refuse it), no lone UTF-16 surrogate (the server's
+  // JSON parser refuses it; cutting a string inside an emoji leaves one), at most max UTF-16 units. oneLine also drops
+  // the other control characters (names).
+  function cleanText(s, max, oneLine) {
+    let out = "";
+    for (let i = 0; i < s.length && out.length < max; i++) {
+      const c = s.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        const n = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+        if (n >= 0xdc00 && n <= 0xdfff) { if (out.length + 2 > max) break; out += s[i] + s[i + 1]; i++; }
+        continue;
+      }
+      if ((c >= 0xdc00 && c <= 0xdfff) || c === 0 || (oneLine && (c < 0x20 || c === 0x7f))) continue;
+      out += s[i];
+    }
+    return out;
+  }
   function txFields(d, createdDefault) {
     if (!isObj(d)) throw badTx("запись повреждена", M.txInvalid);
     if (!TYPES.includes(d.type)) throw badTx("неизвестный тип операции", M.txType);
@@ -166,78 +194,131 @@
     if (!validDate(d.date)) throw badTx("неверная дата", M.txDate);
     if (d.category != null && typeof d.category !== "string") throw badTx("неверная категория", M.txInvalid);
     if (d.note != null && typeof d.note !== "string") throw badTx("неверный комментарий", M.txInvalid);
-    let category = (d.category || "").trim().slice(0, 32);
+    let category = cleanText((d.category || "").trim(), 32, true);
     if (!category) category = d.type === "income" ? "other_in" : d.type === "saving" ? "savings" : "other";
     const out = {
       type: d.type, amount, category,
-      note: (d.note || "").slice(0, 80),
+      note: cleanText(d.note || "", 80, false),
       date: d.date,
       createdAt: finite(d.createdAt) && d.createdAt >= 0 ? Math.round(d.createdAt) : createdDefault,
     };
+    // the goal a saving went to; anything else (other types, bad ids) is dropped: missing = the first goal
+    if (d.type === "saving" && typeof d.goalId === "string" && GOAL_ID_RE.test(d.goalId)) out.goalId = d.goalId;
     if (d.example === true) out.example = true;
     return out;
   }
 
-  function settingsData(s) {
-    const bad = () => fail("invalid", M.settingsInvalid);
-    if (!isObj(s)) throw bad();
-    let out;
-    try { out = JSON.parse(JSON.stringify(s)); } catch (e) { throw bad(); }   // keeps unknown fields, JSON-safe
-    delete out._ms;                                                         // field stamps are the store's own, never taken from outside
-    const sb = s.startBalance == null ? 0 : s.startBalance;
-    if (!finite(sb) || Math.abs(sb) > MAX_AMOUNT) throw bad();
-    out.startBalance = r2(sb);
-    if (s.goal == null) out.goal = null;
-    else {
-      const g = s.goal;
-      if (!isObj(g) || typeof g.name !== "string" || !finite(g.target) || g.target <= 0 || g.target > MAX_AMOUNT) throw bad();
-      const deadline = g.deadline == null ? "" : g.deadline;
-      if (deadline !== "" && !validDate(deadline)) throw bad();
-      const initial = g.initial == null ? 0 : g.initial;
-      if (!finite(initial) || initial < 0 || initial > MAX_AMOUNT) throw bad();
-      out.goal = { name: g.name.trim().slice(0, 60), target: r2(g.target), deadline, initial: r2(initial) };
+  /* ── settings documents (v2: goals, categories) ─────────────────────── */
+  const utf8Len = s => (typeof root.TextEncoder === "function" ? new root.TextEncoder().encode(s).length : s.length * 3);
+  // bytes of a JSON value printed the way Postgres prints jsonb (", " and ": " separators): what the server's
+  // size check (octet_length(data::text)) measures
+  function pgJsonBytes(v) {
+    let extra = 0;
+    const walk = x => {
+      if (Array.isArray(x)) { extra += Math.max(0, x.length - 1); x.forEach(walk); }
+      else if (isObj(x)) { const ks = Object.keys(x); extra += ks.length + Math.max(0, ks.length - 1); ks.forEach(k => walk(x[k])); }
+    };
+    walk(v);
+    return utf8Len(JSON.stringify(v)) + extra;
+  }
+  const iconOf = (v, dflt) => (typeof v === "string" && ICON_RE.test(v) ? v : dflt);
+  function goalOf(g) {
+    if (!isObj(g) || typeof g.id !== "string" || !GOAL_ID_RE.test(g.id) || typeof g.name !== "string") return null;
+    const target = finite(g.target) && g.target <= MAX_AMOUNT ? r2(g.target) : 0;
+    const deadline = g.deadline == null ? "" : g.deadline;
+    const initial = g.initial == null ? 0 : g.initial;
+    if (!(target > 0) || (deadline !== "" && !validDate(deadline)) || !finite(initial) || initial < 0 || initial > MAX_AMOUNT) return null;
+    return {
+      id: g.id, name: cleanText(g.name.trim(), 60, true), target, deadline, initial: r2(initial),
+      icon: iconOf(g.icon, "Target"),
+      createdAt: finite(g.createdAt) && g.createdAt >= 0 && g.createdAt <= MAX_DATE_MS ? Math.round(g.createdAt) : 0,
+    };
+  }
+  function categoryOf(c) {
+    if (!isObj(c) || typeof c.id !== "string" || !CAT_ID_RE.test(c.id) || (c.type !== "income" && c.type !== "expense") || typeof c.name !== "string") return null;
+    const out = { id: c.id, type: c.type, name: cleanText(c.name.trim(), 32, true), icon: iconOf(c.icon, "Ellipsis") };
+    if (c.archived === true) out.archived = true;
+    return out;
+  }
+  // entries of a list with valid, unique ids, at most max of them
+  function listOf(arr, max, entry) {
+    const out = [], ids = new Set();
+    for (const raw of arr) {
+      if (out.length >= max) break;
+      const v = entry(raw);
+      if (v && !ids.has(v.id)) { ids.add(v.id); out.push(v); }
     }
+    return out;
+  }
+  // A settings document as the store keeps and syncs it (docs/ARCHITECTURE.md, Settings). A v1 document carries
+  // goal: {…} | null instead of goals: goals = goal ? [{ id: "g_main", icon: "Target", createdAt: 0, ...goal }] : [].
+  // strict (saveSettings, backup files): a malformed field or an oversized document rejects the whole document;
+  // otherwise (stored records, server rows) a malformed field falls back to its default. Invalid goals, categories and
+  // limits entries are dropped in both modes. Unknown top-level fields are kept; _ms and the legacy goal never are.
+  function settingsData(s, strict) {
+    const bad = () => fail("invalid", M.settingsInvalid);
+    if (!isObj(s)) { if (strict) throw bad(); s = {}; }
+    let out;
+    try { out = JSON.parse(JSON.stringify(s)); } catch (e) { if (strict) throw bad(); out = {}; s = {}; }
+    delete out._ms;                                                         // field stamps are the store's own, never taken from outside
+    delete out.goal;                                                        // v1 field: migrated into goals, never written again
+    const sb = s.startBalance == null ? 0 : s.startBalance;
+    if (finite(sb) && Math.abs(sb) <= MAX_AMOUNT) out.startBalance = r2(sb);
+    else if (strict) throw bad();
+    else out.startBalance = 0;
+    const goals = s.goals != null ? s.goals : isObj(s.goal) ? [Object.assign({ id: "g_main", icon: "Target", createdAt: 0 }, s.goal)] : [];
+    if (!Array.isArray(goals) && strict) throw bad();
+    out.goals = Array.isArray(goals) ? listOf(goals, MAX_GOALS, goalOf) : [];
     out.limits = {};
-    if (s.limits != null) {
-      if (!isObj(s.limits)) throw bad();
+    if (s.limits != null && !isObj(s.limits)) { if (strict) throw bad(); }
+    else if (s.limits != null) {
+      let n = 0;
       for (const [k, v] of Object.entries(s.limits)) {
-        if (k && k.length <= 32 && finite(v) && v > 0 && v <= MAX_AMOUNT) out.limits[k] = r2(v);
+        if (n >= MAX_LIMITS) break;
+        if (k !== "__proto__" && LIMIT_KEY_RE.test(k) && finite(v) && v <= MAX_AMOUNT && r2(v) > 0) { out.limits[k] = r2(v); n++; }
       }
     }
-    const ex = isObj(s.example) ? SETTINGS_KEYS.filter(k => s.example[k] === true) : [];
-    if (ex.length) { out.example = {}; for (const k of ex) out.example[k] = true; }
+    const cats = s.categories == null ? [] : s.categories;
+    if (!Array.isArray(cats) && strict) throw bad();
+    out.categories = Array.isArray(cats) ? listOf(cats, MAX_CATEGORIES, categoryOf) : [];
+    const ex = isObj(s.example) ? s.example : {};
+    const flags = SETTINGS_KEYS.filter(k => ex[k] === true || (k === "goals" && ex.goal === true));   // v1 flag example.goal
+    if (flags.length) { out.example = {}; for (const k of flags) out.example[k] = true; }
     else delete out.example;
-    const json = JSON.stringify(out);
-    const bytes = typeof root.TextEncoder === "function" ? new root.TextEncoder().encode(json).length : json.length * 3;
-    if (bytes > 30000) throw bad();
+    if (strict && pgJsonBytes(out) > MAX_SETTINGS_BYTES) throw bad();
     return out;
   }
   const hasExampleFlags = d => !!(d && isObj(d.example) && Object.keys(d.example).length);
+  // whether a raw (maybe v1) document holds field k at all
+  const hasField = (raw, k) => isObj(raw) && (raw[k] !== undefined || (k === "goals" && raw.goal !== undefined));
   function isDefaultField(k, v) {
     if (k === "startBalance") return !v;
-    if (k === "goal") return v == null;
-    return !v || (isObj(v) && !Object.keys(v).length);
+    if (k === "goals" || k === "categories") return !Array.isArray(v) || !v.length;
+    return !isObj(v) || !Object.keys(v).length;
   }
 
   /* ── settings: per-field last writer wins ──────
-   * The settings document has three independent fields. Each local record keeps a timestamp per field
-   * (rec.fieldMs = { startBalance, goal, limits }); on the server they travel inside the document as
-   * data._ms = { startBalance, goal, limits, at } (at = the row's client_updated_ms). Merging takes every
-   * field from the side that changed it last, so offline edits of different fields on two devices both
-   * survive. Example values and values reset by «Удалить пример» carry 0: they never beat a real value.
-   * The UI never sees _ms: settingsData() drops it and the stamps are recomputed on every save. */
-  const ZERO_MS = { startBalance: 0, goal: 0, limits: 0 };
+   * The settings document has four independent fields (startBalance, goals, limits, categories). Each local record
+   * keeps a timestamp per field (rec.fieldMs); on the server they travel inside the document as
+   * data._ms = { startBalance, goals, limits, categories, at } (at = the row's client_updated_ms). Merging takes every
+   * field from the side that changed it last, so offline edits of different fields on two devices both survive.
+   * Example values and values reset by «Удалить пример» carry 0: they never beat a real value.
+   * The UI never sees _ms: settingsData() drops it and the stamps are recomputed on every save.
+   * v1 records and rows stamp the goal as goal: that stamp applies to goals. */
+  const ZERO_MS = { startBalance: 0, goals: 0, limits: 0, categories: 0 };
   // stamp of a value from a backup file without any timestamps: newer than "not the user's value" (0), older than any edit
   const UNTIMED_MS = 1;
   const exFlag = (d, k) => !!(d && isObj(d.example) && d.example[k] === true);
+  function sameJson(a, b) {
+    if (a === b) return true;
+    if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((v, i) => sameJson(v, b[i]));
+    if (!isObj(a) || !isObj(b)) return false;
+    const ka = Object.keys(a);
+    return ka.length === Object.keys(b).length && ka.every(k => Object.prototype.hasOwnProperty.call(b, k) && sameJson(a[k], b[k]));
+  }
   function sameValue(k, a, b) {
     if (k === "startBalance") return (a || 0) === (b || 0);
-    if (k === "goal") {
-      if (a == null || b == null) return a == null && b == null;
-      return a.name === b.name && a.target === b.target && (a.deadline || "") === (b.deadline || "") && (a.initial || 0) === (b.initial || 0);
-    }
-    const ea = Object.entries(isObj(a) ? a : {}), ob = isObj(b) ? b : {};
-    return ea.length === Object.keys(ob).length && ea.every(([key, v]) => ob[key] === v);
+    return sameJson(a == null ? SETTINGS_DEFAULTS[k] : a, b == null ? SETTINGS_DEFAULTS[k] : b);
   }
   const sameField = (k, da, db) => sameValue(k, da[k], db[k]) && exFlag(da, k) === exFlag(db, k);
   const sameSettings = (da, db) => SETTINGS_KEYS.every(k => sameField(k, da, db));
@@ -252,13 +333,38 @@
     return out;
   }
   const docOf = rec => ({ data: rec.data, ms: fieldStamps(rec) });
+  // A stored settings record (IndexedDB, localStorage fallback) in the current shape: v2 data and a stamp for every
+  // field. A v1 record's fieldMs.goal becomes the stamp of goals; a field the record does not hold at all
+  // (categories in v1) gets 0, so it never beats a value set elsewhere.
+  function normSettingsRec(rec) {
+    if (!isObj(rec) || !isObj(rec.data)) return null;
+    const raw = rec.data;
+    const data = settingsData(raw, false);
+    const fm = isObj(rec.fieldMs) ? rec.fieldMs : {};
+    const updatedMs = finite(rec.updatedMs) && rec.updatedMs > 0 ? rec.updatedMs : 0;
+    const ok = v => finite(v) && v >= 0;
+    const fieldMs = {};
+    for (const k of SETTINGS_KEYS) {
+      let v = fm[k];
+      if (k === "goals" && !ok(v) && !Array.isArray(raw.goals)) v = fm.goal;
+      if (!ok(v)) v = rec.localOnly || !hasField(raw, k) ? 0 : updatedMs;
+      fieldMs[k] = exFlag(data, k) ? 0 : v;
+    }
+    return { data, fieldMs, updatedMs, dirty: !!rec.dirty, localOnly: !!rec.localOnly };
+  }
   // A server row's stamps are trusted only when _ms.at equals its client_updated_ms: an app version without
   // per-field stamps keeps an old _ms when it rewrites the document, and its row then counts as changed as a whole.
+  // A field without a stamp of its own (an app version that did not know the field carried it along) counts as
+  // changed at client_updated_ms; a field the document does not hold at all gets 0 (it says nothing about it).
   function rowStamps(raw, data, cum) {
-    const m = isObj(raw) && isObj(raw._ms) ? raw._ms : null;
-    const ok = !!m && m.at === cum && SETTINGS_KEYS.every(k => finite(m[k]) && m[k] >= 0 && m[k] <= cum);
+    const m = isObj(raw) && isObj(raw._ms) && raw._ms.at === cum ? raw._ms : null;
+    const ok = v => finite(v) && v >= 0 && v <= cum;
     const out = {};
-    for (const k of SETTINGS_KEYS) out[k] = exFlag(data, k) ? 0 : ok ? m[k] : cum;
+    for (const k of SETTINGS_KEYS) {
+      let v = m ? m[k] : undefined;
+      if (m && k === "goals" && !ok(v) && !Array.isArray(raw.goals)) v = m.goal;     // a v1 row
+      out[k] = exFlag(data, k) || !hasField(raw, k) ? 0 : ok(v) ? v : cum;
+    }
     return out;
   }
   // a's value of field k beats b's: changed later, or at the same time while b still holds the example value
@@ -309,14 +415,18 @@
   }
 
   // what the UI and backups see of a settings document (field stamps stay inside the store)
-  function publicSettings(d) { const out = clone(d); delete out._ms; return out; }
+  function publicSettings(d) { const out = clone(d); delete out._ms; delete out.goal; return out; }
 
   function toTx(r) {
     const t = { id: r.id, type: r.type, amount: r.amount, category: r.category || "", note: r.note || "", date: r.date, createdAt: r.createdAt || 0 };
+    const g = goalIdOf(r);
+    if (g) t.goalId = g;
     if (r.updatedMs > 0) t.updatedAt = r.updatedMs;
     if (r.example === true) t.example = true;
     return t;
   }
+  // a stored record's goal (savings only): records from older versions have none (= the first goal)
+  const goalIdOf = r => (r.type === "saving" && typeof r.goalId === "string" && GOAL_ID_RE.test(r.goalId) ? r.goalId : null);
   const liveRecord = r => isObj(r) && !r.deleted && TYPES.includes(r.type) && finite(r.amount) && r.amount > 0 && typeof r.date === "string";
 
   /* ── Supabase rows ⇄ local records ─────────── */
@@ -325,6 +435,7 @@
       user_id: uid, id: r.id, type: r.type, amount: r.amount,
       category: r.category || "", note: r.note || "", date: r.date,
       created_ms: Math.max(0, Math.round(r.createdAt || 0)),
+      goal_id: goalIdOf(r),             // always sent: null clears a goal the record no longer has
       example: r.example === true, deleted: !!r.deleted,
       client_updated_ms: Math.max(0, Math.round(r.updatedMs || 0)),
     };
@@ -341,14 +452,15 @@
       updatedMs: Number(row.client_updated_ms) || 0,
       dirty: false, localOnly: false,
     };
+    if (rec.type === "saving" && typeof row.goal_id === "string" && GOAL_ID_RE.test(row.goal_id)) rec.goalId = row.goal_id;
     if (row.example === true) rec.example = true;
     if (!rec.deleted && !(TYPES.includes(rec.type) && rec.amount > 0 && validDate(rec.date))) return null;
     return rec;
   }
+  // a v1 document (goal) is migrated; a malformed field falls back to its default
   function settingsRowToRec(row) {
     const raw = isObj(row.data) ? row.data : {};
-    let data;
-    try { data = settingsData(raw); } catch (e) { data = clone(SETTINGS_DEFAULTS); }
+    const data = settingsData(raw, false);
     const updatedMs = Number(row.client_updated_ms) || 0;
     return { data, fieldMs: rowStamps(raw, data, updatedMs), updatedMs, dirty: false, localOnly: false };
   }
@@ -395,7 +507,9 @@
       if (status === 429) return fail("rate", M.rate, e);
       if (code === "25006") return fail("read_only", M.serverReadOnly, e);
       if (/^53[1-4]00$/.test(code) || status === 507) return fail("quota", M.serverFull, e);
-      if (code === "42P01" || code === "42703" || code === "42P10" || code === "42883" || /^PGRST20[0-9]$/.test(code) || status === 404) return fail("invalid", M.noSchema, e);
+      // a column of a newer schema is missing (transactions.goal_id): the project still has an older schema.sql
+      if (code === "42703" || code === "PGRST204") return fail("invalid", M.oldSchema, e);
+      if (code === "42P01" || code === "42P10" || code === "42883" || /^PGRST20[0-9]$/.test(code) || status === 404) return fail("invalid", M.noSchema, e);
       if ([502, 503, 504, 520, 521, 522, 523, 524].includes(status)) return fail("network", M.server, e);
       if (/^(22|23)/.test(code) || status === 400 || status === 409) return fail("invalid", M.serverRejected, e);
       return fail("unknown", M.syncFailed, e);
@@ -679,7 +793,7 @@
       const writeKeys = [...new Set(batch.filter(o => o.write).flatMap(o => o.keys))];
       const apply = st => {
         if ("tx" in st && !isObj(st.tx)) st.tx = {};
-        if ("settings" in st && !(isObj(st.settings) && isObj(st.settings.data))) st.settings = null;
+        if ("settings" in st) st.settings = normSettingsRec(st.settings);   // also migrates a v1 record (goal → goals)
         if ("meta" in st) st.meta = normMeta(st.meta);
         for (const op of batch) {
           op.ok = true; op.value = undefined;
@@ -766,7 +880,7 @@
           }
         }
         if (data && isObj(data.settings) && !st.settings) {
-          try { st.settings = { data: settingsData(data.settings), fieldMs: Object.assign({}, ZERO_MS), updatedMs: 0, dirty: false, localOnly: true }; } catch (e) { /* skip */ }
+          st.settings = { data: settingsData(data.settings, false), fieldMs: Object.assign({}, ZERO_MS), updatedMs: 0, dirty: false, localOnly: true };
         }
         st.meta.seeded = true;
       });
@@ -789,10 +903,8 @@
             if (!c || (r.updatedMs || 0) > (c.updatedMs || 0)) st.tx[id] = r;
           }
           const os = old.settings;
-          let od = null;
-          if (isObj(os) && isObj(os.data) && !(os.localOnly && seeded)) { try { od = settingsData(os.data); } catch (e) { od = null; } }
-          if (od) {
-            const orec = { data: od, fieldMs: os.fieldMs, updatedMs: Number(os.updatedMs) || 0, dirty: !!os.dirty, localOnly: !!os.localOnly };
+          const orec = isObj(os) && !(os.localOnly && seeded) ? normSettingsRec(os) : null;   // a v1 record is migrated
+          if (orec) {
             const cur = st.settings;
             if (!cur) st.settings = orec;
             else {
@@ -1359,7 +1471,7 @@
     function parseBackup(data) {
       if (typeof data === "string") { try { data = JSON.parse(data); } catch (e) { throw fail("invalid", M.notBackup); } }
       if (!isObj(data) || data.app !== "budget" || !Array.isArray(data.tx)) throw fail("invalid", M.notBackup);
-      if (data.version !== 1) throw fail("invalid", finite(data.version) && data.version > 1 ? M.backupVersion : M.notBackup);
+      if (data.version !== 1 && data.version !== BACKUP_VERSION) throw fail("invalid", finite(data.version) && data.version > BACKUP_VERSION ? M.backupVersion : M.notBackup);
       const t = now();
       const items = data.tx.map((raw, i) => {
         try {
@@ -1373,18 +1485,25 @@
         }
       });
       let settings = null;
-      if (data.settings != null) {
-        try { settings = settingsData(data.settings); } catch (e) { throw fail("invalid", M.backupSettings); }
+      const rawSettings = data.settings;
+      if (rawSettings != null) {
+        try { settings = settingsData(rawSettings, true); } catch (e) { throw fail("invalid", M.backupSettings); }   // v1: goal → goals
       }
       const sts = finite(data.settingsUpdatedAt) && data.settingsUpdatedAt > 0 ? Math.min(Math.round(data.settingsUpdatedAt), t) : null;
       // per-field stamps (written since they exist); older files: every field counts as changed at settingsUpdatedAt.
       // A file with no stamps at all (made by hand or by another tool) is older than every value the user set here,
       // but its own values still beat an example, a default or no settings at all (stamp 0): they get UNTIMED_MS.
+      // A field the file does not hold at all (categories in a v1 file) is not imported (-1); v1 files stamp the
+      // goal as goal, which applies to goals.
       const fms = isObj(data.settingsFieldsUpdatedAt) ? data.settingsFieldsUpdatedAt : {};
+      const stamp = v => finite(v) && v >= 0;
       const settingsMs = {};
       for (const k of SETTINGS_KEYS) {
-        settingsMs[k] = finite(fms[k]) && fms[k] >= 0 ? Math.min(Math.round(fms[k]), t)
-          : sts || (settings && !isDefaultField(k, settings[k]) ? UNTIMED_MS : 0);
+        let v = fms[k];
+        if (k === "goals" && !stamp(v) && settings && !Array.isArray(rawSettings.goals)) v = fms.goal;
+        settingsMs[k] = !settings || !hasField(rawSettings, k) ? -1
+          : stamp(v) ? Math.min(Math.round(v), t)
+          : sts || (!isDefaultField(k, settings[k]) ? UNTIMED_MS : 0);
       }
       return { items, settings, settingsTs: sts, settingsMs };
     }
@@ -1426,7 +1545,7 @@
         const tx = [];
         for (const id in S.tx) { const r = S.tx[id]; if (liveRecord(r)) tx.push(toTx(r)); }
         tx.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt - b.createdAt) || (a.id < b.id ? -1 : 1)));
-        const out = { app: "budget", version: 1, exportedAt: new Date(now()).toISOString(), settings: S.settings ? publicSettings(S.settings.data) : null, tx };
+        const out = { app: "budget", version: BACKUP_VERSION, exportedAt: new Date(now()).toISOString(), settings: S.settings ? publicSettings(S.settings.data) : null, tx };
         if (S.settings && S.settings.updatedMs > 0) {
           out.settingsUpdatedAt = S.settings.updatedMs;
           out.settingsFieldsUpdatedAt = fieldStamps(S.settings);
@@ -1601,7 +1720,7 @@
         await writeTx(String(id), data);
       },
       async saveSettings(next) {
-        const data = settingsData(next);
+        const data = settingsData(next, true);
         await boot();
         const t = now();
         await commit(["settings"], st => {

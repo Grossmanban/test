@@ -22,25 +22,36 @@
   }
 
   /* ── Categories ────────────────────────────── */
+  // built-in categories; users add their own (settings.categories) with an icon from PICKER_ICONS
   const CATS = {
     expense: [
-      { id: "housing", name: "Жильё и ЖКХ", icon: "House" },
+      { id: "housing", name: "Жильё", icon: "House" },
+      { id: "utilities", name: "Счета и арнона", icon: "Zap" },
       { id: "groceries", name: "Продукты", icon: "ShoppingCart" },
       { id: "transport", name: "Транспорт", icon: "Bus" },
+      { id: "car", name: "Машина и бензин", icon: "Car" },
       { id: "cafe", name: "Кафе и рестораны", icon: "Coffee" },
       { id: "health", name: "Здоровье", icon: "HeartPulse" },
+      { id: "kids", name: "Дети", icon: "Baby" },
+      { id: "pets", name: "Питомцы", icon: "PawPrint" },
       { id: "fun", name: "Развлечения", icon: "Popcorn" },
       { id: "clothes", name: "Одежда и обувь", icon: "Shirt" },
+      { id: "beauty", name: "Красота и уход", icon: "Sparkles" },
+      { id: "sport", name: "Спорт", icon: "Dumbbell" },
       { id: "telecom", name: "Связь и подписки", icon: "Smartphone" },
       { id: "education", name: "Образование", icon: "GraduationCap" },
       { id: "travel", name: "Путешествия", icon: "Plane" },
       { id: "gifts", name: "Подарки", icon: "Gift" },
+      { id: "charity", name: "Пожертвования", icon: "HandHeart" },
       { id: "other", name: "Прочее", icon: "Ellipsis" },
     ],
     income: [
       { id: "salary", name: "Зарплата", icon: "Briefcase" },
       { id: "freelance", name: "Подработка", icon: "Laptop" },
+      { id: "social", name: "Социальные выплаты", icon: "HandCoins" },
+      { id: "refund", name: "Возвраты и налоги", icon: "ReceiptText" },
       { id: "cashback", name: "Кешбэк и проценты", icon: "Percent" },
+      { id: "sales", name: "Продажа вещей", icon: "Tag" },
       { id: "gift_in", name: "Подарки", icon: "Gift" },
       { id: "other_in", name: "Прочее", icon: "Ellipsis" },
     ],
@@ -48,10 +59,38 @@
   };
   const CAT = {};
   for (const [type, list] of Object.entries(CATS)) for (const c of list) CAT[c.id] = { ...c, type };
+  // icons offered when a user creates a category
+  const PICKER_ICONS = ["ShoppingBag", "Store", "Utensils", "Pizza", "Coffee", "Beer", "Wine", "Cake", "Apple", "Milk",
+    "House", "Building2", "Sofa", "Lamp", "Hammer", "Wrench", "Plug", "Droplets", "Flame", "Zap",
+    "Car", "Fuel", "Bus", "Train", "Bike", "CarTaxiFront", "Plane", "Luggage", "Hotel", "Ship",
+    "HeartPulse", "Pill", "Stethoscope", "Syringe", "Glasses", "Baby", "School", "GraduationCap", "BookOpen", "Puzzle",
+    "PawPrint", "Dog", "Cat", "Dumbbell", "Trophy", "Music", "Gamepad2", "Film", "Ticket", "Camera",
+    "Palette", "Scissors", "Sparkles", "Shirt", "Watch", "Gem", "Gift", "HandHeart", "Church", "Flower2",
+    "Smartphone", "Laptop", "Tv", "Wifi", "Headphones", "CreditCard", "Landmark", "Coins", "Banknote", "HandCoins",
+    "Briefcase", "Calculator", "ReceiptText", "Percent", "Tag", "Package", "Truck", "Leaf", "Sun", "Star"];
+  // icons offered for goals
+  const GOAL_ICONS = ["Target", "ShieldCheck", "Umbrella", "Plane", "TreePalm", "House", "Car", "Laptop", "Smartphone",
+    "GraduationCap", "Baby", "Heart", "Gem", "Gift", "Bike", "Camera", "Sofa", "PiggyBank", "Rocket", "Star"];
+  const DEFAULT_GOAL_ICON = "Target";
+
+  // a category record by id, built-in or the user's own (archived ones still resolve for old operations)
+  function findCat(id) {
+    if (CAT[id]) return CAT[id];
+    const c = (S.settings ? settings().categories : []).find(x => x.id === id);
+    return c ? { id: c.id, name: c.name, icon: c.icon, type: c.type, custom: true, archived: !!c.archived } : null;
+  }
   function catOf(t) {
-    const c = CAT[t.category];
+    const c = findCat(t.category);
     if (c && c.type === t.type) return c;
     return t.type === "income" ? CAT.other_in : t.type === "saving" ? CAT.savings : CAT.other;
+  }
+  // categories offered in pickers for a type: built-ins and active custom ones
+  function catsFor(type) {
+    if (type === "saving") return CATS.saving;
+    const custom = settings().categories.filter(c => c.type === type && !c.archived)
+      .map(c => ({ id: c.id, name: c.name, icon: c.icon, type: c.type, custom: true }));
+    const list = CATS[type];
+    return [...list.slice(0, -1), ...custom, list[list.length - 1]];   // custom ones before «Прочее»
   }
   const KIND_BG = { income: "bg-income", expense: "bg-expense", saving: "bg-saving" };
 
@@ -87,16 +126,17 @@
   const NF0 = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 });
   const NF2 = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const MINUS = "−", NB = " ";
+  const CUR = "₪";   // Israeli new shekel
   const r2 = n => Math.round(n * 100) / 100;
   function num(v) { const a = Math.abs(r2(v)); return Number.isInteger(a) ? NF0.format(a) : NF2.format(a); }
   function money(v, opts = {}) {
     v = r2(v);
     const s = v < 0 ? MINUS : (opts.sign && v > 0 ? "+" : "");
     const body = opts.round ? NF0.format(Math.abs(Math.round(v))) : num(v);
-    return `${s}${body}${NB}₽`;
+    return `${s}${body}${NB}${CUR}`;
   }
   function parseAmount(str) {
-    const s = String(str || "").replace(/[\s  ₽]/g, "").replace(",", ".");
+    const s = String(str || "").replace(/[\s  ₽₪]/g, "").replace(",", ".");
     if (!s) return null;
     if (!/^\d*\.?\d*$/.test(s)) return NaN;
     const v = parseFloat(s);
@@ -114,7 +154,9 @@
   const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   /* ── State ─────────────────────────────────── */
-  const DEFAULTS = { startBalance: 0, goal: null, limits: {} };
+  const DEFAULTS = { startBalance: 0, goals: [], limits: {}, categories: [] };
+  const ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
+  const mintId = p => p + Math.random().toString(36).slice(2, 10);
   const S = {
     status: "loading",      // loading | ready | offline
     tx: [],
@@ -132,25 +174,68 @@
   const snapListeners = new Set();
   let lastSnap = null;
 
+  // the settings document in its v2 shape (goals[] and categories[]); v1 data with a single `goal` is migrated here
+  let settingsMemo = null, settingsMemoSrc;
   function settings() {
+    if (settingsMemoSrc === S.settings && settingsMemo) return settingsMemo;
     const raw = S.settings || {};
-    const out = { ...DEFAULTS };
+    const out = { startBalance: 0, goals: [], limits: {}, categories: [] };
     if (typeof raw.startBalance === "number" && Number.isFinite(raw.startBalance)) out.startBalance = raw.startBalance;
-    const g = raw.goal;
-    if (g && typeof g === "object" && typeof g.name === "string" && typeof g.target === "number" && g.target > 0) {
-      out.goal = {
-        name: g.name.slice(0, 60),
-        target: g.target,
-        deadline: typeof g.deadline === "string" && /^\d{4}-\d{2}-\d{2}$/.test(g.deadline) ? g.deadline : "",
-        initial: typeof g.initial === "number" && g.initial > 0 ? g.initial : 0,
-      };
+    const goalOk = g => g && typeof g === "object" && typeof g.name === "string" && g.name.trim() && typeof g.target === "number" && g.target > 0;
+    const normGoal = (g, i) => ({
+      id: typeof g.id === "string" && ID_RE.test(g.id) ? g.id : (i === 0 ? "g_main" : "g_" + i),
+      name: g.name.slice(0, 60),
+      target: g.target,
+      deadline: typeof g.deadline === "string" && /^\d{4}-\d{2}-\d{2}$/.test(g.deadline) ? g.deadline : "",
+      initial: typeof g.initial === "number" && g.initial > 0 ? g.initial : 0,
+      icon: GOAL_ICONS.includes(g.icon) ? g.icon : DEFAULT_GOAL_ICON,
+      createdAt: typeof g.createdAt === "number" ? g.createdAt : 0,
+    });
+    const goals = Array.isArray(raw.goals) ? raw.goals : (raw.goal ? [{ id: "g_main", ...raw.goal }] : []);
+    const seen = new Set();
+    for (const g of goals) {
+      if (!goalOk(g)) continue;
+      const n = normGoal(g, out.goals.length);
+      if (seen.has(n.id)) continue;
+      seen.add(n.id); out.goals.push(n);
+      if (out.goals.length >= 20) break;
+    }
+    if (Array.isArray(raw.categories)) {
+      const ids = new Set();
+      for (const c of raw.categories) {
+        if (!c || typeof c !== "object" || typeof c.id !== "string" || !/^c_[a-z0-9]{4,20}$/.test(c.id) || ids.has(c.id)) continue;
+        if (c.type !== "income" && c.type !== "expense" || typeof c.name !== "string" || !c.name.trim()) continue;
+        ids.add(c.id);
+        out.categories.push({ id: c.id, type: c.type, name: c.name.slice(0, 32), icon: PICKER_ICONS.includes(c.icon) ? c.icon : "Tag", ...(c.archived ? { archived: true } : {}) });
+        if (out.categories.length >= 60) break;
+      }
     }
     if (raw.limits && typeof raw.limits === "object") {
-      out.limits = {};
-      for (const [k, v] of Object.entries(raw.limits)) if (CAT[k] && CAT[k].type === "expense" && typeof v === "number" && v > 0) out.limits[k] = v;
+      for (const [k, v] of Object.entries(raw.limits)) {
+        const isExpense = (CAT[k] && CAT[k].type === "expense") || out.categories.some(c => c.id === k && c.type === "expense");
+        if (isExpense && typeof v === "number" && v > 0) out.limits[k] = v;
+      }
     }
-    out.example = raw.example && typeof raw.example === "object" ? raw.example : null;
+    let ex = raw.example && typeof raw.example === "object" ? { ...raw.example } : null;
+    if (ex && ex.goal) { ex.goals = true; delete ex.goal; }
+    out.example = ex && Object.keys(ex).length ? ex : null;
+    settingsMemoSrc = S.settings; settingsMemo = out;
     return out;
+  }
+  // the goal a saving operation belongs to: its goalId, or the first goal for older operations
+  function goalOfTx(t, goals = settings().goals) {
+    if (t.goalId) return goals.find(g => g.id === t.goalId) || null;
+    return goals[0] || null;
+  }
+  function goalSaved(g, goals = settings().goals) {
+    let sum = g.initial;
+    for (const t of S.tx) if (t.type === "saving" && goalOfTx(t, goals) === g) sum += t.amount;
+    return r2(sum);
+  }
+  function goalSavedInMonth(g, ym, goals = settings().goals) {
+    let sum = 0;
+    for (const t of S.tx) if (t.type === "saving" && ymOf(t.date) === ym && goalOfTx(t, goals) === g) sum += t.amount;
+    return r2(sum);
   }
   function validTx(t) {
     return t && ["income", "expense", "saving"].includes(t.type)
@@ -192,9 +277,6 @@
     r.net = r2(r.inc - r.exp - r.sav);
     return r;
   }
-  function savedTotal() {
-    return S.tx.reduce((s, t) => s + (t.type === "saving" ? t.amount : 0), 0);
-  }
 
   /* ── Render: header & notices ───────────────── */
   function renderHeader() {
@@ -208,6 +290,7 @@
     $("#fab").disabled = !canAdd;
     $("#editStart").disabled = !canAdd;
     $("#limitsBtn").disabled = !canAdd;
+    $("#catsBtn").disabled = !canAdd;
   }
 
   function renderNotice() {
@@ -253,7 +336,7 @@
     const prevEnd = lastIso(shiftYm(ym, -1));
     const startBal = balanceAt(d.sorted, prevEnd);
     const s = num(bal), [int, frac] = s.split(",");
-    $("#bcAmount").innerHTML = `${bal < 0 ? MINUS : ""}<span class="int">${int}</span>${frac ? `<span class="frac">,${frac}</span>` : ""}<span class="cur">₽</span>`;
+    $("#bcAmount").innerHTML = `${bal < 0 ? MINUS : ""}<span class="int">${int}</span>${frac ? `<span class="frac">,${frac}</span>` : ""}<span class="cur">${CUR}</span>`;
     const change = r2(bal - startBal);
     $("#bcSub").innerHTML =
       `<span>На 1 ${M_GEN[m - 1]}: <b class="num">${money(startBal)}</b></span>` +
@@ -391,7 +474,7 @@
     total.textContent = money(st.exp);
     const ids = new Set([...Object.keys(st.byCat), ...Object.keys(limits)]);
     const rows = [...ids].map(id => ({
-      c: CAT[id], sum: r2(st.byCat[id] ? st.byCat[id].sum : 0), n: st.byCat[id] ? st.byCat[id].n : 0,
+      c: findCat(id), sum: r2(st.byCat[id] ? st.byCat[id].sum : 0), n: st.byCat[id] ? st.byCat[id].n : 0,
       limit: limits[id] || 0, prev: r2(prev.byCat[id] ? prev.byCat[id].sum : 0),
     })).filter(r => r.c).sort((a, b) => b.sum - a.sum || b.limit - a.limit);
 
@@ -423,7 +506,7 @@
         r.limit ? `<div>Лимит <span class="num">${money(r.limit)}</span></div>` : "",
         `<div style="opacity:.7;margin-top:2px">Нажмите, чтобы показать операции</div>`,
       ].join("");
-      return `<button class="cat-row ${S.cat === r.c.id ? "is-active" : ""}" data-cat="${r.c.id}" data-tip="${esc(tip)}" aria-pressed="${S.cat === r.c.id}">
+      return `<button class="cat-row ${S.cat === r.c.id ? "is-active" : ""}" data-cat="${esc(r.c.id)}" data-tip="${esc(tip)}" aria-pressed="${S.cat === r.c.id}">
         <span class="tx-ic bg-expense">${icon(r.c.icon)}</span>
         <span class="cat-name">${esc(r.c.name)}</span>
         <span class="cat-amt">${money(r.sum)}</span>
@@ -436,65 +519,127 @@
     }).join("") + `<p class="cat-hint" aria-hidden="true">Нажмите на категорию, чтобы отфильтровать операции</p>`;
   }
 
-  /* ── Render: goal ───────────────────────────── */
+  /* ── Render: goals ──────────────────────────── */
   function monthsBetween(fromYm, toIso) {
     const [fy, fm] = ymParts(fromYm), [ty, tm] = dParts(toIso);
     return (ty - fy) * 12 + (tm - fm);
   }
-  function renderGoal() {
-    const el = $("#goalCard");
-    const g = settings().goal;
-    const canEdit = S.status === "ready" && !S.readOnly;
-    if (S.status !== "ready" || !g) {
-      el.innerHTML = `<div class="card-head"><div><p class="eyebrow">Цель накоплений</p><h2 id="goalTitle">Копите на что-то важное?</h2></div></div>
-        <p class="hint" style="margin:0 0 14px">Поставьте цель — сумму и срок. Переводы «В копилку» будут двигать прогресс, а здесь появится, сколько откладывать в месяц.</p>
-        <button class="btn btn-gold" id="goalSet" ${canEdit ? "" : "disabled"}>${icon("Target")}Поставить цель</button>`;
-      return;
-    }
-    const saved = r2(g.initial + savedTotal());
+  function goalStats(g, goals) {
+    const saved = goalSaved(g, goals);
     const pct = Math.min(100, saved / g.target * 100);
     const left = r2(Math.max(0, g.target - saved));
-    const thisMonthSaved = r2(S.tx.reduce((s, t) => s + (t.type === "saving" && ymOf(t.date) === CUR_YM ? t.amount : 0), 0));
-    const [, cm] = ymParts(CUR_YM);
-    let deadlineHtml = "без срока", perMonth = null, status = "";
+    const thisMonth = goalSavedInMonth(g, CUR_YM, goals);
+    let mLeft = null, perMonth = null, need = null, overdue = false;
     if (g.deadline) {
-      const mLeft = monthsBetween(CUR_YM, g.deadline);
-      const [dy, dm] = dParts(g.deadline);
-      deadlineHtml = `${dParts(g.deadline)[2]} ${M_GEN[dm - 1]} ${dy}<small>${mLeft > 0 ? `осталось ${mLeft}${NB}мес.` : "срок наступил"}</small>`;
+      mLeft = monthsBetween(CUR_YM, g.deadline);
       if (left > 0 && mLeft > 0) {
-        const leftAtMonthStart = r2(Math.max(0, g.target - (saved - thisMonthSaved)));
-        perMonth = Math.ceil(leftAtMonthStart / mLeft / 100) * 100;
-        const need = r2(perMonth - thisMonthSaved);
-        status = need <= 0
-          ? `<div class="status is-good">${icon("CircleCheck")}<span>В ${M_PREP[cm - 1]} отложено <b>${money(thisMonthSaved)}</b> — план месяца выполнен.</span></div>`
-          : `<div class="status is-warn">${icon("Clock")}<span>В ${M_PREP[cm - 1]} отложено ${money(thisMonthSaved)}. Чтобы успеть к сроку, добавьте ещё <b>${money(need)}</b>.</span></div>`;
-      } else if (left > 0) {
-        status = `<div class="status is-warn">${icon("Clock")}<span>Срок прошёл, осталось собрать <b>${money(left)}</b>. Обновите дату цели.</span></div>`;
-      }
+        const leftAtStart = r2(Math.max(0, g.target - (saved - thisMonth)));
+        perMonth = Math.ceil(leftAtStart / mLeft / 10) * 10;      // rounded up to 10 ₪
+        need = r2(perMonth - thisMonth);
+      } else if (left > 0) overdue = true;
     }
-    if (left === 0) status = `<div class="status is-good">${icon("PartyPopper")}<span><b>Цель достигнута!</b> Можно поставить следующую.</span></div>`;
-    const monthPart = Math.min(pct, thisMonthSaved / g.target * 100);
-    el.innerHTML = `
-      <div class="card-head">
-        <div><p class="eyebrow">Цель накоплений</p><h2 id="goalTitle">${esc(g.name)}</h2></div>
-        <button class="icon-btn" id="goalEdit" aria-label="Изменить цель" ${canEdit ? "" : "disabled"}>${icon("Pencil")}</button>
+    return { saved, pct, left, thisMonth, mLeft, perMonth, need, overdue, done: left === 0 };
+  }
+  function goalStatusHtml(g, st) {
+    const [, cm] = ymParts(CUR_YM);
+    if (st.done) return `<div class="status is-good">${icon("PartyPopper")}<span><b>Цель достигнута!</b> Можно поставить следующую.</span></div>`;
+    if (st.overdue) return `<div class="status is-warn">${icon("Clock")}<span>Срок прошёл, осталось собрать <b>${money(st.left)}</b>. Обновите дату цели.</span></div>`;
+    if (st.need == null) return "";
+    return st.need <= 0
+      ? `<div class="status is-good">${icon("CircleCheck")}<span>В ${M_PREP[cm - 1]} отложено <b>${money(st.thisMonth)}</b>: план месяца выполнен.</span></div>`
+      : st.thisMonth > 0
+        ? `<div class="status is-warn">${icon("Clock")}<span>В ${M_PREP[cm - 1]} отложено ${money(st.thisMonth)}. Чтобы успеть к сроку, добавьте ещё <b>${money(st.need)}</b>.</span></div>`
+        : `<div class="status is-warn">${icon("Clock")}<span>Чтобы успеть к сроку, отложите в ${M_PREP[cm - 1]} <b>${money(st.need)}</b>.</span></div>`;
+  }
+  function meterHtml(g, st, label) {
+    const monthPart = Math.min(st.pct, st.thisMonth / g.target * 100);
+    return `<div class="meter" role="meter" aria-valuemin="0" aria-valuemax="${g.target}" aria-valuenow="${Math.min(st.saved, g.target)}" aria-valuetext="${Math.floor(st.pct)}%: ${money(st.saved)} из ${money(g.target)}" aria-label="${esc(label)}">
+        <span class="meter-fill" style="width:${st.pct.toFixed(2)}%"></span>
+        ${monthPart > 0.3 && st.pct < 100 ? `<span class="meter-month" style="left:${(st.pct - monthPart).toFixed(2)}%;width:${monthPart.toFixed(2)}%" title="Отложено в этом месяце"></span>` : ""}
+      </div>`;
+  }
+  function goalCardHtml(g, goals, canEdit) {
+    const st = goalStats(g, goals);
+    let deadlineHtml = "без срока";
+    if (g.deadline) {
+      const [dy, dm, dd] = dParts(g.deadline);
+      deadlineHtml = `${dd}${NB}${M_GEN[dm - 1]} ${dy}<small>${st.mLeft > 0 ? `осталось ${st.mLeft}${NB}мес.` : "срок наступил"}</small>`;
+    }
+    return `<article class="card goal-card${st.done ? " is-done" : ""}" aria-label="Цель «${esc(g.name)}»">
+      <div class="goal-top">
+        <span class="goal-ic">${icon(g.icon)}</span>
+        <h3 class="goal-name">${esc(g.name)}</h3>
+        <button class="icon-btn" data-goal-edit="${esc(g.id)}" aria-label="Изменить цель «${esc(g.name)}»" ${canEdit ? "" : "disabled"}>${icon("Pencil")}</button>
       </div>
       <div class="goal-figs">
-        <span class="goal-saved">${money(saved)}</span>
+        <span class="goal-saved">${money(st.saved)}</span>
         <span class="goal-of">из ${money(g.target)}</span>
-        <span class="goal-pct">${Math.floor(pct)}%</span>
+        <span class="goal-pct">${Math.floor(st.pct)}%</span>
       </div>
-      <div class="meter" role="meter" aria-valuemin="0" aria-valuemax="${g.target}" aria-valuenow="${Math.min(saved, g.target)}" aria-valuetext="${Math.floor(pct)}%: ${money(saved)} из ${money(g.target)}" aria-label="Накоплено ${money(saved)} из ${money(g.target)}">
-        <span class="meter-fill" style="width:${pct.toFixed(2)}%"></span>
-        ${monthPart > 0.3 && pct < 100 ? `<span class="meter-month" style="left:${(pct - monthPart).toFixed(2)}%;width:${monthPart.toFixed(2)}%" title="Отложено в этом месяце"></span>` : ""}
-      </div>
+      ${meterHtml(g, st, `Накоплено ${money(st.saved)} из ${money(g.target)}`)}
       <dl class="goal-stats">
-        <div><dt>Осталось</dt><dd>${money(left)}</dd></div>
+        <div><dt>Осталось</dt><dd>${money(st.left)}</dd></div>
         <div><dt>Срок</dt><dd>${deadlineHtml}</dd></div>
-        <div><dt>В месяц</dt><dd>${perMonth ? "≈" + NB + money(perMonth) : "—"}</dd></div>
+        <div><dt>В месяц</dt><dd>${st.perMonth ? "≈" + NB + money(st.perMonth) : "—"}</dd></div>
       </dl>
-      ${status}
-      <button class="btn btn-gold" id="goalAdd" ${canEdit ? "" : "disabled"}>${icon("PiggyBank")}Отложить в копилку</button>`;
+      ${goalStatusHtml(g, st)}
+      ${st.done ? "" : `<button class="btn btn-gold" data-goal-add="${esc(g.id)}" ${canEdit ? "" : "disabled"}>${icon("PiggyBank")}Отложить</button>`}
+    </article>`;
+  }
+  // compact goals card in the side column of the budget view
+  function renderGoal() {
+    const el = $("#goalCard");
+    const goals = settings().goals;
+    const canEdit = S.status === "ready" && !S.readOnly;
+    if (S.status !== "ready" || !goals.length) {
+      el.innerHTML = `<div class="card-head"><div><p class="eyebrow">Цели накоплений</p><h2 id="goalTitle">Копите на что-то важное?</h2></div></div>
+        <p class="hint" style="margin:0 0 14px">Поставьте одну или несколько целей: подушка безопасности, отпуск, ноутбук. Переводы «В копилку» будут двигать прогресс нужной цели.</p>
+        <button class="btn btn-gold" data-do="goal-new" ${canEdit ? "" : "disabled"}>${icon("Target")}Поставить цель</button>`;
+      return;
+    }
+    const total = goals.reduce((sum, g) => sum + goalSaved(g, goals), 0);
+    const shown = goals.slice(0, 3);
+    el.innerHTML = `
+      <div class="card-head">
+        <div><p class="eyebrow">Цели накоплений</p><h2 id="goalTitle">Накоплено ${money(total)}</h2></div>
+        <button class="btn btn-ghost btn-sm" data-do="goals-view">Все цели</button>
+      </div>
+      <div class="goal-mini-list">
+        ${shown.map(g => {
+          const st = goalStats(g, goals);
+          return `<button class="goal-mini" data-goal-add="${esc(g.id)}" ${canEdit && !st.done ? "" : "disabled"} aria-label="Отложить на цель «${esc(g.name)}»: ${Math.floor(st.pct)}%, ${money(st.saved)} из ${money(g.target)}">
+            <span class="goal-ic">${icon(g.icon)}</span>
+            <span class="goal-mini-name">${esc(g.name)}</span>
+            <span class="goal-mini-pct">${st.done ? icon("CircleCheck") : Math.floor(st.pct) + "%"}</span>
+            <span class="goal-mini-meter" aria-hidden="true"><span style="width:${st.pct.toFixed(2)}%"></span></span>
+            <span class="goal-mini-meta">${money(st.saved)} из ${money(g.target)}${st.need > 0 ? ` · ещё ${money(st.need)} в этом месяце` : ""}</span>
+          </button>`;
+        }).join("")}
+      </div>
+      ${goals.length > shown.length ? `<p class="hint goal-more">И ещё ${goals.length - shown.length} ${plural(goals.length - shown.length, ["цель", "цели", "целей"])} на вкладке «Цели».</p>` : ""}
+      <button class="btn btn-gold" data-do="saving" ${canEdit ? "" : "disabled"}>${icon("PiggyBank")}Отложить в копилку</button>`;
+  }
+  // the «Цели» view
+  function renderGoalsView() {
+    const el = $("#viewGoals");
+    if (!el) return;
+    const goals = settings().goals;
+    const canEdit = S.status === "ready" && !S.readOnly;
+    const total = goals.reduce((sum, g) => sum + goalSaved(g, goals), 0);
+    const target = goals.reduce((sum, g) => sum + g.target, 0);
+    const month = goals.reduce((sum, g) => sum + goalSavedInMonth(g, CUR_YM, goals), 0);
+    const [, cm] = ymParts(CUR_YM);
+    const head = `<div class="view-head">
+        <div><h2 class="view-title">Цели накоплений</h2>
+          <p class="meta">${goals.length ? `${goals.length} ${plural(goals.length, ["цель", "цели", "целей"])} · накоплено ${money(total)} из ${money(target)} · в ${M_PREP[cm - 1]} отложено ${money(month)}` : "Здесь будут ваши цели и прогресс по каждой"}</p></div>
+        <button class="btn btn-primary" data-do="goal-new" ${canEdit ? "" : "disabled"}>${icon("Plus")}Новая цель</button>
+      </div>`;
+    if (S.status !== "ready") { el.innerHTML = head + `<div class="skeleton"></div>`; return; }
+    el.innerHTML = head + (goals.length
+      ? `<div class="goal-grid">${goals.map(g => goalCardHtml(g, goals, canEdit)).join("")}</div>`
+      : `<div class="card empty"><div class="empty-ic">${icon("Target")}</div><h3>Целей пока нет</h3>
+          <p>Начните с подушки безопасности: обычно советуют запас на 3–6 месяцев расходов. Потом добавьте отпуск, технику или учёбу.</p>
+          <div class="row"><button class="btn btn-primary" data-do="goal-new" ${canEdit ? "" : "disabled"}>${icon("Plus")}Поставить цель</button></div></div>`);
   }
 
   /* ── Render: ledger ─────────────────────────── */
@@ -502,8 +647,9 @@
     const body = $("#ledgerBody"), meta = $("#ledgerMeta");
     $$("#typeFilter button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.f === S.filter)));
     const chip = $("#catChipSlot");
-    chip.innerHTML = S.cat && CAT[S.cat]
-      ? `<button class="cat-chip" id="clearCat" aria-label="Сбросить категорию ${esc(CAT[S.cat].name)}">${esc(CAT[S.cat].name)}${icon("X")}</button>` : "";
+    const fc = S.cat ? findCat(S.cat) : null;
+    chip.innerHTML = fc
+      ? `<button class="cat-chip" id="clearCat" aria-label="Сбросить категорию ${esc(fc.name)}">${esc(fc.name)}${icon("X")}</button>` : "";
     const [, m] = ymParts(S.month);
 
     if (S.status === "loading") {
@@ -528,7 +674,7 @@
     meta.textContent = list.length === inMonth.length
       ? `${inMonth.length} ${plural(inMonth.length, OPS)} в ${M_PREP[m - 1]}`
       : `Показано ${list.length} из ${inMonth.length}`;
-    if (S.cat && CAT[S.cat]) {
+    if (S.cat && findCat(S.cat)) {
       // the category tooltip is mouse-only: give touch users last month's figure and the limit here
       const pYm = shiftYm(S.month, -1), pv = monthStats(pYm).byCat[S.cat], lim = settings().limits[S.cat];
       meta.textContent += ` · в ${M_PREP[ymParts(pYm)[1] - 1]}: ${money(pv ? pv.sum : 0)}${lim ? ` · лимит ${money(lim)}` : ""}`;
@@ -565,7 +711,8 @@
     const title = t.note && t.note.trim() ? t.note.trim() : c.name;
     const amtCls = t.type === "income" ? "t-good" : t.type === "saving" ? "t-gold" : "";
     const sign = t.type === "income" ? "+" : MINUS;
-    const metaName = t.type === "saving" ? (settings().goal ? `Копилка · ${settings().goal.name}` : "Копилка") : c.name;
+    const goal = t.type === "saving" ? goalOfTx(t) : null;
+    const metaName = t.type === "saving" ? (goal ? `Копилка · ${goal.name}` : "Копилка") : c.name;
     const label = `${title}, ${sign}${money(t.amount)}, ${metaName}${t.example ? ", пример" : ""}, остаток ${money(after)}`;
     return `<li class="tx" ${TOUCH_UI ? 'role="button"' : ""} tabindex="0" data-id="${esc(t.id)}" aria-label="${esc(label)}">
       <span class="tx-ic ${KIND_BG[t.type]}">${icon(c.icon)}</span>
@@ -587,6 +734,7 @@
     renderKpis();
     renderCats();
     renderGoal();
+    renderGoalsView();
     renderLedger(d);
     if (lastSnap) for (const cb of snapListeners) { try { cb(lastSnap); } catch (e) { console.error(e); } }
   }
@@ -630,9 +778,15 @@
     if (c === "read_only") { S.readOnly = true; render(); }
     return (e && e.message && e.code) ? e.message : (ERR_DEFAULT[c] || "Не удалось сохранить. Повторите попытку.");
   }
+  // the normalized v2 settings document, ready to store (never carries the legacy `goal` key)
+  function settingsDoc() {
+    const st = settings();
+    const doc = { startBalance: st.startBalance, goals: st.goals.map(g => ({ ...g })), limits: { ...st.limits }, categories: st.categories.map(c => ({ ...c })) };
+    if (st.example) doc.example = { ...st.example };
+    return doc;
+  }
   function saveSettings(patch) {
-    const raw = S.settings ? JSON.parse(JSON.stringify(S.settings)) : {};
-    const next = { ...DEFAULTS, ...raw, ...patch };
+    const next = { ...settingsDoc(), ...patch };
     if (next.example && typeof next.example === "object") {
       for (const k of Object.keys(patch)) delete next.example[k];
       if (!Object.keys(next.example).length) delete next.example;
@@ -647,30 +801,68 @@
     if (S.month === CUR_YM) return TODAY;
     return S.month < CUR_YM ? lastIso(S.month) : `${S.month}-01`;
   }
-  function renderCatChips(type, selected) {
-    const list = CATS[type];
-    const field = $("#catField"), hint = $("#savingHint");
+  // categories most used in the last 60 days come first, so the usual choice is one tap away
+  function usageOrder(type) {
+    const since = isoOf(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 60));
+    const count = {};
+    for (const t of S.tx) if (t.type === type && t.date >= since) count[t.category] = (count[t.category] || 0) + 1;
+    const list = catsFor(type);
+    const last = list[list.length - 1];
+    return [...list.slice(0, -1).map((c, i) => ({ c, i, n: count[c.id] || 0 })).sort((x, y) => y.n - x.n || x.i - y.i).map(x => x.c), last];
+  }
+  function renderCatChips(type, selected, goalId) {
+    const field = $("#catField"), legend = $("#catLegend"), hint = $("#savingHint");
     if (type === "saving") {
-      field.hidden = true;
-      const g = settings().goal;
+      const goals = settings().goals;
+      legend.textContent = "Цель";
       hint.hidden = false;
-      hint.textContent = g
-        ? `Сумма уйдёт в копилку цели «${g.name}», уменьшит остаток на счёте и не попадёт в расходы.`
-        : "Сумма уйдёт в копилку, уменьшит остаток на счёте и не попадёт в расходы. Цель можно поставить в карточке «Цель накоплений».";
-      $("#catChips").innerHTML = `<input type="radio" name="category" value="savings" checked hidden>`;
+      hint.textContent = "Сумма уйдёт в копилку выбранной цели, уменьшит остаток на счёте и не попадёт в расходы.";
+      if (!goals.length) {
+        field.hidden = true;
+        hint.innerHTML = `Сумма уйдёт в копилку, уменьшит остаток на счёте и не попадёт в расходы. <button type="button" class="link-btn" data-do="goal-new">Поставить цель</button>, чтобы видеть прогресс.`;
+        $("#catChips").innerHTML = `<input type="radio" name="category" value="savings" checked hidden>`;
+        return;
+      }
+      field.hidden = false;
+      const sel = goals.some(g => g.id === goalId) ? goalId : goals.find(g => !goalStats(g, goals).done)?.id || goals[0].id;
+      $("#catChips").innerHTML = `<input type="radio" name="category" value="savings" checked hidden>` + goals.map(g =>
+        `<label class="chip-opt"><input type="radio" name="goal" value="${esc(g.id)}" ${g.id === sel ? "checked" : ""}><span>${icon(g.icon)}${esc(g.name)}</span></label>`).join("");
       return;
     }
     field.hidden = false; hint.hidden = true;
-    const sel = list.some(c => c.id === selected) ? selected : list[type === "expense" ? 1 : 0].id;
-    $("#catChips").innerHTML = list.map(c =>
-      `<label class="chip-opt"><input type="radio" name="category" value="${c.id}" ${c.id === sel ? "checked" : ""}><span>${icon(c.icon)}${esc(c.name)}</span></label>`).join("");
+    legend.textContent = "Категория";
+    const list = usageOrder(type);
+    const fallback = type === "expense" ? (list.find(c => c.id === "groceries") || list[0]) : list[0];
+    const sel = list.some(c => c.id === selected) ? selected : fallback.id;
+    // long lists: the most used categories first, the rest behind «Ещё»
+    const SHOW = 9;
+    const expanded = catChipsExpanded || list.length <= SHOW + 2;
+    let shown = list;
+    if (!expanded) {
+      shown = list.slice(0, SHOW);
+      const selCat = list.find(c => c.id === sel);
+      if (!shown.includes(selCat)) shown = [...shown.slice(0, SHOW - 1), selCat];
+    }
+    $("#catChips").innerHTML = shown.map(c =>
+      `<label class="chip-opt"><input type="radio" name="category" value="${esc(c.id)}" ${c.id === sel ? "checked" : ""}><span>${icon(c.icon)}${esc(c.name)}</span></label>`).join("")
+      + (expanded ? "" : `<button type="button" class="chip-more" data-more="1">${icon("Ellipsis")}Ещё ${list.length - shown.length}</button>`)
+      + `<button type="button" class="chip-add" data-do="cat-new" data-type="${type}">${icon("Plus")}Своя категория</button>`;
   }
+  let catChipsExpanded = false;
+  $("#catChips").addEventListener("click", e => {
+    if (!e.target.closest("[data-more]")) return;
+    catChipsExpanded = true;
+    const type = $('#txForm input[name="type"]:checked').value, cur = $('#txForm input[name="category"]:checked');
+    renderCatChips(type, cur ? cur.value : null);
+  });
+
   function openTx(t = null, preset = {}) {
     if (S.status !== "ready" || S.readOnly) return;
     editing = t;
     const type = t ? t.type : (preset.type || (S.filter !== "all" ? S.filter : "expense"));
     $(`#txForm input[name="type"][value="${type}"]`).checked = true;
-    renderCatChips(type, t ? t.category : (S.cat || null));
+    catChipsExpanded = false;
+    renderCatChips(type, t ? t.category : (preset.category || S.cat || null), t ? t.goalId : preset.goalId);
     $("#txAmount").value = t ? inputAmount(t.amount) : "";
     $("#txDate").value = t ? t.date : defaultDate();
     $("#txNote").value = t ? (t.note || "") : "";
@@ -704,7 +896,8 @@
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < "1900-01-01" || date > "2199-12-31") { fail("Укажите дату операции между 1900 и 2199 годом."); $("#txDate").focus(); return; }
     const data = {
       type, amount, date,
-      category: catEl ? catEl.value : (type === "saving" ? "savings" : "other"),
+      category: type === "saving" ? "savings" : (catEl ? catEl.value : "other"),
+      ...(type === "saving" && $('#txForm input[name="goal"]:checked') ? { goalId: $('#txForm input[name="goal"]:checked').value } : {}),
       note: $("#txNote").value.trim().slice(0, 80),
       createdAt: editing && editing.createdAt ? editing.createdAt : Date.now(),
       updatedAt: Date.now(),
@@ -748,15 +941,25 @@
     } catch (e) { toast(errText(e)); }
   }
 
-  /* ── Goal dialog ───────────────────────────── */
+  /* ── Goal dialog (new or edit) ─────────────── */
   const goalDlg = $("#goalDlg");
-  function openGoal() {
+  let editingGoal = null;
+  function iconGrid(el, name, icons, selected) {
+    el.innerHTML = icons.map(n =>
+      `<label class="icon-opt" title=""><input type="radio" name="${name}" value="${n}" ${n === selected ? "checked" : ""} aria-label="${n}"><span>${icon(n)}</span></label>`).join("");
+  }
+  function openGoal(id) {
     if (S.status !== "ready" || S.readOnly) return;
-    const g = settings().goal;
+    const goals = settings().goals;
+    const g = id ? goals.find(x => x.id === id) || null : null;
+    if (!g && goals.length >= 20) { toast("Можно завести до 20 целей. Удалите выполненную, чтобы добавить новую."); return; }
+    editingGoal = g;
+    $("#goalDlgTitle").textContent = g ? "Изменить цель" : "Новая цель";
     $("#gName").value = g ? g.name : "";
     $("#gTarget").value = g ? inputAmount(g.target) : "";
     $("#gDeadline").value = g ? g.deadline : "";
     $("#gInitial").value = g ? inputAmount(g.initial) : "";
+    iconGrid($("#gIcons"), "gicon", GOAL_ICONS, g ? g.icon : (goals.length ? "Target" : "ShieldCheck"));
     $("#goalDelete").hidden = !g;
     $("#goalErr").hidden = true;
     goalDlg.showModal();
@@ -770,33 +973,138 @@
     const target = parseAmount($("#gTarget").value);
     const initial = parseAmount($("#gInitial").value) || 0;
     const deadline = $("#gDeadline").value;
+    const ic = ($('#goalForm input[name="gicon"]:checked') || {}).value || DEFAULT_GOAL_ICON;
     if (!name) { fail("Назовите цель, например «Подушка безопасности»."); $("#gName").focus(); return; }
-    if (!target || Number.isNaN(target) || target <= 0) { fail("Укажите сумму цели больше нуля."); $("#gTarget").focus(); return; }
-    if (Number.isNaN(initial) || initial < 0) { fail("Отложенная сумма должна быть числом, например 50 000."); return; }
+    if (!target || Number.isNaN(target) || target <= 0 || target >= 1e10) { fail("Укажите сумму цели больше нуля."); $("#gTarget").focus(); return; }
+    if (Number.isNaN(initial) || initial < 0) { fail("Отложенная сумма должна быть числом, например 5 000."); return; }
+    if (deadline && (deadline < "1900-01-01" || deadline > "2199-12-31")) { fail("Укажите срок между 1900 и 2199 годом или оставьте поле пустым."); return; }
+    const goals = settings().goals.map(g => ({ ...g }));
+    const fields = { name: name.slice(0, 60), target, deadline: deadline || "", initial, icon: ic };
+    let next;
+    if (editingGoal) next = goals.map(g => g.id === editingGoal.id ? { ...g, ...fields } : g);
+    else next = [...goals, { id: mintId("g_"), createdAt: Date.now(), ...fields }];
     try {
-      await saveSettings({ goal: { name: name.slice(0, 60), target, deadline: deadline || "", initial } });
-      goalDlg.close(); toast("Цель сохранена");
+      await saveSettings({ goals: next });
+      goalDlg.close(); toast(editingGoal ? "Цель сохранена" : "Цель добавлена");
     } catch (ex) { fail(errText(ex)); }
   });
   $("#goalDelete").addEventListener("click", async () => {
-    const prev = settings().goal;
+    if (!editingGoal) return;
+    const prev = settings().goals.map(g => ({ ...g }));
+    const gone = editingGoal;
     goalDlg.close();
     try {
-      await saveSettings({ goal: null });
-      toast("Цель убрана", { label: "Вернуть", run: () => saveSettings({ goal: prev }).catch(e => toast(errText(e))) });
+      await saveSettings({ goals: prev.filter(g => g.id !== gone.id) });
+      toast(`Цель «${gone.name}» убрана`, { label: "Вернуть", run: () => saveSettings({ goals: prev }).catch(e => toast(errText(e))) });
     } catch (ex) { toast(errText(ex)); }
   });
+
+  /* ── Category editor and manager ───────────── */
+  const catDlg = $("#catDlg"), catsDlg = $("#catsDlg");
+  let editingCat = null, catFromTx = false;
+  function catUsage(id) {
+    return S.tx.reduce((n, t) => n + (t.category === id ? 1 : 0), 0);
+  }
+  function openCatEditor(id, type, fromTx = false) {
+    if (S.status !== "ready" || S.readOnly) return;
+    const cats = settings().categories;
+    const c = id ? cats.find(x => x.id === id) || null : null;
+    if (!c && cats.length >= 60) { toast("Можно завести до 60 своих категорий. Удалите ненужные, чтобы добавить новую."); return; }
+    editingCat = c; catFromTx = fromTx;
+    $("#catDlgTitle").textContent = c ? "Изменить категорию" : "Новая категория";
+    const t = c ? c.type : (type === "income" ? "income" : "expense");
+    $(`#catForm input[name="ctype"][value="${t}"]`).checked = true;
+    $$('#catForm input[name="ctype"]').forEach(r => { r.disabled = !!c && catUsage(c.id) > 0; });
+    $("#cName").value = c ? c.name : "";
+    iconGrid($("#cIcons"), "cicon", PICKER_ICONS, c ? c.icon : null);
+    const used = c ? catUsage(c.id) : 0;
+    $("#catRemove").hidden = !c;
+    $("#catRemove").lastChild.textContent = used ? "Скрыть" : "Удалить";
+    $("#catRemove").setAttribute("aria-label", used ? "Скрыть категорию" : "Удалить категорию");
+    $("#catRemoveHint").hidden = !c || !used;
+    $("#catRemoveHint").textContent = used ? `Категория есть в ${used} ${plural(used, OPS)}. Её можно скрыть: старые записи сохранят название и иконку.` : "";
+    $("#catErr").hidden = true;
+    catDlg.showModal();
+    if (!c || matchMedia("(pointer: fine)").matches) $("#cName").focus();
+  }
+  $("#catForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const err = $("#catErr");
+    const fail = msg => { err.textContent = msg; err.hidden = false; };
+    const name = $("#cName").value.trim().slice(0, 32);
+    const type = $('#catForm input[name="ctype"]:checked').value;
+    const ic = ($('#catForm input[name="cicon"]:checked') || {}).value;
+    if (!name) { fail("Назовите категорию, например «Ваад байт»."); $("#cName").focus(); return; }
+    if (!ic) { fail("Выберите иконку."); return; }
+    const taken = [...catsFor(type)].some(c => c.name.toLowerCase() === name.toLowerCase() && (!editingCat || c.id !== editingCat.id));
+    if (taken) { fail(`Категория «${name}» уже есть.`); return; }
+    const cats = settings().categories.map(c => ({ ...c }));
+    const id = editingCat ? editingCat.id : "c_" + Math.random().toString(36).slice(2, 10).replace(/[^a-z0-9]/g, "x");
+    const next = editingCat ? cats.map(c => c.id === id ? { ...c, name, type, icon: ic } : c) : [...cats, { id, type, name, icon: ic }];
+    try {
+      await saveSettings({ categories: next });
+      catDlg.close();
+      toast(editingCat ? "Категория сохранена" : `Категория «${name}» добавлена`);
+      if (catFromTx && txDlg.open) {
+        $(`#txForm input[name="type"][value="${type}"]`).checked = true;
+        renderCatChips(type, id);
+      }
+      if (catsDlg.open) renderCatsManager();
+    } catch (ex) { fail(errText(ex)); }
+  });
+  $("#catRemove").addEventListener("click", async () => {
+    if (!editingCat) return;
+    const prev = settings().categories.map(c => ({ ...c }));
+    const gone = editingCat, used = catUsage(gone.id) > 0;
+    const next = used ? prev.map(c => c.id === gone.id ? { ...c, archived: true } : c) : prev.filter(c => c.id !== gone.id);
+    catDlg.close();
+    try {
+      await saveSettings({ categories: next });
+      toast(used ? `Категория «${gone.name}» скрыта` : `Категория «${gone.name}» удалена`, { label: "Вернуть", run: () => saveSettings({ categories: prev }).catch(e => toast(errText(e))) });
+      if (catsDlg.open) renderCatsManager();
+    } catch (ex) { toast(errText(ex)); }
+  });
+  function renderCatsManager() {
+    const cats = settings().categories;
+    const group = (title, list, archived) => list.length ? `<h3 class="cats-group">${title}</h3><div class="cats-list">${list.map(c => `
+      <div class="cats-row">
+        <span class="tx-ic ${c.type === "income" ? "bg-income" : "bg-expense"}">${icon(c.icon)}</span>
+        <span class="cats-name"><b>${esc(c.name)}</b><small>${c.type === "income" ? "доход" : "расход"} · ${catUsage(c.id)} ${plural(catUsage(c.id), OPS)}</small></span>
+        ${archived ? `<button type="button" class="btn btn-ghost btn-sm" data-cat-restore="${esc(c.id)}">Вернуть</button>`
+                   : `<button type="button" class="icon-btn" data-cat-edit="${esc(c.id)}" aria-label="Изменить категорию «${esc(c.name)}»">${icon("Pencil")}</button>`}
+      </div>`).join("")}</div>` : "";
+    const active = cats.filter(c => !c.archived), hidden = cats.filter(c => c.archived);
+    $("#catsBody").innerHTML = active.length || hidden.length
+      ? group("Расходы", active.filter(c => c.type === "expense")) + group("Доходы", active.filter(c => c.type === "income")) + group("Скрытые", hidden, true)
+      : `<div class="empty" style="padding:18px 8px"><div class="empty-ic">${icon("Tags")}</div><p>Своих категорий пока нет. Добавьте, например, «Ваад байт», «Кружки детей» или «Социальное пособие на жильё».</p></div>`;
+  }
+  function openCategories() {
+    if (S.status !== "ready" || S.readOnly) return;
+    renderCatsManager();
+    catsDlg.showModal();
+  }
+  $("#catsBody").addEventListener("click", async e => {
+    const ed = e.target.closest("[data-cat-edit]");
+    if (ed) { openCatEditor(ed.dataset.catEdit); return; }
+    const rs = e.target.closest("[data-cat-restore]");
+    if (rs) {
+      const next = settings().categories.map(c => c.id === rs.dataset.catRestore ? (({ archived, ...rest }) => rest)(c) : { ...c });
+      try { await saveSettings({ categories: next }); renderCatsManager(); toast("Категория снова в списке"); }
+      catch (ex) { toast(errText(ex)); }
+    }
+  });
+  $("#catsAdd").addEventListener("click", () => openCatEditor(null, "expense"));
 
   /* ── Limits dialog ─────────────────────────── */
   const limitsDlg = $("#limitsDlg");
   function openLimits() {
     if (S.status !== "ready" || S.readOnly) return;
     const lim = settings().limits, st = monthStats(S.month), [, m] = ymParts(S.month);
-    $("#limitList").innerHTML = CATS.expense.map(c => `
+    $("#limitList").innerHTML = catsFor("expense").map(c => `
       <label class="limit-row">
         <span class="tx-ic bg-expense">${icon(c.icon)}</span>
         <span><b>${esc(c.name)}</b><small>в ${M_PREP[m - 1]}: ${money(st.byCat[c.id] ? st.byCat[c.id].sum : 0)}</small></span>
-        <span class="money-input"><input class="input num" inputmode="decimal" autocomplete="off" id="lim-${c.id}" data-cat="${c.id}" placeholder="без лимита" value="${inputAmount(lim[c.id] || 0)}"></span>
+        <span class="money-input"><input class="input num" inputmode="decimal" autocomplete="off" id="lim-${esc(c.id)}" data-cat="${esc(c.id)}" placeholder="без лимита" value="${inputAmount(lim[c.id] || 0)}"></span>
       </label>`).join("");
     $("#limitsErr").hidden = true;
     limitsDlg.showModal();
@@ -808,7 +1116,7 @@
     for (const inp of $$("#limitList input")) {
       const v = parseAmount(inp.value);
       if (v == null || v === 0) continue;
-      if (Number.isNaN(v) || v < 0) { err.textContent = `Проверьте лимит для «${CAT[inp.dataset.cat].name}»: нужна сумма числом.`; err.hidden = false; inp.focus(); return; }
+      if (Number.isNaN(v) || v < 0) { err.textContent = `Проверьте лимит для «${(findCat(inp.dataset.cat) || CAT.other).name}»: нужна сумма числом.`; err.hidden = false; inp.focus(); return; }
       limits[inp.dataset.cat] = v;
     }
     try { await saveSettings({ limits }); limitsDlg.close(); toast("Лимиты сохранены"); }
@@ -846,13 +1154,12 @@
     renderNotice();
     try {
       await store.deleteMany(ex.map(t => t.id), done => { S.clearing.done = done; renderNotice(); });
-      const st = S.settings && S.settings.example;
-      if (st && typeof st === "object" && Object.keys(st).length) {
-        const patch = {};
-        for (const k of Object.keys(st)) if (k in DEFAULTS) patch[k] = DEFAULTS[k];
-        const raw = JSON.parse(JSON.stringify(S.settings));
-        delete raw.example;
-        await store.saveSettings({ ...DEFAULTS, ...raw, ...patch });
+      const ex = settings().example;
+      if (ex && Object.keys(ex).length) {
+        const next = settingsDoc();
+        for (const k of Object.keys(ex)) if (k in DEFAULTS) next[k] = JSON.parse(JSON.stringify(DEFAULTS[k]));
+        delete next.example;
+        await store.saveSettings(next);
       }
       S.clearing = null; S.cat = null;
       render();
@@ -911,9 +1218,55 @@
   });
   $("#catChipSlot").addEventListener("click", e => { if (e.target.closest("#clearCat")) { S.cat = null; render(); } });
   $("#notice").addEventListener("click", e => { if (e.target.closest("#clearEx")) clearExamples(); });
-  $("#goalCard").addEventListener("click", e => {
-    if (e.target.closest("#goalEdit") || e.target.closest("#goalSet")) openGoal();
-    else if (e.target.closest("#goalAdd")) openTx(null, { type: "saving" });
+  // goal and category buttons anywhere (side card, goals view, sheets)
+  document.addEventListener("click", e => {
+    const el = e.target.closest("[data-goal-add],[data-goal-edit],[data-do]");
+    if (!el || el.disabled) return;
+    if (el.dataset.goalAdd !== undefined) { openTx(null, { type: "saving", goalId: el.dataset.goalAdd || undefined }); return; }
+    if (el.dataset.goalEdit) { openGoal(el.dataset.goalEdit); return; }
+    switch (el.dataset.do) {
+      case "goal-new": if (txDlg.open) txDlg.close(); openGoal(null); break;
+      case "goals-view": setView("goals"); break;
+      case "saving": openTx(null, { type: "saving" }); break;
+      case "cat-new": openCatEditor(null, el.dataset.type, true); break;
+      case "categories": openCategories(); break;
+    }
+  });
+  $("#catsBtn").addEventListener("click", openCategories);
+
+  /* ── Views: Бюджет · Цели · Обучение ─────────── */
+  const VIEWS = ["budget", "goals", "learn"];
+  let learnMounted = false;
+  function setView(v, opts = {}) {
+    if (!VIEWS.includes(v)) v = "budget";
+    S.view = v;
+    $("#viewBudget").hidden = v !== "budget";
+    $("#viewGoals").hidden = v !== "goals";
+    $("#viewLearn").hidden = v !== "learn";
+    $$("#viewTabs [role=tab]").forEach(b => { const on = b.dataset.view === v; b.setAttribute("aria-selected", String(on)); b.tabIndex = on ? 0 : -1; });
+    document.documentElement.dataset.view = v;
+    if (v === "learn" && !learnMounted) {
+      learnMounted = true;
+      const el = $("#viewLearn");
+      if (window.BudgetLearn && typeof window.BudgetLearn.mount === "function") {
+        try { window.BudgetLearn.mount(el, window.BudgetApp); }
+        catch (e) { console.error(e); el.innerHTML = `<div class="card empty"><h3>Раздел обучения не открылся</h3><p>Обновите страницу.</p></div>`; }
+      } else el.innerHTML = `<div class="card empty"><h3>Раздел обучения не загрузился</h3><p>Обновите страницу.</p></div>`;
+    }
+    hideTip();
+    if (!opts.keepScroll) window.scrollTo(0, 0);
+    if (!opts.keepHash) {
+      try { history.replaceState(null, "", v === "budget" ? location.pathname + location.search : "#" + v); } catch (e) { /* sandboxed frame */ }
+    }
+  }
+  $("#viewTabs").addEventListener("click", e => { const b = e.target.closest("[data-view]"); if (b) setView(b.dataset.view); });
+  $("#viewTabs").addEventListener("keydown", e => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    const tabs = $$("#viewTabs [role=tab]"), i = tabs.indexOf(document.activeElement);
+    if (i < 0) return;
+    e.preventDefault();
+    const j = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : (i + (e.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[j].focus(); setView(tabs[j].dataset.view, { keepScroll: true });
   });
 
   $("#ledgerBody").addEventListener("click", e => {
@@ -1050,11 +1403,21 @@
 
   window.BudgetApp = {
     store, icon, hydrateIcons, esc, money, toast, enhanceDialog,
+    actions: {
+      setView: v => setView(v),
+      openTx: (preset = {}) => openTx(null, preset || {}),
+      openLimits: () => openLimits(),
+      openGoal: id => openGoal(id || null),
+      openCategories: () => openCategories(),
+      openStart: () => openStart(),
+    },
     onSnapshot(cb) { snapListeners.add(cb); if (lastSnap) cb(lastSnap); return () => snapListeners.delete(cb); },
     features: FEATURES,
   };
 
   hydrateIcons();
+  const startView = (location.hash || "").replace("#", "");
+  setView(VIEWS.includes(startView) ? startView : "budget", { keepHash: true, keepScroll: true });
   render();
   drawGuilloche();
   store.init(applySnapshot);

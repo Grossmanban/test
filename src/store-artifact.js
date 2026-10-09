@@ -44,6 +44,8 @@
       createdAt: typeof d.createdAt === "number" ? d.createdAt : Date.now(),
       updatedAt: typeof d.updatedAt === "number" ? d.updatedAt : Date.now(),
     };
+    // the goal a saving went to (missing = the first goal); other types never carry one
+    if (d.type === "saving" && typeof d.goalId === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(d.goalId)) out.goalId = d.goalId;
     if (d.example === true) out.example = true;
     return out;
   }

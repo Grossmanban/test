@@ -4,8 +4,8 @@
       <div class="brand">
         <div class="brand-mark" data-icon="Wallet"></div>
         <div>
-          <h1>Домашняя бухгалтерия</h1>
-          <p>Доходы, расходы и цель накоплений в рублях</p>
+          <h1>Money honey</h1>
+          <p>Доходы, расходы и цели в шекелях</p>
         </div>
       </div>
       <div class="top-tools" id="pwaTop"></div>
@@ -19,9 +19,16 @@
     <button class="btn btn-primary" id="addBtn" aria-label="Новая операция"><span data-icon="Plus"></span>Новая операция</button>
   </header>
 
+  <nav class="viewtabs" id="viewTabs" role="tablist" aria-label="Разделы">
+    <button type="button" role="tab" id="tabBudget" data-view="budget" aria-selected="true" aria-controls="viewBudget"><span data-icon="Wallet"></span><span>Бюджет</span></button>
+    <button type="button" role="tab" id="tabGoals" data-view="goals" aria-selected="false" aria-controls="viewGoals" tabindex="-1"><span data-icon="Target"></span><span>Цели</span></button>
+    <button type="button" role="tab" id="tabLearn" data-view="learn" aria-selected="false" aria-controls="viewLearn" tabindex="-1"><span data-icon="GraduationCap"></span><span>Обучение</span></button>
+  </nav>
+
   <div class="notice" id="notice" hidden></div>
   <div id="pwaBanner"></div>
 
+  <div class="view" id="viewBudget" role="tabpanel" aria-labelledby="tabBudget">
   <section class="overview" aria-label="Сводка">
     <article class="balance-card" id="balanceCard">
       <canvas id="guilloche" aria-hidden="true"></canvas>
@@ -71,7 +78,10 @@
             <h2 id="catTitle">Расходы по категориям</h2>
             <div class="cat-total num" id="catTotal">—</div>
           </div>
-          <button class="btn btn-ghost btn-sm" id="limitsBtn"><span data-icon="SlidersHorizontal"></span>Лимиты</button>
+          <div class="head-tools">
+            <button class="icon-btn" id="catsBtn" aria-label="Мои категории" title="Мои категории" data-icon="Tags"></button>
+            <button class="btn btn-ghost btn-sm" id="limitsBtn"><span data-icon="SlidersHorizontal"></span>Лимиты</button>
+          </div>
         </div>
         <div id="planLine"></div>
         <div class="cat-list" id="catList"></div>
@@ -80,6 +90,10 @@
       <section class="card" aria-labelledby="goalTitle" id="goalCard"></section>
     </aside>
   </div>
+  </div>
+
+  <section class="view" id="viewGoals" role="tabpanel" aria-labelledby="tabGoals" hidden></section>
+  <section class="view" id="viewLearn" role="tabpanel" aria-labelledby="tabLearn" hidden></section>
 </div>
 
 <button class="btn btn-primary fab" id="fab" aria-label="Новая операция"><span data-icon="Plus"></span>Операция</button>
@@ -102,7 +116,7 @@
       <div class="money-input amount-big"><input class="input num" id="txAmount" inputmode="decimal" autocomplete="off" placeholder="0"></div>
     </label>
     <fieldset id="catField">
-      <legend class="legend">Категория</legend>
+      <legend class="legend" id="catLegend">Категория</legend>
       <div class="chips" id="catChips"></div>
     </fieldset>
     <p class="hint" id="savingHint" hidden></p>
@@ -133,13 +147,17 @@
       <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
       <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
     </div>
-    <label class="field"><span>На что копите</span><input class="input" id="gName" maxlength="60" placeholder="Например: подушка безопасности" autocomplete="off"></label>
+    <label class="field"><span>На что копите</span><input class="input" id="gName" maxlength="60" placeholder="Например: подушка безопасности" autocomplete="off" enterkeyhint="next"></label>
     <div class="row2">
-      <label class="field"><span>Нужная сумма</span><div class="money-input"><input class="input num" id="gTarget" inputmode="decimal" autocomplete="off" placeholder="300 000"></div></label>
+      <label class="field"><span>Нужная сумма</span><div class="money-input"><input class="input num" id="gTarget" inputmode="decimal" autocomplete="off" placeholder="30 000"></div></label>
       <label class="field"><span>Срок (необязательно)</span><input class="input" type="date" id="gDeadline" min="1900-01-01" max="2199-12-31"></label>
     </div>
+    <fieldset>
+      <legend class="legend">Иконка</legend>
+      <div class="icon-grid" id="gIcons"></div>
+    </fieldset>
     <label class="field"><span>Уже отложено до начала учёта</span><div class="money-input"><input class="input num" id="gInitial" inputmode="decimal" autocomplete="off" placeholder="0"></div></label>
-    <p class="hint">Прогресс складывается из этой суммы и всех операций «В копилку».</p>
+    <p class="hint">Прогресс складывается из этой суммы и всех переводов «В копилку» на эту цель.</p>
     <p class="err" id="goalErr" hidden></p>
     <div class="dlg-foot">
       <button type="button" class="btn btn-danger" id="goalDelete" aria-label="Убрать цель" hidden><span data-icon="Trash2"></span>Убрать цель</button>
@@ -192,6 +210,53 @@
       <button type="submit" class="btn btn-primary">Сохранить</button>
     </div>
   </form>
+</dialog>
+
+<!-- Category editor -->
+<dialog id="catDlg" aria-labelledby="catDlgTitle">
+  <form class="dlg" id="catForm" novalidate>
+    <div class="dlg-head">
+      <h2 id="catDlgTitle">Новая категория</h2>
+      <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
+      <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
+    </div>
+    <div class="seg seg-wide seg-2" role="radiogroup" aria-label="Тип категории">
+      <label><input type="radio" name="ctype" value="expense" checked><span><span data-icon="ArrowUpRight"></span>Расход</span></label>
+      <label><input type="radio" name="ctype" value="income"><span><span data-icon="ArrowDownLeft"></span>Доход</span></label>
+    </div>
+    <label class="field"><span>Название</span><input class="input" id="cName" maxlength="32" placeholder="Например: Ваад байт" autocomplete="off" enterkeyhint="done"></label>
+    <fieldset>
+      <legend class="legend">Иконка</legend>
+      <div class="icon-grid" id="cIcons"></div>
+    </fieldset>
+    <p class="hint" id="catRemoveHint" hidden></p>
+    <p class="err" id="catErr" hidden></p>
+    <div class="dlg-foot">
+      <button type="button" class="btn btn-danger" id="catRemove" aria-label="Удалить или скрыть категорию" hidden><span data-icon="Trash2"></span><span>Удалить</span></button>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-quiet" data-close>Отмена</button>
+      <button type="submit" class="btn btn-primary">Сохранить</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Category manager -->
+<dialog id="catsDlg" aria-labelledby="catsDlgTitle">
+  <div class="dlg">
+    <div class="dlg-head">
+      <div>
+        <h2 id="catsDlgTitle">Мои категории</h2>
+        <p class="hint" style="margin-top:4px">Свои категории доходов и расходов с иконками. Встроенные остаются всегда.</p>
+      </div>
+      <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
+    </div>
+    <div id="catsBody"></div>
+    <div class="dlg-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-quiet" data-close>Готово</button>
+      <button type="button" class="btn btn-primary" id="catsAdd"><span data-icon="Plus"></span>Новая категория</button>
+    </div>
+  </div>
 </dialog>
 
 <div class="toast" id="toast" hidden></div>

@@ -28,9 +28,12 @@ for (const f of fs.readdirSync(src)) {
   const text = fs.readFileSync(path.join(src, f), "utf8");
   for (const re of [/\bicon\(\s*"([A-Z][A-Za-z0-9]*)"/g, /data-icon="([A-Z][A-Za-z0-9]*)"/g, /\bicon:\s*"([A-Z][A-Za-z0-9]*)"/g])
     for (const m of text.matchAll(re)) names.add(m[1]);
+  // icon lists such as PICKER_ICONS / GOAL_ICONS = ["Name", …]
+  for (const m of text.matchAll(/[A-Z_]*ICONS\s*=\s*\[([^\]]*)\]/g))
+    for (const n of m[1].matchAll(/"([A-Z][A-Za-z0-9]*)"/g)) names.add(n[1]);
 }
 // names chosen at run time (e.g. a ternary inside icon(...)) are listed here
-for (const n of (process.env.EXTRA_ICONS || "TrendingUp,TrendingDown").split(",").filter(Boolean)) names.add(n);
+for (const n of (process.env.EXTRA_ICONS || "TrendingUp,TrendingDown,Tag").split(",").filter(Boolean)) names.add(n);
 
 const out = {};
 const missing = [];

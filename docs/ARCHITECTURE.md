@@ -27,30 +27,55 @@ Every `src/*.js` file is a classic script wrapped in its own IIFE (no modules, n
 Script order in the PWA `index.html`: `config.js`, `vendor/supabase.js`, then one bundle `app.<hash>.js` = `icons.js + seed.js + store-pwa.js + app.js + pwa.js`.
 Artifact: one inline `<script>` = `icons.js + store-artifact.js + app.js`.
 
-## Data shapes
+## Data shapes (v2: Money honey)
+
+Amounts are Israeli new shekels (₪, ILS), stored as plain numbers with 2 decimals; the currency is a UI concern only.
 
 ```ts
 type TxType = "income" | "expense" | "saving";
 interface Tx {               // what the UI sees
   id: string;                // ≤ 64 chars, [A-Za-z0-9_-]
   type: TxType;
-  amount: number;            // > 0, rounded to 2 decimals (rubles)
-  category: string;          // ids from CATS in app.js; "savings" for type "saving"
+  amount: number;            // > 0 and < 1e10, rounded to 2 decimals (shekels)
+  category: string;          // ≤ 32 chars: a built-in id from CATS in app.js, a custom category id ("c_…"), "savings" for type "saving"
+  goalId?: string;           // type "saving" only: the goal this money went to ([A-Za-z0-9_-]{1,32}); missing = the first goal
   note: string;              // ≤ 80 chars
-  date: string;              // "YYYY-MM-DD"
+  date: string;              // "YYYY-MM-DD", 1900-01-01 … 2199-12-31
   createdAt: number;         // ms epoch, ordering within a day
   updatedAt?: number;        // ms epoch
   example?: true;            // part of the example budget
 }
+interface Goal {
+  id: string;                // [A-Za-z0-9_-]{1,32}, e.g. "g_k3x9q2"
+  name: string;              // ≤ 60 chars
+  target: number;            // > 0
+  deadline: string;          // "" or "YYYY-MM-DD"
+  initial: number;           // ≥ 0, saved before tracking started
+  icon: string;              // lucide icon name from GOAL_ICONS in app.js
+  createdAt: number;         // ms epoch, display order
+}
+interface CustomCategory {
+  id: string;                // "c_" + [a-z0-9]{4,20}
+  type: "income" | "expense";
+  name: string;              // ≤ 32 chars
+  icon: string;              // lucide icon name from PICKER_ICONS in app.js
+  archived?: true;           // hidden from pickers, still shown on old operations
+}
 interface Settings {         // one document per user
   startBalance: number;      // may be negative
-  goal: { name: string; target: number; deadline: string /* "" or YYYY-MM-DD */; initial: number } | null;
-  limits: Record<string /* expense category id */, number>;
-  example?: { startBalance?: true; goal?: true; limits?: true };   // fields still holding example values
+  goals: Goal[];             // ≤ 20, in display order
+  limits: Record<string /* expense category id, built-in or custom */, number>;
+  categories: CustomCategory[];   // ≤ 60
+  example?: { startBalance?: true; goals?: true; limits?: true; categories?: true };   // fields still holding example values
 }
-// The PWA store keeps a timestamp per settings field internally (see "Sync rules"); the UI never sees it,
-// and a `_ms` key handed to saveSettings() is ignored.
+// Legacy (v1) settings carry `goal: {name,target,deadline,initial} | null` instead of `goals`.
+// Every reader migrates it: goals = goal ? [{ id: "g_main", icon: "Target", createdAt: 0, ...goal }] : [].
+// Writers never write `goal` again. Saving operations without goalId belong to goals[0].
+// The PWA store keeps a timestamp per settings field internally (startBalance, goals, limits, categories; see "Sync rules");
+// the UI never sees it, and a `_ms` key handed to saveSettings() is ignored.
 ```
+
+Server: `public.transactions` has a nullable `goal_id text` column (same charset/length as Goal.id); the client maps `goalId ↔ goal_id`.
 
 ## Store contract (both adapters)
 
@@ -151,6 +176,16 @@ interface BudgetApp {
 ```
 
 PWA mount points in `src/app.html`: `#pwaTop` (inside the top bar, before the month switcher) and `#pwaBanner` (directly after `#notice`).
+
+## Learning section (`src/lessons.js`, `src/learn.js`, `src/learn.css`; both targets)
+
+- `lessons.js` defines `window.MH_LESSONS = Lesson[]` (pure data, Russian):
+  `{ id, title, summary, minutes, icon, track: "basics" | "israel" | "app", sections: [{ h?, p: string[] , list?: string[] }], takeaways: string[], quiz: [{ q, options: string[], correct: number, explain }], tryIt?: { label, action: "tx" | "saving" | "limits" | "goal" | "categories" | "start" }, sources: [{ title, url }] }`.
+  Text is plain (no HTML); renderers escape it.
+- `learn.js` defines `window.BudgetLearn = { mount(el, api) }`. `app.js` calls it once, the first time the «Обучение» view opens, with `el = #viewLearn` and `api = BudgetApp` (which also exposes `actions` below).
+- Lesson progress is per device: `localStorage["mh-learn"]` (every access wrapped in try/catch; the section must work without it).
+
+`BudgetApp.actions` (exposed by `app.js`): `{ setView(name: "budget" | "goals" | "learn"), openTx(preset?: { type?, category?, goalId? }), openLimits(), openGoal(goalId?: string | null), openCategories(), openStart() }`.
 
 ## Styling rules
 

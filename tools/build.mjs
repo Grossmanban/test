@@ -36,12 +36,13 @@ function copyDir(from, to) {
 }
 
 const appHtml = need(src("app.html")).trim();
-const appCss = need(src("app.css")).trim();
+const LEARN_JS = ["lessons.js", "learn.js"];
+const appCss = `${need(src("app.css")).trim()}\n\n/* ── learn.css ── */\n${need(src("learn.css")).trim()}`;
 
 /* ── claude.ai artifact ─────────────────────────── */
 function buildArtifact() {
-  const js = bundle(["icons.js", "store-artifact.js", "app.js"]);
-  const html = `<title>Домашняя бухгалтерия</title>
+  const js = bundle(["icons.js", "store-artifact.js", ...LEARN_JS, "app.js"]);
+  const html = `<title>Money honey</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Unbounded:wght@500;600&display=swap">
@@ -68,7 +69,7 @@ function buildPwa() {
   fs.mkdirSync(dist, { recursive: true });
 
   const css = `${appCss}\n\n/* ── pwa.css ── */\n${need(src("pwa.css")).trim()}\n`;
-  const js = bundle(["icons.js", "seed.js", "store-pwa.js", "app.js", "pwa.js"]);
+  const js = bundle(["icons.js", "seed.js", "store-pwa.js", ...LEARN_JS, "app.js", "pwa.js"]);
   const cssName = `app.${hash(css)}.css`;
   const jsName = `app.${hash(js)}.js`;
   writeFile(path.join(dist, cssName), css);
