@@ -504,9 +504,9 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .limit-row:last-child { border-bottom: 0; }
 .limit-row .tx-ic { width: 34px; height: 34px; border-radius: 10px; }
 .limit-row .tx-ic .ic { width: 16px; height: 16px; }
-.limit-row b { display: block; font-size: 14px; }
+.limit-row b { display: block; font-size: 14px; -webkit-hyphens: auto; hyphens: auto; overflow-wrap: anywhere; }
 .limit-row small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.limit-row .input { height: 38px; font-size: 16px; text-align: right; }
+.limit-row .input { height: 40px; font-size: 16px; text-align: right; }
 
 /* ── Toast & tooltip ───────────────────────────── */
 .toast {
@@ -559,7 +559,7 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .goal-top { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-bottom: 14px; }
 .goal-ic { width: 44px; height: 44px; border-radius: 14px; display: grid; place-items: center; background: var(--gold-soft); color: var(--gold); flex: none; }
 .goal-ic .ic { width: 20px; height: 20px; }
-.goal-name { margin: 0; font-family: var(--font-display); font-weight: 600; font-size: 16px; line-height: 1.3; min-width: 0; overflow-wrap: anywhere; text-wrap: balance; }
+.goal-name { margin: 0; font-family: var(--font-display); font-weight: 600; font-size: 16px; line-height: 1.3; min-width: 0; -webkit-hyphens: auto; hyphens: auto; overflow-wrap: break-word; text-wrap: balance; }
 .goal-card .btn-gold { margin-top: 2px; }
 .goal-mini-list { display: grid; gap: 4px; margin: -4px -8px 12px; }
 .goal-mini {
@@ -625,7 +625,7 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
   border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--ink-2); font-size: 13.5px; font-weight: 700;
 }
 .chip-more .ic { width: 16px; height: 16px; }
-@media (pointer: coarse) { .chip-add, .chip-more { height: 40px; } }
+@media (pointer: coarse) { .chip-add, .chip-more { height: 44px; } }
 .cats-group { margin: 14px 0 6px; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .cats-group:first-child { margin-top: 0; }
 .cats-list { display: grid; gap: 2px; }
@@ -746,6 +746,11 @@ select.input { -webkit-appearance: none; appearance: none; background-image: non
   .dlg { --dlg-pt: 18px; --dlg-px: 16px; }
   .dlg-head h2 { font-size: 16px; }
   .toast { bottom: calc(150px + env(safe-area-inset-bottom, 0px)); }
+  dialog .toast { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
+  /* a sheet opened over another one leaves the lower sheet's title visible */
+  #catDlg, #accDlg { max-height: calc(92dvh - 72px); }
+  /* «+» only: the label covered the overview figures */
+  .fab { width: 56px; padding: 0; gap: 0; font-size: 0; justify-content: center; }
   .viewtabs {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 45; width: auto; max-width: none;
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 0;
@@ -808,13 +813,14 @@ select.input { -webkit-appearance: none; appearance: none; background-image: non
   .icon-btn { width: 44px; height: 44px; }
   .month-nav { padding: 2px; }
   .btn { height: 44px; }
-  .btn-sm { height: 40px; }
+  .btn-sm { height: 44px; }
   .fab { height: 56px; }
-  .seg button { height: 40px; }
+  .seg button { height: 44px; }
   .today-btn { height: 36px; }
-  .bc-edit { height: 40px; min-width: 40px; justify-content: center; }
-  .cat-chip { height: 40px; }
-  .chip-opt span { height: 40px; }
+  .bc-edit { height: 44px; min-width: 44px; justify-content: center; }
+  .cat-chip { height: 44px; }
+  .chip-opt span { height: 44px; }
+  .limit-row .input { height: 44px; }
   .seg-wide span { height: 44px; }
   .search input { height: 44px; }
   .toast button { height: 44px; padding: 0 14px; }
@@ -830,3 +836,18 @@ select.input { -webkit-appearance: none; appearance: none; background-image: non
   :root[data-theme="dark"] { --muted: #a9b8b2; --ink-2: #c9d5d0; --line: #3a4b44; --line-strong: #5f726a; --field-line: #8a9c94; --bar-track: #2c3b35; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+
+/* ── Review fixes: stacked sheets, tight widths, touch targets ── */
+/* the sheet underneath keeps its buttons out of sight while another sheet is open on top of it */
+#txDlg:has(~ #catDlg[open]) .dlg-foot, #txDlg:has(~ #accDlg[open]) .dlg-foot, #txDlg:has(~ #goalDlg[open]) .dlg-foot,
+#accsDlg:has(~ #accDlg[open]) .dlg-foot, #catDlg[open] ~ #catsDlg .dlg-foot { visibility: hidden; }
+@media (max-height: 500px) { .icon-grid { max-height: none; overflow: visible; } }
+@media (max-width: 960px) { .tx-meta { white-space: normal; flex-wrap: wrap; row-gap: 2px; } }
+@media (max-width: 360px), (min-width: 720px) and (max-width: 960px) {
+  #limitsBtn { width: 44px; padding: 0; gap: 0; font-size: 0; justify-content: center; }
+}
+@media (max-width: 360px) {
+  .goal-name { font-size: 15px; }
+  #typeFilter button { padding: 0 4px; font-size: 13px; min-width: 44px; }
+}
+@media (pointer: coarse) and (min-width: 641px) { .viewtabs button { height: 44px; } }

@@ -16,7 +16,7 @@
 .lrn-sum { display: grid; gap: 7px; flex: 0 0 auto; width: min(100%, 230px); }
 .lrn-sum-text { margin: 0; font-size: 13px; font-weight: 600; color: var(--ink-2); }
 .lrn-sum-text b { font-size: 15px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums; }
-.lrn-meter { height: 8px; border-radius: 4px; background: var(--bar-track); overflow: hidden; }
+.lrn-meter { height: 8px; border-radius: 4px; background: var(--line-strong); overflow: hidden; }
 .lrn-meter span { display: block; height: 100%; border-radius: 4px; background: var(--bar); }
 
 /* continue card */

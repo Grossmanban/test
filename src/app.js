@@ -1012,6 +1012,9 @@
     clearTimeout(toastTimer);
     el.innerHTML = `<span>${esc(msg)}</span>${action ? `<button type="button" id="toastAct">${esc(action.label)}</button>` : ""}`;
     el.hidden = false;
+    // an open sheet sits in the top layer above the page: the toast (and its «Вернуть») goes into the topmost one
+    const host = [...document.querySelectorAll("dialog[open]")].pop() || document.body;
+    if (el.parentNode !== host) host.appendChild(el);
     const live = $("#live"); live.textContent = "";
     setTimeout(() => { live.textContent = action ? `${msg}. Кнопка «${action.label}» внизу экрана` : msg; }, 60);
     if (action) $("#toastAct").onclick = () => { el.hidden = true; action.run(); };
@@ -1040,18 +1043,32 @@
     if (st.example) doc.example = { ...st.example };
     return doc;
   }
+  // Starts from the stored document, so the fields and entries this save does not change go back exactly as they
+  // came (values of a newer version, limits of categories this view hides); only a v1 `goal` becomes goals.
   function saveSettings(patch) {
-    const next = { ...settingsDoc(), ...patch };
+    const raw = S.settings ? JSON.parse(JSON.stringify(S.settings)) : {};
+    const next = { ...DEFAULTS, ...raw, ...patch };
+    if (!Array.isArray(raw.goals) && !("goals" in patch)) next.goals = settingsDoc().goals;
+    delete next.goal;
     if (Array.isArray(next.accounts) && next.accounts.length) {
       next.accounts = next.accounts.map(({ virtual, ...a }) => a);
       // v2 clients only know startBalance: keep it equal to the net opening of all accounts
-      next.startBalance = r2(next.accounts.reduce((sum, a) => sum + (a.kind === "card" ? -a.opening : a.opening), 0));
-    } else delete next.accounts;
-    if (next.example && typeof next.example === "object") {
-      for (const k of Object.keys(patch)) delete next.example[k];
-      if (!Object.keys(next.example).length) delete next.example;
-    }
+      next.startBalance = r2(next.accounts.reduce((sum, a) => sum + (a.kind === "card" ? -(Number(a.opening) || 0) : Number(a.opening) || 0), 0));
+    } else { delete next.accounts; delete next.defaultAccount; }
+    const ex = raw.example && typeof raw.example === "object" ? { ...raw.example } : null;
+    if (ex && ex.goal) { ex.goals = true; delete ex.goal; }
+    if (ex) for (const k of Object.keys(patch)) delete ex[k];
+    if (ex && "accounts" in patch) delete ex.startBalance;   // the openings now say what the start is
+    if (ex && Object.keys(ex).length) next.example = ex; else delete next.example;
     return store.saveSettings(next);
+  }
+  // «Вернуть» puts back only the removed entry, at its old place in the current list, so whatever another device
+  // added meanwhile stays
+  function restoreEntry(list, prev, id) {
+    const at = prev.findIndex(x => x.id === id);
+    const cur = list.filter(x => x.id !== id && !x.virtual).map(x => ({ ...x }));
+    cur.splice(Math.min(at, cur.length), 0, { ...prev[at] });
+    return cur;
   }
 
   /* ── Transaction dialog ────────────────────── */
@@ -1197,7 +1214,7 @@
     const type = t ? t.type : (preset.type || (S.filter !== "all" ? S.filter : "expense"));
     $(`#txForm input[name="type"][value="${type}"]`).checked = true;
     catChipsExpanded = false;
-    renderCatChips(type, t ? t.category : (preset.category || S.cat || null), t ? t.goalId : preset.goalId);
+    renderCatChips(type, t ? t.category : (preset.category || S.cat || null), t ? (t.goalId || (goalOfTx(t) || {}).id) : preset.goalId);
     accTouched = !!t;
     const cat = ($('#txForm input[name="category"]:checked') || {}).value;
     renderAccChips(type, t ? accountIdOf(t) : (preset.account || rememberedAccount(cat)), t ? t.toAccount : preset.toAccount);
@@ -1388,7 +1405,7 @@
     goalDlg.close();
     try {
       await saveSettings({ goals: prev.filter(g => g.id !== gone.id) });
-      toast(`Цель «${gone.name}» убрана`, { label: "Вернуть", run: () => saveSettings({ goals: prev }).catch(e => toast(errText(e))) });
+      toast(`Цель «${gone.name}» убрана`, { label: "Вернуть", run: () => saveSettings({ goals: restoreEntry(settings().goals, prev, gone.id) }).catch(e => toast(errText(e))) });
     } catch (ex) { toast(errText(ex)); }
   });
 
@@ -1453,7 +1470,7 @@
     catDlg.close();
     try {
       await saveSettings({ categories: next });
-      toast(used ? `Категория «${gone.name}» скрыта` : `Категория «${gone.name}» удалена`, { label: "Вернуть", run: () => saveSettings({ categories: prev }).catch(e => toast(errText(e))) });
+      toast(used ? `Категория «${gone.name}» скрыта` : `Категория «${gone.name}» удалена`, { label: "Вернуть", run: () => saveSettings({ categories: restoreEntry(settings().categories, prev, gone.id) }).catch(e => toast(errText(e))) });
       if (catsDlg.open) renderCatsManager();
     } catch (ex) { toast(errText(ex)); }
   });
@@ -1506,6 +1523,8 @@
     e.preventDefault();
     const err = $("#limitsErr");
     const limits = {};
+    const listed = new Set($$("#limitList input").map(i => i.dataset.cat));
+    for (const [k, v] of Object.entries(settings().limits)) if (!listed.has(k)) limits[k] = v;   // hidden categories keep theirs
     for (const inp of $$("#limitList input")) {
       const v = parseAmount(inp.value);
       if (v == null || v === 0) continue;
@@ -1635,7 +1654,7 @@
     accDlg.close();
     try {
       await saveSettings({ accounts: next, defaultAccount: def });
-      toast(used ? `Счёт «${gone.name}» скрыт` : `Счёт «${gone.name}» удалён`, { label: "Вернуть", run: () => saveSettings({ accounts: prev }).catch(e => toast(errText(e))) });
+      toast(used ? `Счёт «${gone.name}» скрыт` : `Счёт «${gone.name}» удалён`, { label: "Вернуть", run: () => saveSettings({ accounts: restoreEntry(settings().accounts, prev, gone.id) }).catch(e => toast(errText(e))) });
       if (accsDlg.open) renderAccountsManager();
     } catch (ex) { toast(errText(ex)); }
   });
@@ -1671,14 +1690,28 @@
       await store.deleteMany(ex.map(t => t.id), done => { S.clearing.done = done; renderNotice(); });
       const exFlags = settings().example;
       if (exFlags && Object.keys(exFlags).length) {
-        const next = settingsDoc();
+        const st = settings(), next = settingsDoc();
         for (const k of Object.keys(exFlags)) if (k in DEFAULTS) next[k] = JSON.parse(JSON.stringify(DEFAULTS[k]));
+        // the user's own operations keep the example goal, category or account they were made into: it becomes
+        // theirs, without the example's amounts («уже отложено», opening balance)
+        const mine = S.tx.filter(t => t.example !== true);
+        if (exFlags.goals) next.goals = st.goals.filter(g => mine.some(t => t.type === "saving" && goalOfTx(t, st.goals) === g)).map(g => ({ ...g, initial: 0 }));
+        if (exFlags.categories) next.categories = st.categories.filter(c => mine.some(t => t.category === c.id)).map(c => ({ ...c }));
+        if (exFlags.accounts) {
+          const kept = st.accounts.filter(a => !a.virtual && mine.some(t => t.account === a.id || t.toAccount === a.id)).map(a => ({ ...a, opening: 0 }));
+          if (kept.length) {
+            next.accounts = kept;
+            next.defaultAccount = kept.some(a => a.id === st.defaultAccount) ? st.defaultAccount : (kept.find(a => a.kind !== "card") || kept[0]).id;
+          } else delete next.defaultAccount;
+          next.startBalance = 0;
+        }
+        if (!next.accounts || !next.accounts.length) { delete next.accounts; delete next.defaultAccount; }
         delete next.example;
         await store.saveSettings(next);
       }
       S.clearing = null; S.cat = null;
       render();
-      toast("Пример удалён. Укажите начальный остаток и добавьте свои операции.");
+      toast("Пример удалён. Добавьте свои счета и операции.");
     } catch (e) {
       S.clearing = null; render(); toast(errText(e));
     }
@@ -1711,7 +1744,10 @@
       const a = document.activeElement;
       if (!a || !dlg.contains(a) || !a.matches(KB_SEL)) dlg.classList.remove("kb-open");
     }, 150));
-    dlg.addEventListener("close", () => dlg.classList.remove("kb-open"));
+    dlg.addEventListener("close", () => {
+      dlg.classList.remove("kb-open");
+      const t = $("#toast"); if (dlg.contains(t)) document.body.appendChild(t);
+    });
   }
   $$("dialog").forEach(enhanceDialog);
   $("#typeFilter").addEventListener("click", e => {
