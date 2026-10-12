@@ -46,6 +46,12 @@
     };
     // the goal a saving went to (missing = the first goal); other types never carry one
     if (d.type === "saving" && typeof d.goalId === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(d.goalId)) out.goalId = d.goalId;
+    // v3: the account it touches, a transfer's destination, and a split purchase's part
+    const ID = /^[A-Za-z0-9_-]{1,32}$/;
+    if (typeof d.account === "string" && ID.test(d.account)) out.account = d.account;
+    if (d.type === "transfer" && typeof d.toAccount === "string" && ID.test(d.toAccount) && d.toAccount !== out.account) out.toAccount = d.toAccount;
+    const p = d.plan;
+    if (d.type === "expense" && p && typeof p.id === "string" && ID.test(p.id) && Number.isInteger(p.n) && Number.isInteger(p.of) && p.n >= 1 && p.n <= p.of && p.of <= 36) out.plan = { id: p.id, n: p.n, of: p.of };
     if (d.example === true) out.example = true;
     return out;
   }

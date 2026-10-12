@@ -34,7 +34,7 @@
       <canvas id="guilloche" aria-hidden="true"></canvas>
       <div class="bc-top">
         <span class="bc-label" id="bcLabel">Остаток на счёте</span>
-        <button class="bc-edit" id="editStart" aria-label="Изменить начальный остаток"><span data-icon="Pencil"></span><span class="bc-edit-text">Начальный остаток</span></button>
+        <button class="bc-edit" id="editStart" aria-label="Счета и остатки"><span data-icon="Settings2"></span><span class="bc-edit-text">Счета</span></button>
       </div>
       <p class="bc-amount" id="bcAmount">—</p>
       <div class="bc-sub" id="bcSub"></div>
@@ -72,6 +72,7 @@
     </section>
 
     <aside class="side">
+      <section class="card" aria-labelledby="accTitle" id="accCard"></section>
       <section class="card" aria-labelledby="catTitle">
         <div class="card-head">
           <div>
@@ -106,10 +107,11 @@
       <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
       <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
     </div>
-    <div class="seg seg-wide" role="radiogroup" aria-label="Тип операции">
+    <div class="seg seg-wide seg-4" role="radiogroup" aria-label="Тип операции">
       <label><input type="radio" name="type" value="expense" id="tExp"><span><span data-icon="ArrowUpRight"></span>Расход</span></label>
       <label><input type="radio" name="type" value="income" id="tInc"><span><span data-icon="ArrowDownLeft"></span>Доход</span></label>
-      <label><input type="radio" name="type" value="saving" id="tSav"><span><span data-icon="PiggyBank"></span>В копилку</span></label>
+      <label><input type="radio" name="type" value="saving" id="tSav"><span><span data-icon="PiggyBank"></span>Копилка</span></label>
+      <label><input type="radio" name="type" value="transfer" id="tTrf"><span><span data-icon="ArrowLeftRight"></span>Перевод</span></label>
     </div>
     <label class="field">
       <span>Сумма</span>
@@ -120,6 +122,22 @@
       <div class="chips" id="catChips"></div>
     </fieldset>
     <p class="hint" id="savingHint" hidden></p>
+    <fieldset id="accField" hidden>
+      <legend class="legend" id="accLegend">Счёт</legend>
+      <div class="chips" id="accChips"></div>
+    </fieldset>
+    <fieldset id="toField" hidden>
+      <legend class="legend">Куда</legend>
+      <div class="chips" id="toChips"></div>
+    </fieldset>
+    <div class="split" id="splitField" hidden>
+      <label class="split-toggle" id="splitToggle"><input type="checkbox" id="splitOn"><span><span data-icon="Split"></span>Разбить на платежи (сплит, תשלומים)</span></label>
+      <div class="split-row" id="splitRow" hidden>
+        <label class="field split-n"><span>Платежей</span><select class="input" id="splitN"></select></label>
+        <p class="hint" id="splitHint"></p>
+      </div>
+      <p class="hint" id="planInfo" hidden></p>
+    </div>
     <div class="row2">
       <label class="field"><span>Дата</span><input class="input" type="date" id="txDate" min="1900-01-01" max="2199-12-31" required></label>
       <label class="field"><span>Комментарий</span><input class="input" id="txNote" maxlength="80" enterkeyhint="done" autocomplete="off" placeholder="Например: продукты на неделю"></label>
@@ -129,6 +147,7 @@
       <span>Удалить операцию без возможности вернуть?</span><span class="spacer"></span>
       <button type="button" class="btn btn-sm btn-quiet" id="txConfirmNo">Оставить</button>
       <button type="button" class="btn btn-sm btn-danger-solid" id="txConfirmYes">Удалить</button>
+      <button type="button" class="btn btn-sm btn-danger" id="txConfirmAll" hidden>Весь сплит</button>
     </div>
     <div class="dlg-foot">
       <button type="button" class="btn btn-danger" id="txDelete" aria-label="Удалить операцию" hidden><span data-icon="Trash2"></span>Удалить</button>
@@ -189,22 +208,62 @@
   </form>
 </dialog>
 
-<!-- Start balance dialog -->
-<dialog id="startDlg" aria-labelledby="startDlgTitle">
-  <form class="dlg" id="startForm" novalidate>
+<!-- Accounts manager -->
+<dialog id="accsDlg" aria-labelledby="accsDlgTitle">
+  <div class="dlg">
     <div class="dlg-head">
-      <h2 id="startDlgTitle">Начальный остаток</h2>
+      <div>
+        <h2 id="accsDlgTitle">Счета</h2>
+        <p class="hint" style="margin-top:4px">Банк, наличные, Bit или PayBox, кредитки с днём списания. Остатки считаются по операциям и переводам.</p>
+      </div>
+      <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
+    </div>
+    <div id="accsBody"></div>
+    <div class="dlg-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-quiet" data-close>Готово</button>
+      <button type="button" class="btn btn-primary" id="accsAdd"><span data-icon="Plus"></span>Новый счёт</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Account editor -->
+<dialog id="accDlg" aria-labelledby="accDlgTitle">
+  <form class="dlg" id="accForm" novalidate>
+    <div class="dlg-head">
+      <h2 id="accDlgTitle">Новый счёт</h2>
       <button type="submit" class="btn btn-sm btn-primary dlg-kb-save">Сохранить</button>
       <button type="button" class="icon-btn" data-close aria-label="Закрыть" data-icon="X"></button>
     </div>
-    <div class="seg seg-wide seg-2" role="radiogroup" aria-label="Знак остатка">
-      <label><input type="radio" name="startSign" value="1" checked><span>Есть на счёте</span></label>
-      <label><input type="radio" name="startSign" value="-1"><span>Долг (минус)</span></label>
+    <div class="seg seg-wide seg-4" role="radiogroup" aria-label="Вид счёта">
+      <label><input type="radio" name="akind" value="bank" checked><span><span data-icon="Landmark"></span>Банк</span></label>
+      <label><input type="radio" name="akind" value="cash"><span><span data-icon="Banknote"></span>Наличные</span></label>
+      <label><input type="radio" name="akind" value="wallet"><span><span data-icon="Smartphone"></span>Кошелёк</span></label>
+      <label><input type="radio" name="akind" value="card"><span><span data-icon="CreditCard"></span>Карта</span></label>
     </div>
-    <label class="field"><span>Сумма до первой записи</span><div class="money-input amount-big"><input class="input num" id="startAmount" inputmode="decimal" autocomplete="off" placeholder="0"></div></label>
-    <p class="hint">От этой суммы считается остаток после каждой операции.</p>
-    <p class="err" id="startErr" hidden></p>
+    <label class="field"><span>Название</span><input class="input" id="aName" maxlength="40" autocomplete="off" enterkeyhint="next"></label>
+    <fieldset>
+      <legend class="legend">Иконка</legend>
+      <div class="icon-grid" id="aIcons"></div>
+    </fieldset>
+    <div class="seg seg-wide seg-2" role="radiogroup" aria-label="Знак остатка" id="accSignRow">
+      <label><input type="radio" name="asign" value="1" checked><span>Есть на счёте</span></label>
+      <label><input type="radio" name="asign" value="-1"><span>Минус (овердрафт)</span></label>
+    </div>
+    <label class="field"><span id="aOpeningLabel">Остаток на начало учёта</span><div class="money-input"><input class="input num" id="aOpening" inputmode="decimal" autocomplete="off" placeholder="0"></div></label>
+    <p class="hint" id="aOpeningHint"></p>
+    <div id="accCardFields" class="acc-card-fields" hidden>
+      <div class="row2">
+        <label class="field"><span>День списания (מועד חיוב)</span><select class="input" id="aBilling"></select></label>
+        <label class="field"><span>Списывается со счёта</span><select class="input" id="aPayFrom"></select></label>
+      </div>
+      <label class="field"><span>Кредитный лимит (необязательно)</span><div class="money-input"><input class="input num" id="aLimit" inputmode="decimal" autocomplete="off" placeholder="—"></div></label>
+      <p class="hint">Покупки по карте попадают в бюджет в день покупки. В день списания приложение предложит провести перевод с банковского счёта на карту.</p>
+    </div>
+    <label class="check-row" id="aDefaultRow"><input type="checkbox" id="aDefault"><span>Основной счёт: подставлять в новых операциях</span></label>
+    <p class="err" id="accErr" hidden></p>
     <div class="dlg-foot">
+      <button type="button" class="btn btn-danger" id="accRemove" aria-label="Удалить счёт" hidden><span data-icon="Trash2"></span><span>Удалить</span></button>
       <span class="spacer"></span>
       <button type="button" class="btn btn-quiet" data-close>Отмена</button>
       <button type="submit" class="btn btn-primary">Сохранить</button>

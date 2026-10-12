@@ -56,6 +56,7 @@
       { id: "other_in", name: "Прочее", icon: "Ellipsis" },
     ],
     saving: [{ id: "savings", name: "Копилка", icon: "PiggyBank" }],
+    transfer: [{ id: "transfer", name: "Перевод", icon: "ArrowLeftRight" }],
   };
   const CAT = {};
   for (const [type, list] of Object.entries(CATS)) for (const c of list) CAT[c.id] = { ...c, type };
@@ -72,6 +73,15 @@
   const GOAL_ICONS = ["Target", "ShieldCheck", "Umbrella", "Plane", "TreePalm", "House", "Car", "Laptop", "Smartphone",
     "GraduationCap", "Baby", "Heart", "Gem", "Gift", "Bike", "Camera", "Sofa", "PiggyBank", "Rocket", "Star"];
   const DEFAULT_GOAL_ICON = "Target";
+  // accounts (v3): where money lives
+  const ACCOUNT_KINDS = {
+    bank: { name: "Банковский счёт", short: "Банк", icon: "Landmark" },
+    cash: { name: "Наличные", short: "Наличные", icon: "Banknote" },
+    wallet: { name: "Кошелёк: Bit, PayBox…", short: "Кошелёк", icon: "Smartphone" },
+    card: { name: "Кредитная карта", short: "Карта", icon: "CreditCard" },
+  };
+  const ACCOUNT_ICONS = ["Landmark", "Building2", "Banknote", "Coins", "Wallet", "WalletCards", "CreditCard", "Smartphone",
+    "PiggyBank", "HandCoins", "Briefcase", "Vault", "Gem", "ShieldCheck", "Heart", "Star"];
 
   // a category record by id, built-in or the user's own (archived ones still resolve for old operations)
   function findCat(id) {
@@ -82,17 +92,17 @@
   function catOf(t) {
     const c = findCat(t.category);
     if (c && c.type === t.type) return c;
-    return t.type === "income" ? CAT.other_in : t.type === "saving" ? CAT.savings : CAT.other;
+    return t.type === "income" ? CAT.other_in : t.type === "saving" ? CAT.savings : t.type === "transfer" ? CAT.transfer : CAT.other;
   }
   // categories offered in pickers for a type: built-ins and active custom ones
   function catsFor(type) {
-    if (type === "saving") return CATS.saving;
+    if (type === "saving" || type === "transfer") return CATS[type];
     const custom = settings().categories.filter(c => c.type === type && !c.archived)
       .map(c => ({ id: c.id, name: c.name, icon: c.icon, type: c.type, custom: true }));
     const list = CATS[type];
     return [...list.slice(0, -1), ...custom, list[list.length - 1]];   // custom ones before «Прочее»
   }
-  const KIND_BG = { income: "bg-income", expense: "bg-expense", saving: "bg-saving" };
+  const KIND_BG = { income: "bg-income", expense: "bg-expense", saving: "bg-saving", transfer: "bg-transfer" };
 
   /* ── Dates ─────────────────────────────────── */
   const pad = n => String(n).padStart(2, "0");
@@ -154,7 +164,7 @@
   const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   /* ── State ─────────────────────────────────── */
-  const DEFAULTS = { startBalance: 0, goals: [], limits: {}, categories: [] };
+  const DEFAULTS = { startBalance: 0, goals: [], limits: {}, categories: [], accounts: [] };
   const ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
   const mintId = p => p + Math.random().toString(36).slice(2, 10);
   const S = {
@@ -179,7 +189,7 @@
   function settings() {
     if (settingsMemoSrc === S.settings && settingsMemo) return settingsMemo;
     const raw = S.settings || {};
-    const out = { startBalance: 0, goals: [], limits: {}, categories: [] };
+    const out = { startBalance: 0, goals: [], limits: {}, categories: [], accounts: [], defaultAccount: "a_main" };
     if (typeof raw.startBalance === "number" && Number.isFinite(raw.startBalance)) out.startBalance = raw.startBalance;
     const goalOk = g => g && typeof g === "object" && typeof g.name === "string" && g.name.trim() && typeof g.target === "number" && g.target > 0;
     const normGoal = (g, i) => ({
@@ -216,6 +226,34 @@
         if (isExpense && typeof v === "number" && v > 0) out.limits[k] = v;
       }
     }
+    // accounts: with none stored the app behaves as one bank account holding the start balance (v2 data)
+    if (Array.isArray(raw.accounts)) {
+      const ids = new Set();
+      for (const a of raw.accounts) {
+        if (!a || typeof a !== "object" || typeof a.id !== "string" || !/^a_[a-z0-9]{2,20}$/.test(a.id) || ids.has(a.id)) continue;
+        if (!ACCOUNT_KINDS[a.kind] || typeof a.name !== "string" || !a.name.trim()) continue;
+        ids.add(a.id);
+        const acc = {
+          id: a.id, kind: a.kind, name: a.name.slice(0, 40),
+          icon: ACCOUNT_ICONS.includes(a.icon) ? a.icon : ACCOUNT_KINDS[a.kind].icon,
+          opening: typeof a.opening === "number" && Number.isFinite(a.opening) ? a.opening : 0,
+          createdAt: typeof a.createdAt === "number" ? a.createdAt : 0,
+        };
+        if (a.kind === "card") {
+          acc.billingDay = Number.isInteger(a.billingDay) && a.billingDay >= 1 && a.billingDay <= 28 ? a.billingDay : 10;
+          if (typeof a.payFrom === "string") acc.payFrom = a.payFrom;
+          if (typeof a.creditLimit === "number" && a.creditLimit > 0) acc.creditLimit = a.creditLimit;
+          if (acc.opening < 0) acc.opening = -acc.opening;
+        }
+        if (a.archived) acc.archived = true;
+        out.accounts.push(acc);
+        if (out.accounts.length >= 20) break;
+      }
+      for (const a of out.accounts) if (a.kind === "card" && a.payFrom && !out.accounts.some(b => b.id === a.payFrom && b.kind !== "card")) delete a.payFrom;
+    }
+    if (!out.accounts.length) out.accounts = [{ id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", opening: out.startBalance, createdAt: 0, virtual: true }];
+    out.defaultAccount = typeof raw.defaultAccount === "string" && out.accounts.some(a => a.id === raw.defaultAccount && !a.archived)
+      ? raw.defaultAccount : (out.accounts.find(a => !a.archived && a.kind !== "card") || out.accounts[0]).id;
     let ex = raw.example && typeof raw.example === "object" ? { ...raw.example } : null;
     if (ex && ex.goal) { ex.goals = true; delete ex.goal; }
     out.example = ex && Object.keys(ex).length ? ex : null;
@@ -238,31 +276,57 @@
     return r2(sum);
   }
   function validTx(t) {
-    return t && ["income", "expense", "saving"].includes(t.type)
+    return t && ["income", "expense", "saving", "transfer"].includes(t.type)
       && typeof t.amount === "number" && Number.isFinite(t.amount) && t.amount > 0
       && typeof t.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(t.date);
   }
-  const sgn = t => t.type === "income" ? 1 : -1;
+  const sgn = t => t.type === "income" ? 1 : t.type === "transfer" ? 0 : -1;
+  // the account an operation touches (its source for a transfer); unknown or missing ids fall back to the default
+  function accountIdOf(t) {
+    const st = settings();
+    return t.account && st.accounts.some(a => a.id === t.account) ? t.account : st.defaultAccount;
+  }
+  const findAccount = id => settings().accounts.find(a => a.id === id) || null;
+  const activeAccounts = () => settings().accounts.filter(a => !a.archived);
+  // net opening across accounts: money minus card debts at the start of tracking
+  function netOpening() {
+    return settings().accounts.reduce((sum, a) => sum + (a.kind === "card" ? -a.opening : a.opening), 0);
+  }
+  // balance of every account at the end of cutoffIso (card balances are negative while money is owed)
+  function accountBalances(cutoffIso) {
+    const bal = new Map(settings().accounts.map(a => [a.id, a.kind === "card" ? -a.opening : a.opening]));
+    for (const t of S.tx) {
+      if (t.date > cutoffIso) continue;
+      const from = accountIdOf(t);
+      if (t.type === "transfer") {
+        if (!t.toAccount || !bal.has(t.toAccount) || t.toAccount === from) continue;
+        bal.set(from, bal.get(from) - t.amount);
+        bal.set(t.toAccount, bal.get(t.toAccount) + t.amount);
+      } else bal.set(from, bal.get(from) + sgn(t) * t.amount);
+    }
+    for (const [k, v] of bal) bal.set(k, r2(v));
+    return bal;
+  }
   function sortAsc(list) {
     return [...list].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1
       : ((a.createdAt || 0) - (b.createdAt || 0)) || (a.id < b.id ? -1 : 1));
   }
   function derive() {
     const sorted = sortAsc(S.tx);
-    let bal = settings().startBalance;
+    let bal = netOpening();
     const after = new Map();
     for (const t of sorted) { bal += sgn(t) * t.amount; after.set(t.id, r2(bal)); }
     return { sorted, after };
   }
   function balanceAt(sorted, cutoffIso) {
-    let b = settings().startBalance;
+    let b = netOpening();
     for (const t of sorted) { if (t.date > cutoffIso) break; b += sgn(t) * t.amount; }
     return r2(b);
   }
   function monthStats(ym, upToDay = 31) {
     const r = { inc: 0, exp: 0, sav: 0, n: 0, byCat: {} };
     for (const t of S.tx) {
-      if (ymOf(t.date) !== ym || dParts(t.date)[2] > upToDay) continue;
+      if (ymOf(t.date) !== ym || dParts(t.date)[2] > upToDay || t.type === "transfer") continue;
       r.n++;
       if (t.type === "income") r.inc += t.amount;
       else if (t.type === "saving") r.sav += t.amount;
@@ -461,6 +525,91 @@
   }
 
   /* ── Render: categories ─────────────────────── */
+  /* ── Accounts, cards and transfers ──────────── */
+  const dayBefore = iso => { const [y, m, d] = dParts(iso); return isoOf(new Date(y, m - 1, d - 1)); };
+  function addMonths(iso, k) {
+    const [y, m, d] = dParts(iso);
+    const first = new Date(y, m - 1 + k, 1), last = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+    return isoOf(new Date(first.getFullYear(), first.getMonth(), Math.min(d, last)));
+  }
+  function billingDate(card, ym) { return `${ym}-${pad(Math.min(card.billingDay, daysIn(ym)))}`; }
+  // the latest billing date on or before today, and the next one after today
+  function cardDates(card) {
+    const here = billingDate(card, CUR_YM);
+    return {
+      last: here <= TODAY ? here : billingDate(card, shiftYm(CUR_YM, -1)),
+      next: here > TODAY ? here : billingDate(card, shiftYm(CUR_YM, 1)),
+    };
+  }
+  // what the bank should pay on a billing date: the card debt the day before it, less what was paid since
+  function cardDue(card, billIso) {
+    const owed = -(accountBalances(dayBefore(billIso)).get(card.id) || 0);
+    let paid = 0;
+    for (const t of S.tx) if (t.type === "transfer" && t.toAccount === card.id && t.date >= billIso && t.date <= TODAY) paid += t.amount;
+    return r2(Math.max(0, owed - paid));
+  }
+  // future installments of split purchases still to come on a card
+  function cardFuture(card) {
+    let sum = 0, n = 0;
+    for (const t of S.tx) if (t.type === "expense" && t.date > TODAY && accountIdOf(t) === card.id) { sum += t.amount; n++; }
+    return { sum: r2(sum), n };
+  }
+  // cards whose last bill has not been paid yet (shown as a prompt to record the bank → card transfer)
+  function cardsDue() {
+    const out = [];
+    for (const card of activeAccounts().filter(a => a.kind === "card")) {
+      const { last } = cardDates(card);
+      if (card.createdAt && last < isoOf(new Date(card.createdAt))) continue;
+      const due = cardDue(card, last);
+      if (due > 0) out.push({ card, date: last, due });
+    }
+    return out;
+  }
+  function accountMeta(a, bal) {
+    if (a.kind !== "card") return ACCOUNT_KINDS[a.kind].short;
+    const { next } = cardDates(a);
+    const [, nm, nd] = dParts(next);
+    const fut = cardFuture(a);
+    return `спишется ${nd}${NB}${M_GEN[nm - 1]}${fut.n ? ` · сплит ещё ${money(fut.sum)}` : ""}${a.creditLimit ? ` · лимит ${money(a.creditLimit)}` : ""}`;
+  }
+  function renderAccounts() {
+    const el = $("#accCard");
+    if (!el) return;
+    if (S.status !== "ready") { el.innerHTML = `<div class="skeleton"></div>`; return; }
+    const st = settings(), accs = activeAccounts(), bal = accountBalances(TODAY);
+    const money0 = accs.filter(a => a.kind !== "card").reduce((sum, a) => sum + bal.get(a.id), 0);
+    const debt = accs.filter(a => a.kind === "card").reduce((sum, a) => sum - bal.get(a.id), 0);
+    const canEdit = !S.readOnly;
+    const single = accs.length === 1 && accs[0].virtual;
+    const dues = cardsDue();
+    el.innerHTML = `
+      <div class="card-head">
+        <div><p class="eyebrow">Счета на сегодня</p><h2 id="accTitle">Деньги ${money(money0)}</h2>
+          ${debt > 0.004 ? `<p class="meta">Долг по картам ${money(debt)}</p>` : ""}</div>
+        <div class="head-tools">
+          ${single ? "" : `<button class="icon-btn" data-do="transfer" aria-label="Перевод между счетами" title="Перевод между счетами" ${canEdit ? "" : "disabled"}>${icon("ArrowLeftRight")}</button>`}
+          <button class="btn btn-ghost btn-sm" data-do="accounts" ${canEdit ? "" : "disabled"}>${icon("Settings2")}Счета</button>
+        </div>
+      </div>
+      ${dues.map(d => {
+        const [, m, dd] = dParts(d.date);
+        return `<div class="status is-warn acc-due">${icon("CalendarClock")}<span>Списание по карте <b>${esc(d.card.name)}</b> ${dd}${NB}${M_GEN[m - 1]}: <b>${money(d.due)}</b></span>
+          <button class="btn btn-sm btn-primary" data-pay-card="${esc(d.card.id)}" ${canEdit ? "" : "disabled"}>Провести</button></div>`;
+      }).join("")}
+      <div class="acc-list">
+        ${accs.map(a => {
+          const b = bal.get(a.id);
+          const neg = a.kind === "card" ? b < -0.004 : b < -0.004;
+          return `<div class="acc-row">
+            <span class="tx-ic ${a.kind === "card" ? "bg-card" : "bg-acc"}">${icon(a.icon)}</span>
+            <span class="acc-name"><b>${esc(a.name)}</b><small>${esc(accountMeta(a, b))}</small></span>
+            <span class="acc-bal num ${neg ? (a.kind === "card" ? "t-ink2" : "t-bad") : ""}">${a.kind === "card" ? (b < -0.004 ? `долг ${money(-b)}` : money(b)) : money(b)}</span>
+          </div>`;
+        }).join("")}
+      </div>
+      ${single ? `<p class="hint acc-hint">Заведите свои счета: банк, наличные, Bit или PayBox, кредитки с днём списания. Тогда переводы и сплит будут учитываться правильно.</p>` : ""}`;
+  }
+
   function renderCats() {
     const list = $("#catList"), total = $("#catTotal"), plan = $("#planLine");
     if (S.status !== "ready") {
@@ -709,15 +858,20 @@
   function txRow(t, after) {
     const c = catOf(t);
     const title = t.note && t.note.trim() ? t.note.trim() : c.name;
-    const amtCls = t.type === "income" ? "t-good" : t.type === "saving" ? "t-gold" : "";
-    const sign = t.type === "income" ? "+" : MINUS;
+    const amtCls = t.type === "income" ? "t-good" : t.type === "saving" ? "t-gold" : t.type === "transfer" ? "t-ink2" : "";
+    const sign = t.type === "income" ? "+" : t.type === "transfer" ? "" : MINUS;
     const goal = t.type === "saving" ? goalOfTx(t) : null;
-    const metaName = t.type === "saving" ? (goal ? `Копилка · ${goal.name}` : "Копилка") : c.name;
+    const many = activeAccounts().length > 1 || settings().accounts.length > 1;
+    const acc = findAccount(accountIdOf(t)), to = t.toAccount ? findAccount(t.toAccount) : null;
+    let metaName = t.type === "saving" ? (goal ? `Копилка · ${goal.name}` : "Копилка") : c.name;
+    if (t.type === "transfer") metaName = `${acc ? acc.name : "?"} → ${to ? to.name : "?"}`;
+    else if (many && acc) metaName += ` · ${acc.name}`;
+    if (t.plan) metaName += ` · сплит ${t.plan.n}/${t.plan.of}`;
     const label = `${title}, ${sign}${money(t.amount)}, ${metaName}${t.example ? ", пример" : ""}, остаток ${money(after)}`;
     return `<li class="tx" ${TOUCH_UI ? 'role="button"' : ""} tabindex="0" data-id="${esc(t.id)}" aria-label="${esc(label)}">
       <span class="tx-ic ${KIND_BG[t.type]}">${icon(c.icon)}</span>
       <div class="tx-main"><div class="tx-title">${esc(title)}</div>
-        <div class="tx-meta"><span style="overflow:hidden;text-overflow:ellipsis">${esc(metaName)}</span>${t.example ? `<span class="ex-tag">пример</span>` : ""}</div></div>
+        <div class="tx-meta"><span style="overflow:hidden;text-overflow:ellipsis">${esc(metaName)}</span>${t.date > TODAY ? `<span class="ex-tag">запланировано</span>` : ""}${t.example ? `<span class="ex-tag">пример</span>` : ""}</div></div>
       <div class="tx-sum"><div class="tx-amt ${amtCls}">${sign}${money(t.amount)}</div><div class="tx-bal">ост. ${money(after)}</div></div>
       <div class="tx-actions">
         <button class="icon-btn" data-act="edit" aria-label="Изменить" ${S.readOnly ? "disabled" : ""}>${icon("Pencil")}</button>
@@ -733,6 +887,7 @@
     renderBalance(d);
     renderKpis();
     renderCats();
+    renderAccounts();
     renderGoal();
     renderGoalsView();
     renderLedger(d);
@@ -782,11 +937,18 @@
   function settingsDoc() {
     const st = settings();
     const doc = { startBalance: st.startBalance, goals: st.goals.map(g => ({ ...g })), limits: { ...st.limits }, categories: st.categories.map(c => ({ ...c })) };
+    const real = st.accounts.filter(a => !a.virtual);
+    if (real.length) { doc.accounts = real.map(a => ({ ...a })); doc.defaultAccount = st.defaultAccount; }
     if (st.example) doc.example = { ...st.example };
     return doc;
   }
   function saveSettings(patch) {
     const next = { ...settingsDoc(), ...patch };
+    if (Array.isArray(next.accounts) && next.accounts.length) {
+      next.accounts = next.accounts.map(({ virtual, ...a }) => a);
+      // v2 clients only know startBalance: keep it equal to the net opening of all accounts
+      next.startBalance = r2(next.accounts.reduce((sum, a) => sum + (a.kind === "card" ? -a.opening : a.opening), 0));
+    } else delete next.accounts;
     if (next.example && typeof next.example === "object") {
       for (const k of Object.keys(patch)) delete next.example[k];
       if (!Object.keys(next.example).length) delete next.example;
@@ -812,6 +974,11 @@
   }
   function renderCatChips(type, selected, goalId) {
     const field = $("#catField"), legend = $("#catLegend"), hint = $("#savingHint");
+    if (type === "transfer") {
+      field.hidden = true; hint.hidden = true;
+      $("#catChips").innerHTML = `<input type="radio" name="category" value="transfer" checked hidden>`;
+      return;
+    }
     if (type === "saving") {
       const goals = settings().goals;
       legend.textContent = "Цель";
@@ -856,6 +1023,76 @@
     renderCatChips(type, cur ? cur.value : null);
   });
 
+  // account pickers: one account (the implicit default) hides them; transfers pick a source and a destination
+  let accTouched = false;
+  const CAT_ACC_KEY = "mh-cat-acc";
+  function rememberedAccount(cat) {
+    try { const m = JSON.parse(localStorage.getItem(CAT_ACC_KEY) || "{}"); return m[cat] || null; } catch (e) { return null; }
+  }
+  function rememberAccount(cat, acc) {
+    try { const m = JSON.parse(localStorage.getItem(CAT_ACC_KEY) || "{}"); m[cat] = acc; localStorage.setItem(CAT_ACC_KEY, JSON.stringify(m)); } catch (e) { /* per-device convenience only */ }
+  }
+  const accChip = (name, a, sel) =>
+    `<label class="chip-opt"><input type="radio" name="${name}" value="${esc(a.id)}" ${a.id === sel ? "checked" : ""}><span>${icon(a.icon)}${esc(a.name)}</span></label>`;
+  function renderAccChips(type, sel, toSel) {
+    const accs = activeAccounts();
+    const field = $("#accField"), toField = $("#toField");
+    const single = accs.length < 2;
+    if (type === "transfer") {
+      field.hidden = false; toField.hidden = false;
+      $("#accLegend").textContent = "Откуда";
+      if (single) {
+        $("#accChips").innerHTML = `<p class="hint">Чтобы переводить деньги, заведите второй счёт: наличные, Bit, PayBox или кредитку. <button type="button" class="link-btn" data-do="account-new">Добавить счёт</button></p>`;
+        $("#toChips").innerHTML = "";
+        toField.hidden = true;
+        return;
+      }
+      // money usually moves out of the bank, cash or a wallet; a card is a source only when chosen explicitly
+      const selAcc = accs.find(a => a.id === sel);
+      const from = selAcc && (selAcc.kind !== "card" || !accTouched) ? sel : settings().defaultAccount;
+      const to = accs.some(a => a.id === toSel && a.id !== from) ? toSel : (accs.find(a => a.id !== from && a.kind === "cash") || accs.find(a => a.id !== from)).id;
+      $("#accChips").innerHTML = accs.map(a => accChip("account", a, from)).join("");
+      $("#toChips").innerHTML = accs.map(a => accChip("toAccount", a, to)).join("");
+      return;
+    }
+    toField.hidden = true;
+    $("#accLegend").textContent = type === "income" ? "Куда пришли деньги" : "Счёт";
+    field.hidden = single;
+    const s0 = accs.some(a => a.id === sel) ? sel : settings().defaultAccount;
+    $("#accChips").innerHTML = accs.map(a => accChip("account", a, s0)).join("");
+  }
+  // installments («сплит», תשלומים): only for expenses paid by card
+  function renderSplit() {
+    const type = $('#txForm input[name="type"]:checked').value;
+    const accEl = $('#txForm input[name="account"]:checked');
+    const acc = accEl ? findAccount(accEl.value) : findAccount(settings().defaultAccount);
+    const box = $("#splitField");
+    const plan = editing && editing.plan;
+    if (plan) {
+      box.hidden = false; $("#splitToggle").hidden = true; $("#splitRow").hidden = true;
+      const parts = S.tx.filter(t => t.plan && t.plan.id === plan.id).length;
+      $("#planInfo").hidden = false;
+      $("#planInfo").textContent = `Платёж ${plan.n} из ${plan.of} сплита. Изменения коснутся только этого платежа${parts > 1 ? "; удалить можно этот платёж или весь сплит" : ""}.`;
+      return;
+    }
+    $("#planInfo").hidden = true;
+    const show = type === "expense" && acc && acc.kind === "card";
+    box.hidden = !show; $("#splitToggle").hidden = !show;
+    if (!show) { $("#splitOn").checked = false; $("#splitRow").hidden = true; return; }
+    $("#splitRow").hidden = !$("#splitOn").checked;
+    if ($("#splitOn").checked) {
+      const n = Number($("#splitN").value) || 2;
+      const total = parseAmount($("#txAmount").value);
+      const date = $("#txDate").value || TODAY;
+      const months = Array.from({ length: Math.min(n, 3) }, (_, k) => M_NOM[dParts(addMonths(date, k))[1] - 1].toLowerCase());
+      $("#splitHint").textContent = total > 0
+        ? `${n} ${plural(n, ["платёж", "платежа", "платежей"])} по ${money(Math.floor(total * 100 / n) / 100)}: ${months.join(", ")}${n > 3 ? "…" : ""}. Каждый попадёт в бюджет своего месяца.`
+        : `${n} ${plural(n, ["платёж", "платежа", "платежей"])}: каждый попадёт в бюджет своего месяца.`;
+    }
+  }
+  $("#aBilling").innerHTML = Array.from({ length: 28 }, (_, i) => `<option value="${i + 1}">${i + 1}-го</option>`).join("");
+  $("#splitN").innerHTML = Array.from({ length: 35 }, (_, i) => `<option value="${i + 2}">${i + 2}</option>`).join("");
+
   function openTx(t = null, preset = {}) {
     if (S.status !== "ready" || S.readOnly) return;
     editing = t;
@@ -863,12 +1100,18 @@
     $(`#txForm input[name="type"][value="${type}"]`).checked = true;
     catChipsExpanded = false;
     renderCatChips(type, t ? t.category : (preset.category || S.cat || null), t ? t.goalId : preset.goalId);
-    $("#txAmount").value = t ? inputAmount(t.amount) : "";
-    $("#txDate").value = t ? t.date : defaultDate();
-    $("#txNote").value = t ? (t.note || "") : "";
-    $("#txDlgTitle").textContent = t ? "Изменить операцию" : (type === "saving" ? "Отложить в копилку" : "Новая операция");
+    accTouched = !!t;
+    const cat = ($('#txForm input[name="category"]:checked') || {}).value;
+    renderAccChips(type, t ? accountIdOf(t) : (preset.account || rememberedAccount(cat)), t ? t.toAccount : preset.toAccount);
+    $("#txAmount").value = t ? inputAmount(t.amount) : (preset.amount ? inputAmount(preset.amount) : "");
+    $("#txDate").value = t ? t.date : (preset.date || defaultDate());
+    $("#txNote").value = t ? (t.note || "") : (preset.note || "");
+    $("#splitOn").checked = false; $("#splitN").value = "3";
+    renderSplit();
+    $("#txDlgTitle").textContent = t ? "Изменить операцию" : TX_TITLES[type];
     $("#txDelete").hidden = !t;
     $("#txConfirm").hidden = true;
+    $("#txConfirmAll").hidden = !(t && t.plan);
     $("#txErr").hidden = true;
     $$('#txForm [type="submit"]').forEach(b => { b.disabled = false; });
     $("#txSave").textContent = "Сохранить";
@@ -876,28 +1119,56 @@
     // focus inside the tap itself, or iOS does not open the keypad; when editing on touch, leave the keypad closed
     if (!t || matchMedia("(pointer: fine)").matches) $("#txAmount").focus();
   }
+  const TX_TITLES = { expense: "Новая операция", income: "Новая операция", saving: "Отложить в копилку", transfer: "Перевод между счетами" };
   $("#txForm").addEventListener("change", e => {
-    if (e.target.name === "type") {
+    const name = e.target.name;
+    if (name === "type") {
       const cur = $('#txForm input[name="category"]:checked');
+      const acc = $('#txForm input[name="account"]:checked');
       renderCatChips(e.target.value, cur ? cur.value : null);
-      if (!editing) $("#txDlgTitle").textContent = e.target.value === "saving" ? "Отложить в копилку" : "Новая операция";
+      renderAccChips(e.target.value, acc ? acc.value : null);
+      if (!editing) $("#txDlgTitle").textContent = TX_TITLES[e.target.value];
+    } else if (name === "category" && !accTouched) {
+      const remembered = rememberedAccount(e.target.value);
+      if (remembered && $(`#txForm input[name="account"][value="${CSS.escape(remembered)}"]`)) $(`#txForm input[name="account"][value="${CSS.escape(remembered)}"]`).checked = true;
+    } else if (name === "account") {
+      accTouched = true;
+      // a transfer cannot go to the account it comes from
+      const to = $('#txForm input[name="toAccount"]:checked');
+      if (to && to.value === e.target.value) {
+        const other = $$('#txForm input[name="toAccount"]').find(r => r.value !== e.target.value);
+        if (other) other.checked = true;
+      }
     }
+    renderSplit();
   });
+  $("#txAmount").addEventListener("input", () => { if ($("#splitOn").checked) renderSplit(); });
   $("#txForm").addEventListener("submit", async e => {
     e.preventDefault();
     const err = $("#txErr");
     const amount = parseAmount($("#txAmount").value);
     const type = $('#txForm input[name="type"]:checked').value;
     const catEl = $('#txForm input[name="category"]:checked');
+    const accEl = $('#txForm input[name="account"]:checked'), toEl = $('#txForm input[name="toAccount"]:checked');
     const date = $("#txDate").value;
     const fail = msg => { err.textContent = msg; err.hidden = false; };
     if (amount == null || Number.isNaN(amount) || amount <= 0) { fail("Введите сумму больше нуля, например 1 250 или 349,90."); $("#txAmount").focus(); return; }
     if (amount >= 1e10) { fail("Сумма слишком большая. Проверьте, нет ли лишних цифр."); return; }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < "1900-01-01" || date > "2199-12-31") { fail("Укажите дату операции между 1900 и 2199 годом."); $("#txDate").focus(); return; }
-    const data = {
-      type, amount, date,
-      category: type === "saving" ? "savings" : (catEl ? catEl.value : "other"),
+    const account = accEl ? accEl.value : settings().defaultAccount;
+    if (type === "transfer") {
+      if (!toEl) { fail("Заведите второй счёт, чтобы переводить деньги между счетами."); return; }
+      if (toEl.value === account) { fail("Выберите разные счета: откуда и куда."); return; }
+    }
+    const splitN = type === "expense" && !(editing && editing.plan) && $("#splitOn").checked && !$("#splitField").hidden ? Number($("#splitN").value) : 0;
+    const base = {
+      type, date,
+      category: type === "saving" ? "savings" : type === "transfer" ? "transfer" : (catEl ? catEl.value : "other"),
       ...(type === "saving" && $('#txForm input[name="goal"]:checked') ? { goalId: $('#txForm input[name="goal"]:checked').value } : {}),
+      // the implicit single account is not written, so v2 data stays as it was
+      ...(activeAccounts().some(a => !a.virtual) ? { account } : {}),
+      ...(type === "transfer" ? { toAccount: toEl.value } : {}),
+      ...(editing && editing.plan ? { plan: { ...editing.plan } } : {}),
       note: $("#txNote").value.trim().slice(0, 80),
       createdAt: editing && editing.createdAt ? editing.createdAt : Date.now(),
       updatedAt: Date.now(),
@@ -907,17 +1178,32 @@
     if (btn.disabled) return;
     subs.forEach(b => { b.disabled = true; }); btn.textContent = "Сохраняем…";
     try {
-      await store.saveTx(editing ? editing.id : null, data);
+      if (splitN >= 2) {
+        // split purchase: N parts on the card, one per month, the last part takes the rounding remainder
+        const planId = mintId("p_");
+        const part = Math.floor(amount * 100 / splitN) / 100;
+        for (let k = 0; k < splitN; k++) {
+          const amt = k === splitN - 1 ? r2(amount - part * (splitN - 1)) : part;
+          const data = { ...base, amount: amt, date: addMonths(date, k), plan: { id: planId, n: k + 1, of: splitN }, createdAt: base.createdAt + k };
+          await store.saveTx(k === 0 && editing ? editing.id : null, data);
+        }
+      } else {
+        await store.saveTx(editing ? editing.id : null, { ...base, amount });
+      }
+      if (type !== "transfer" && base.category && accEl) rememberAccount(base.category, account);
       txDlg.close();
-      if (ymOf(date) !== S.month) {
+      if (splitN >= 2) toast(`Сплит: ${splitN} ${plural(splitN, ["платёж", "платежа", "платежей"])} по месяцам`);
+      else if (ymOf(date) !== S.month) {
         const [, mm] = ymParts(ymOf(date));
         toast(`Сохранено в ${M_PREP[mm - 1]}`, { label: "Показать", run: () => { S.month = ymOf(date); render(); } });
-      } else toast(editing ? "Изменения сохранены" : "Операция добавлена");
+      } else toast(editing ? "Изменения сохранены" : type === "transfer" ? "Перевод записан" : "Операция добавлена");
     } catch (ex) {
       fail(errText(ex));
       subs.forEach(b => { b.disabled = false; }); btn.textContent = "Сохранить";
     }
   });
+  $("#splitOn").addEventListener("change", renderSplit);
+  $("#splitN").addEventListener("change", renderSplit);
   $("#txDelete").addEventListener("click", () => { $("#txConfirm").hidden = false; $("#txConfirmYes").focus(); });
   $("#txConfirmNo").addEventListener("click", () => { $("#txConfirm").hidden = true; });
   $("#txConfirmYes").addEventListener("click", async () => {
@@ -925,6 +1211,15 @@
     const t = editing;
     txDlg.close();
     await deleteTx(t);
+  });
+  $("#txConfirmAll").addEventListener("click", async () => {
+    if (!editing || !editing.plan) return;
+    const parts = S.tx.filter(t => t.plan && t.plan.id === editing.plan.id);
+    txDlg.close();
+    try {
+      await store.deleteMany(parts.map(t => t.id));
+      toast(`Сплит удалён: ${parts.length} ${plural(parts.length, ["платёж", "платежа", "платежей"])}`);
+    } catch (e) { toast(errText(e)); }
   });
 
   async function deleteTx(t) {
@@ -1123,28 +1418,150 @@
     catch (ex) { err.textContent = errText(ex); err.hidden = false; }
   });
 
-  /* ── Start balance dialog ──────────────────── */
-  const startDlg = $("#startDlg");
-  function openStart() {
-    if (S.status !== "ready" || S.readOnly) return;
-    const v = settings().startBalance;
-    // the iPhone decimal keypad has no minus key, so the sign is a separate choice
-    $(`#startForm input[name="startSign"][value="${v < 0 ? -1 : 1}"]`).checked = true;
-    $("#startAmount").value = inputAmount(Math.abs(v));
-    $("#startErr").hidden = true;
-    startDlg.showModal();
-    $("#startAmount").focus();
+  /* ── Accounts: manager and editor ────────────── */
+  const accsDlg = $("#accsDlg"), accDlg = $("#accDlg");
+  let editingAcc = null;
+  const accUsage = id => S.tx.reduce((n, t) => n + (accountIdOf(t) === id || t.toAccount === id ? 1 : 0), 0);
+  function renderAccountsManager() {
+    const st = settings(), bal = accountBalances(TODAY);
+    const row = (a, archived) => `<div class="cats-row">
+        <span class="tx-ic ${a.kind === "card" ? "bg-card" : "bg-acc"}">${icon(a.icon)}</span>
+        <span class="cats-name"><b>${esc(a.name)}${a.id === st.defaultAccount ? ` <span class="ex-tag">основной</span>` : ""}</b>
+          <small>${esc(a.kind === "card" ? `${ACCOUNT_KINDS.card.short} · списание ${a.billingDay}-го` : ACCOUNT_KINDS[a.kind].short)} · ${a.kind === "card" && bal.get(a.id) < 0 ? `долг ${money(-bal.get(a.id))}` : money(bal.get(a.id))}</small></span>
+        ${archived ? `<button type="button" class="btn btn-ghost btn-sm" data-acc-restore="${esc(a.id)}">Вернуть</button>`
+                   : `<button type="button" class="icon-btn" data-acc-edit="${esc(a.id)}" aria-label="Изменить счёт «${esc(a.name)}»">${icon("Pencil")}</button>`}
+      </div>`;
+    const act = st.accounts.filter(a => !a.archived), arch = st.accounts.filter(a => a.archived);
+    $("#accsBody").innerHTML = `<div class="cats-list">${act.map(a => row(a)).join("")}</div>`
+      + (arch.length ? `<h3 class="cats-group">Скрытые</h3><div class="cats-list">${arch.map(a => row(a, true)).join("")}</div>` : "");
   }
-  $("#startForm").addEventListener("submit", async e => {
+  function openAccounts() {
+    if (S.status !== "ready" || S.readOnly) return;
+    renderAccountsManager();
+    accsDlg.showModal();
+  }
+  function accKindChanged() {
+    const kind = $('#accForm input[name="akind"]:checked').value;
+    const isCard = kind === "card";
+    $("#accCardFields").hidden = !isCard;
+    $("#accSignRow").hidden = isCard;
+    $("#aOpeningLabel").textContent = isCard ? "Долг по карте на начало учёта" : "Остаток на начало учёта";
+    $("#aOpeningHint").textContent = isCard
+      ? "Сколько уже потрачено по карте и ещё не списано с банка. Если записываете с чистого листа, оставьте 0."
+      : "Сколько денег на этом счёте сейчас, до первой записи в приложении.";
+    $("#aName").placeholder = { bank: "Например: Леуми", cash: "Например: Наличные", wallet: "Например: PayBox", card: "Например: Max" }[kind];
+    if (!editingAcc) {
+      const cur = $('#accForm input[name="aicon"]:checked');
+      if (!cur || Object.values(ACCOUNT_KINDS).some(k => k.icon === cur.value)) {
+        const r = $(`#accForm input[name="aicon"][value="${ACCOUNT_KINDS[kind].icon}"]`); if (r) r.checked = true;
+      }
+    }
+    // a card is paid from a bank account or a wallet
+    const payFrom = activeAccounts().filter(a => a.kind !== "card" && (!editingAcc || a.id !== editingAcc.id));
+    const cur = editingAcc && editingAcc.payFrom;
+    $("#aPayFrom").innerHTML = payFrom.length
+      ? payFrom.map(a => `<option value="${esc(a.id)}" ${a.id === cur || (!cur && a.id === settings().defaultAccount) ? "selected" : ""}>${esc(a.name)}</option>`).join("")
+      : `<option value="">Сначала заведите банковский счёт</option>`;
+  }
+  function openAccountEditor(id, kind) {
+    if (S.status !== "ready" || S.readOnly) return;
+    const st = settings();
+    const a = id ? st.accounts.find(x => x.id === id) || null : null;
+    if (!a && st.accounts.filter(x => !x.virtual).length >= 20) { toast("Можно завести до 20 счетов."); return; }
+    editingAcc = a;
+    $("#accDlgTitle").textContent = a ? "Изменить счёт" : "Новый счёт";
+    const k = a ? a.kind : (kind || "bank");
+    $(`#accForm input[name="akind"][value="${k}"]`).checked = true;
+    $$('#accForm input[name="akind"]').forEach(r => { r.disabled = !!a && accUsage(a.id) > 0 && (r.value === "card") !== (a.kind === "card"); });
+    $("#aName").value = a ? a.name : "";
+    iconGrid($("#aIcons"), "aicon", ACCOUNT_ICONS, a ? a.icon : ACCOUNT_KINDS[k].icon);
+    const op = a ? a.opening : 0;
+    $(`#accForm input[name="asign"][value="${op < 0 && k !== "card" ? -1 : 1}"]`).checked = true;
+    $("#aOpening").value = inputAmount(Math.abs(op));
+    $("#aBilling").value = String(a && a.billingDay || 10);
+    $("#aLimit").value = a && a.creditLimit ? inputAmount(a.creditLimit) : "";
+    $("#aDefault").checked = a ? st.defaultAccount === a.id : false;
+    $("#aDefaultRow").hidden = false;
+    accKindChanged();
+    const used = a ? accUsage(a.id) : 0;
+    $("#accRemove").hidden = !a || st.accounts.filter(x => !x.archived).length < 2;
+    $("#accRemove").lastChild.textContent = used ? "Скрыть" : "Удалить";
+    $("#accRemove").setAttribute("aria-label", used ? "Скрыть счёт" : "Удалить счёт");
+    $("#accErr").hidden = true;
+    accDlg.showModal();
+    if (!a || matchMedia("(pointer: fine)").matches) $("#aName").focus();
+  }
+  $("#accForm").addEventListener("change", e => { if (e.target.name === "akind") accKindChanged(); });
+  $("#accForm").addEventListener("submit", async e => {
     e.preventDefault();
-    const raw = $("#startAmount").value.trim();
-    const neg = $('#startForm input[name="startSign"]:checked').value === "-1" || /^[-−]/.test(raw);
+    const err = $("#accErr");
+    const fail = msg => { err.textContent = msg; err.hidden = false; };
+    const kind = $('#accForm input[name="akind"]:checked').value;
+    const name = $("#aName").value.trim().slice(0, 40);
+    const ic = ($('#accForm input[name="aicon"]:checked') || {}).value || ACCOUNT_KINDS[kind].icon;
+    const raw = $("#aOpening").value.trim();
     const v = parseAmount(raw.replace(/^[-−]/, ""));
-    const err = $("#startErr");
-    if (v != null && Number.isNaN(v)) { err.textContent = "Введите сумму числом, например 52 400."; err.hidden = false; return; }
-    try { await saveSettings({ startBalance: (v || 0) * (neg ? -1 : 1) }); startDlg.close(); toast("Начальный остаток сохранён"); }
-    catch (ex) { err.textContent = errText(ex); err.hidden = false; }
+    if (!name) { fail("Назовите счёт, например «Леуми», «Наличные» или «Max»."); $("#aName").focus(); return; }
+    if (v != null && (Number.isNaN(v) || v >= 1e10)) { fail("Введите сумму числом, например 8 500."); $("#aOpening").focus(); return; }
+    const neg = kind !== "card" && ($('#accForm input[name="asign"]:checked').value === "-1" || /^[-−]/.test(raw));
+    const acc = {
+      ...(editingAcc ? (({ virtual, ...rest }) => rest)(editingAcc) : { id: "a_" + Math.random().toString(36).slice(2, 10).replace(/[^a-z0-9]/g, "x"), createdAt: Date.now() }),
+      kind, name, icon: ic, opening: (v || 0) * (neg ? -1 : 1),
+    };
+    if (kind === "card") {
+      acc.billingDay = Number($("#aBilling").value) || 10;
+      const pf = $("#aPayFrom").value; if (pf) acc.payFrom = pf; else delete acc.payFrom;
+      const lim = parseAmount($("#aLimit").value);
+      if (lim && !Number.isNaN(lim) && lim > 0) acc.creditLimit = lim; else delete acc.creditLimit;
+    } else { delete acc.billingDay; delete acc.payFrom; delete acc.creditLimit; }
+    const list = settings().accounts.map(a => ({ ...a }));
+    const next = editingAcc ? list.map(a => a.id === acc.id ? acc : a) : [...list, acc];
+    let def = settings().defaultAccount;
+    if ($("#aDefault").checked && kind !== "card") def = acc.id;
+    if (def === acc.id && kind === "card") def = (next.find(a => a.kind !== "card" && !a.archived) || next[0]).id;
+    try {
+      await saveSettings({ accounts: next, defaultAccount: def });
+      accDlg.close();
+      toast(editingAcc ? "Счёт сохранён" : `Счёт «${name}» добавлен`);
+      if (accsDlg.open) renderAccountsManager();
+      if (txDlg.open) { const type = $('#txForm input[name="type"]:checked').value; renderAccChips(type, type === "transfer" ? null : acc.id); renderSplit(); }
+    } catch (ex) { fail(errText(ex)); }
   });
+  $("#accRemove").addEventListener("click", async () => {
+    if (!editingAcc) return;
+    const prev = settings().accounts.map(a => ({ ...a }));
+    const gone = editingAcc, used = accUsage(gone.id) > 0;
+    const next = used ? prev.map(a => a.id === gone.id ? { ...a, archived: true } : a) : prev.filter(a => a.id !== gone.id);
+    let def = settings().defaultAccount;
+    if (def === gone.id) def = (next.find(a => !a.archived && a.kind !== "card") || next.find(a => !a.archived) || next[0]).id;
+    accDlg.close();
+    try {
+      await saveSettings({ accounts: next, defaultAccount: def });
+      toast(used ? `Счёт «${gone.name}» скрыт` : `Счёт «${gone.name}» удалён`, { label: "Вернуть", run: () => saveSettings({ accounts: prev }).catch(e => toast(errText(e))) });
+      if (accsDlg.open) renderAccountsManager();
+    } catch (ex) { toast(errText(ex)); }
+  });
+  $("#accsBody").addEventListener("click", async e => {
+    const ed = e.target.closest("[data-acc-edit]");
+    if (ed) { openAccountEditor(ed.dataset.accEdit); return; }
+    const rs = e.target.closest("[data-acc-restore]");
+    if (rs) {
+      const next = settings().accounts.map(a => a.id === rs.dataset.accRestore ? (({ archived, ...rest }) => rest)(a) : { ...a });
+      try { await saveSettings({ accounts: next }); renderAccountsManager(); toast("Счёт снова в списке"); }
+      catch (ex) { toast(errText(ex)); }
+    }
+  });
+  $("#accsAdd").addEventListener("click", () => openAccountEditor(null));
+  // the hero's edit button and the old «начальный остаток» entry points open the accounts
+  const openStart = openAccounts;
+  // record a card bill: a transfer from the card's paying account to the card
+  function payCard(cardId) {
+    const card = findAccount(cardId);
+    if (!card) return;
+    const d = cardsDue().find(x => x.card.id === cardId);
+    openTx(null, { type: "transfer", account: card.payFrom || settings().defaultAccount, toAccount: card.id,
+      amount: d ? d.due : undefined, date: d ? d.date : TODAY, note: `Списание по карте ${card.name}` });
+  }
 
   /* ── Clear example data ────────────────────── */
   async function clearExamples() {
@@ -1220,16 +1637,20 @@
   $("#notice").addEventListener("click", e => { if (e.target.closest("#clearEx")) clearExamples(); });
   // goal and category buttons anywhere (side card, goals view, sheets)
   document.addEventListener("click", e => {
-    const el = e.target.closest("[data-goal-add],[data-goal-edit],[data-do]");
+    const el = e.target.closest("[data-goal-add],[data-goal-edit],[data-pay-card],[data-do]");
     if (!el || el.disabled) return;
     if (el.dataset.goalAdd !== undefined) { openTx(null, { type: "saving", goalId: el.dataset.goalAdd || undefined }); return; }
     if (el.dataset.goalEdit) { openGoal(el.dataset.goalEdit); return; }
+    if (el.dataset.payCard) { payCard(el.dataset.payCard); return; }
     switch (el.dataset.do) {
       case "goal-new": if (txDlg.open) txDlg.close(); openGoal(null); break;
       case "goals-view": setView("goals"); break;
       case "saving": openTx(null, { type: "saving" }); break;
       case "cat-new": openCatEditor(null, el.dataset.type, true); break;
       case "categories": openCategories(); break;
+      case "accounts": openAccounts(); break;
+      case "account-new": openAccountEditor(null, "cash"); break;
+      case "transfer": openTx(null, { type: "transfer" }); break;
     }
   });
   $("#catsBtn").addEventListener("click", openCategories);
@@ -1409,7 +1830,9 @@
       openLimits: () => openLimits(),
       openGoal: id => openGoal(id || null),
       openCategories: () => openCategories(),
-      openStart: () => openStart(),
+      openStart: () => openAccounts(),
+      openAccounts: () => openAccounts(),
+      openTransfer: () => openTx(null, { type: "transfer" }),
     },
     onSnapshot(cb) { snapListeners.add(cb); if (lastSnap) cb(lastSnap); return () => snapListeners.delete(cb); },
     features: FEATURES,
