@@ -182,6 +182,59 @@ interface BudgetApp {
 
 PWA mount points in `src/app.html`: `#pwaTop` (inside the top bar, before the month switcher) and `#pwaBanner` (directly after `#notice`).
 
+## Accounts, transfers, cards and installments (v3)
+
+Money lives in user-defined **accounts**. Every operation says which account it touches; moving money
+between accounts is a **transfer**, which is neither income nor expense. Credit cards are accounts whose
+balance is a debt that the linked bank account pays off on the card's billing day.
+
+```ts
+type AccountKind = "bank" | "cash" | "wallet" | "card";   // wallet = Bit, PayBox or any e-wallet that can hold money
+interface Account {
+  id: string;            // "a_" + [a-z0-9]{2,20}; the implicit default account is "a_main"
+  kind: AccountKind;
+  name: string;          // ≤ 40, free text: "Леуми", "Наличные", "PayBox", "Max", "Isracard"…
+  icon: string;          // lucide name from ACCOUNT_ICONS in app.js
+  opening: number;       // balance when tracking started; for a card: the debt at that moment (≥ 0, owed)
+  billingDay?: number;   // card only: 1–28, day the card is charged to payFrom (מועד חיוב)
+  payFrom?: string;      // card only: id of the account the card bill is debited from
+  creditLimit?: number;  // card only, optional
+  archived?: true;       // hidden from pickers, still shown on old operations
+  createdAt: number;
+}
+// Settings v3 adds:
+//   accounts: Account[]                       (≤ 20; display order)
+//   defaultAccount?: string                   (id used when an operation has no account)
+// Migration v2 → v3: with no accounts the app behaves as if
+//   accounts = [{ id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", opening: startBalance }].
+// Writers that create the first real account write that a_main record explicitly (opening = startBalance) and
+// keep `startBalance` equal to the net opening of all accounts (non-card openings minus card openings) so v2
+// clients still show the right total.
+
+type TxType = "income" | "expense" | "saving" | "transfer";
+interface Tx {               // additions to v2
+  account?: string;          // income/expense/saving: the account; transfer: the source. Missing = defaultAccount or "a_main"
+  toAccount?: string;        // transfer only: the destination (≠ account)
+  plan?: { id: string; n: number; of: number };   // installment n of `of` (2–36) of one split purchase, id shared by its parts
+}
+// Transfers use category "transfer". A card bill payment is a transfer payFrom → card.
+// Installments («сплит», תשלומים): a split purchase of total T into N parts is stored as N expense records on the
+// card, amounts T/N rounded to agorot (the last part takes the remainder), dated on the purchase day and then the
+// same day of the following months (clamped to month end). Future-dated parts are obligations: they count in
+// their month's budget and in the card debt only once their date arrives.
+```
+
+Server: `public.transactions` gains nullable `account text`, `to_account text`, `plan_id text`, `plan_n smallint`,
+`plan_of smallint`; `type` also allows `'transfer'`; checks: ids `^[A-Za-z0-9_-]{1,32}$`, a live transfer needs
+account ≠ to_account, plan fields all-or-nothing with 1 ≤ plan_n ≤ plan_of ≤ 36.
+
+Balances (UI): account balance = opening (card: −opening) + incomes − expenses − savings − transfers out + transfers in,
+counting operations dated ≤ the cut-off. A card's balance is negative while money is owed. «Деньги» = sum of
+non-card balances; «Долг по картам» = −sum of card balances; the headline balance stays the net total (as in v2).
+Card cycle: the charge on billingDay of month M covers card operations dated from billingDay of month M−1 up to the
+day before billingDay of month M; on or after the billing day the app proposes the transfer payFrom → card for that
+amount (editable, since real cut-offs differ by issuer); anything not paid stays as debt.
+
 ## Learning section (`src/lessons.js`, `src/learn.js`, `src/learn.css`; both targets)
 
 - `lessons.js` defines `window.MH_LESSONS = Lesson[]` (pure data, Russian):
