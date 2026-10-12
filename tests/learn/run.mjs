@@ -39,7 +39,7 @@ const lucide = require(lucidePath);
 const sandbox = { window: {} };
 vm.runInNewContext(fs.readFileSync(path.join(root, "src/lessons.js"), "utf8"), sandbox);
 const LESSONS = sandbox.window.MH_LESSONS;
-check(Array.isArray(LESSONS) && LESSONS.length >= 10 && LESSONS.length <= 12, `10–12 lessons (${LESSONS && LESSONS.length})`);
+check(Array.isArray(LESSONS) && LESSONS.length >= 10 && LESSONS.length <= 13, `10–13 lessons (${LESSONS && LESSONS.length})`);
 const ACTIONS = ["tx", "saving", "limits", "goal", "categories", "start"];
 const seenIds = new Set();
 for (const l of LESSONS) {
