@@ -42,10 +42,12 @@
   const LIMIT_KEY_RE = /^[A-Za-z0-9_-]{1,32}$/; // limits: expense category id (built-in or custom)
   const ICON_RE = /^[A-Za-z0-9_-]{1,40}$/;      // lucide icon name
   const MAX_GOALS = 20, MAX_CATEGORIES = 60, MAX_LIMITS = 100;
+  const MAX_GONE = 30;                          // tombstones kept per list (goals, categories); see mergeEntries
   const MAX_DATE_MS = 8.64e15;
   // Settings documents larger than this are refused by saveSettings / backup import. Measured like the server's
-  // check (octet_length(data::text) <= 65536, jsonb text has ", " and ": " separators), with room left for _ms.
-  const MAX_SETTINGS_BYTES = 60000;
+  // check (octet_length(data::text) <= 65536, jsonb text has ", " and ": " separators), with room left for _ms
+  // (field stamps, entry stamps of 20 goals and 60 categories, MAX_GONE tombstones per list: under 7 000 bytes).
+  const MAX_SETTINGS_BYTES = 57000;
   const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const TYPES = ["income", "expense", "saving"];
   const SETTINGS_KEYS = ["startBalance", "goals", "limits", "categories"];
@@ -336,10 +338,59 @@
     }
     return out;
   }
-  const docOf = rec => ({ data: rec.data, ms: fieldStamps(rec) });
+  /* ── goals and categories: per entry last writer wins ──
+   * goals and categories are lists of entries with ids. Two devices that add different goals offline both keep
+   * them, and a goal deleted on one device does not come back from another, so these two fields merge entry by
+   * entry. Each side holds, per list, info = { since, ms: { id: stamp }, gone: { id: stamp } }:
+   *   ms     when each entry was added or last changed;
+   *   gone   tombstones of deleted entries (at most MAX_GONE, the newest; dropping older ones raises since);
+   *   since  the list holds every entry changed before it: an entry it does not hold that is older was deleted.
+   * A list without entry stamps (older app versions, v1 data, backups made before them) counts as a whole: every
+   * entry is stamped with the field's stamp and since = the field's stamp, which is exactly "the later list wins"
+   * for entries older than it. Example lists never merge entry by entry (they carry 0 and lose as a whole).
+   * Locally the info is rec.items; on the server it travels as data._ms.items (trusted like the field stamps). */
+  const ENTRY_KEYS = ["goals", "categories"];
+  const ENTRY_RE = { goals: GOAL_ID_RE, categories: CAT_ID_RE };
+  const ENTRY_MAX = { goals: MAX_GOALS, categories: MAX_CATEGORIES };
+  const own = (o, k) => isObj(o) && Object.prototype.hasOwnProperty.call(o, k);
+  const entryId = (k, id) => typeof id === "string" && id !== "__proto__" && ENTRY_RE[k].test(id);
+  function pruneGone(info) {
+    const ids = Object.keys(info.gone).sort((x, y) => info.gone[y] - info.gone[x] || (x < y ? -1 : 1));
+    for (const id of ids.slice(MAX_GONE)) info.since = Math.max(info.since, info.gone[id]);
+    for (const id of ids) if (info.gone[id] <= info.since) delete info.gone[id];
+    return info;
+  }
+  // info of list field k as one side holds it. raw: the stored / transmitted info (anything else: an older version's
+  // list, counted as a whole); fieldMs: the field's stamp; max: stamps above it are not trusted (a row's
+  // client_updated_ms, a backup's import time)
+  function entriesOf(k, raw, list, fieldMs, example, max) {
+    const ids = (Array.isArray(list) ? list : []).map(e => e && e.id).filter(id => entryId(k, id));
+    const info = { since: 0, ms: {}, gone: {} };
+    if (example) { for (const id of ids) info.ms[id] = 0; return info; }
+    const ok = v => finite(v) && v >= 0 && v <= (max == null ? MAX_DATE_MS : max);
+    if (!isObj(raw) || !isObj(raw.ms) || !isObj(raw.gone)) {
+      info.since = fieldMs;
+      for (const id of ids) info.ms[id] = fieldMs;
+      return info;
+    }
+    info.since = ok(raw.since) ? raw.since : 0;
+    for (const id of ids) info.ms[id] = own(raw.ms, id) && ok(raw.ms[id]) ? raw.ms[id] : fieldMs;
+    const present = new Set(ids);
+    for (const id of Object.keys(raw.gone)) if (entryId(k, id) && !present.has(id) && ok(raw.gone[id])) info.gone[id] = raw.gone[id];
+    return pruneGone(info);
+  }
+  function entryInfo(rec) {
+    const fs = fieldStamps(rec), out = {};
+    for (const k of ENTRY_KEYS) {
+      out[k] = entriesOf(k, rec && isObj(rec.items) ? rec.items[k] : null, rec && isObj(rec.data) ? rec.data[k] : [], fs[k], !!rec && exFlag(rec.data, k));
+    }
+    return out;
+  }
+  const docOf = rec => ({ data: rec.data, ms: fieldStamps(rec), items: entryInfo(rec) });
   // A stored settings record (IndexedDB, localStorage fallback) in the current shape: v2 data and a stamp for every
   // field. A v1 record's fieldMs.goal becomes the stamp of goals; a field the record does not hold at all
-  // (categories in v1) gets 0, so it never beats a value set elsewhere.
+  // (categories in v1) gets 0, so it never beats a value set elsewhere. A record without entry stamps (saved by an
+  // older version) gets them from its field stamps (see entriesOf).
   function normSettingsRec(rec) {
     if (!isObj(rec) || !isObj(rec.data)) return null;
     const raw = rec.data;
@@ -354,7 +405,9 @@
       if (!ok(v)) v = rec.localOnly || !hasField(raw, k) ? 0 : updatedMs;
       fieldMs[k] = exFlag(data, k) ? 0 : v;
     }
-    return { data, fieldMs, updatedMs, dirty: !!rec.dirty, localOnly: !!rec.localOnly };
+    const out = { data, fieldMs, updatedMs, dirty: !!rec.dirty, localOnly: !!rec.localOnly };
+    out.items = entryInfo({ ...out, items: rec.items });
+    return out;
   }
   // A server row's stamps are trusted only when _ms.at equals its client_updated_ms: an app version without
   // per-field stamps keeps an old _ms when it rewrites the document, and its row then counts as changed as a whole.
@@ -376,18 +429,61 @@
     if (a.ms[k] !== b.ms[k]) return a.ms[k] > b.ms[k];
     return exFlag(b.data, k) && !exFlag(a.data, k);
   }
-  // base's document with every field that other changed later taken from other
+  // List field k of base and other merged entry by entry (see ENTRY_KEYS): every entry from the side that changed it
+  // last; an entry one side deleted (tombstone, or not held while older than that side's since) is dropped when that
+  // is later than the other side's stamp of it. Order: when one list holds every entry of the result, its order
+  // (the later list first); otherwise base's entries in base's order, then other's additions. base is the side
+  // already in place (the server's row, the device's settings): its first goal stays the first goal, which owns the
+  // saving operations without goalId.
+  function mergeEntries(k, base, other) {
+    const ia = base.items[k], ib = other.items[k];
+    const la = Array.isArray(base.data[k]) ? base.data[k] : [], lb = Array.isArray(other.data[k]) ? other.data[k] : [];
+    const ma = new Map(la.map(e => [e.id, e])), mb = new Map(lb.map(e => [e.id, e]));
+    const otherLater = wins(other, base, k);
+    const stamp = (info, id, fms) => (own(info.ms, id) ? info.ms[id] : fms);
+    const since = Math.max(ia.since, ib.since);
+    const keep = new Map(), ms = {}, gone = {};
+    for (const id of new Set([...ma.keys(), ...mb.keys(), ...Object.keys(ia.gone), ...Object.keys(ib.gone)])) {
+      const ea = ma.get(id), eb = mb.get(id);
+      const pa = ea ? stamp(ia, id, base.ms[k]) : -1, pb = eb ? stamp(ib, id, other.ms[k]) : -1;
+      const ta = !ea && own(ia.gone, id) ? ia.gone[id] : -1, tb = !eb && own(ib.gone, id) ? ib.gone[id] : -1;
+      const p = Math.max(pa, pb);
+      const d = Math.max(ea ? -1 : Math.max(ta, ia.since), eb ? -1 : Math.max(tb, ib.since));
+      if (p >= 0 && p >= d) {
+        keep.set(id, eb && (!ea || pb > pa || (pb === pa && otherLater)) ? eb : ea);
+        if (entryId(k, id)) ms[id] = p;
+      } else if (Math.max(ta, tb) > since && entryId(k, id)) gone[id] = Math.max(ta, tb);
+    }
+    const oa = la.map(e => e.id).filter(id => keep.has(id)), ob = lb.map(e => e.id).filter(id => keep.has(id));
+    const [first, second] = otherLater ? [ob, oa] : [oa, ob];
+    const inA = new Set(oa);
+    const order = first.length === keep.size ? first : second.length === keep.size ? second : [...oa, ...ob.filter(id => !inA.has(id))];
+    const list = order.slice(0, ENTRY_MAX[k]).map(id => clone(keep.get(id)));
+    const kept = {};
+    for (const e of list) if (own(ms, e.id)) kept[e.id] = ms[e.id];
+    return { list, info: pruneGone({ since, ms: kept, gone }) };
+  }
+  // base's document with every field that other changed later taken from other; goals and categories entry by entry
+  // (a stamp of -1: other has nothing to say about the field)
   function mergeFields(base, other) {
-    const data = clone(base.data), ms = Object.assign({}, base.ms);
+    const data = clone(base.data), ms = Object.assign({}, base.ms), items = clone(base.items);
     const ex = Object.assign({}, isObj(data.example) ? data.example : {});
     for (const k of SETTINGS_KEYS) {
+      if (ENTRY_KEYS.includes(k) && other.ms[k] >= 0 && other.items && other.items[k] && !exFlag(base.data, k) && !exFlag(other.data, k)) {
+        const m = mergeEntries(k, base, other);
+        data[k] = m.list;
+        items[k] = m.info;
+        ms[k] = Math.max(base.ms[k], other.ms[k]);
+        continue;
+      }
       if (!wins(other, base, k)) continue;
       data[k] = clone(other.data[k]);
       ms[k] = other.ms[k];
+      if (ENTRY_KEYS.includes(k)) items[k] = clone(other.items[k]);
       if (exFlag(other.data, k)) ex[k] = true; else delete ex[k];
     }
     if (Object.keys(ex).length) data.example = ex; else delete data.example;
-    return { data, ms };
+    return { data, ms, items };
   }
   // stamps for a document the user saved over prev: only the fields whose value changed get time t
   function stampFields(prev, data, t) {
@@ -401,13 +497,53 @@
     }
     return out;
   }
+  // entry stamps for a document the user saved over prev: new and changed entries get time t, removed ones a
+  // tombstone; entries of a list that held the example values are all new
+  function stampEntries(prev, data, t) {
+    const base = prev ? docOf(prev) : null;
+    const out = {};
+    for (const k of ENTRY_KEYS) {
+      const list = Array.isArray(data[k]) ? data[k] : [];
+      if (exFlag(data, k)) { out[k] = entriesOf(k, null, list, 0, true); continue; }
+      const p = base && !exFlag(base.data, k) ? base.items[k] : null;
+      const info = { since: p ? p.since : 0, ms: {}, gone: p ? Object.assign({}, p.gone) : {} };
+      const old = new Map((p && Array.isArray(base.data[k]) ? base.data[k] : []).map(e => [e.id, e]));
+      for (const e of list) {
+        const pe = old.get(e.id);
+        old.delete(e.id);
+        if (!entryId(k, e.id)) continue;
+        info.ms[e.id] = pe && sameJson(pe, e) ? (own(p.ms, e.id) ? p.ms[e.id] : base.ms[k]) : t;
+        delete info.gone[e.id];
+      }
+      for (const id of old.keys()) if (entryId(k, id)) info.gone[id] = t;
+      out[k] = pruneGone(info);
+    }
+    return out;
+  }
+  // on the server: data._ms = { startBalance, goals, limits, categories, at, items: { goals, categories } }
   function settingsWire(rec) {
     const at = Math.max(0, Math.round(rec.updatedMs || 0));
     const st = fieldStamps(rec);
     const _ms = {};
     for (const k of SETTINGS_KEYS) _ms[k] = Math.min(at, Math.max(0, Math.round(st[k])));
     _ms.at = at;
+    const cap = v => Math.min(at, Math.max(0, Math.round(v)));
+    const info = entryInfo(rec);
+    _ms.items = {};
+    for (const k of ENTRY_KEYS) {
+      const i = info[k], ms = {}, gone = {};
+      for (const id of Object.keys(i.ms)) ms[id] = cap(i.ms[id]);
+      for (const id of Object.keys(i.gone)) gone[id] = cap(i.gone[id]);
+      _ms.items[k] = { since: cap(i.since), ms, gone };
+    }
     return Object.assign(clone(rec.data), { _ms });
+  }
+  // entry info of a server row: trusted under the same rule as its field stamps (_ms.at = client_updated_ms)
+  function rowEntries(raw, data, fieldMs, cum) {
+    const m = isObj(raw) && isObj(raw._ms) && raw._ms.at === cum && isObj(raw._ms.items) ? raw._ms.items : null;
+    const out = {};
+    for (const k of ENTRY_KEYS) out[k] = entriesOf(k, m ? m[k] : null, data[k], fieldMs[k], exFlag(data, k), cum);
+    return out;
   }
   // true when nothing in the settings is the user's own value: every field is an example or a default
   const onlyExampleOrDefault = d => SETTINGS_KEYS.every(k => (isObj(d.example) && d.example[k] === true) || isDefaultField(k, d[k]));
@@ -466,7 +602,8 @@
     const raw = isObj(row.data) ? row.data : {};
     const data = settingsData(raw, false);
     const updatedMs = Number(row.client_updated_ms) || 0;
-    return { data, fieldMs: rowStamps(raw, data, updatedMs), updatedMs, dirty: false, localOnly: false };
+    const fieldMs = rowStamps(raw, data, updatedMs);
+    return { data, fieldMs, items: rowEntries(raw, data, fieldMs, updatedMs), updatedMs, dirty: false, localOnly: false };
   }
 
   /* ── error classification ──────────────────── */
@@ -915,7 +1052,7 @@
               const m = mergeFields(docOf(cur), docOf(orec));   // per field: example values never replace real ones
               if (!sameSettings(m.data, cur.data)) {
                 const localOnly = !!cur.localOnly && orec.localOnly;
-                st.settings = { data: m.data, fieldMs: m.ms, updatedMs: Math.max(bumpMs(t, cur), orec.updatedMs + 1), dirty: !localOnly, localOnly };
+                st.settings = { data: m.data, fieldMs: m.ms, items: m.items, updatedMs: Math.max(bumpMs(t, cur), orec.updatedMs + 1), dirty: !localOnly, localOnly };
               }
             }
           }
@@ -1225,6 +1362,10 @@
               const ms = fieldStamps(s);
               for (const k of SETTINGS_KEYS) if (isDefaultField(k, s.data[k])) ms[k] = 0;
               s.fieldMs = ms;
+              // goals and categories of this device join the account's (entry by entry): what was deleted or never
+              // held here says nothing about the account's entries (no tombstones, since 0)
+              s.items = entryInfo(s);
+              for (const k of ENTRY_KEYS) { s.items[k].since = 0; s.items[k].gone = {}; }
               s.dirty = true;
             }
           }
@@ -1424,11 +1565,11 @@
       const cur = st.settings;
       if (!cur) { st.settings = remote; return; }
       if (!cur.localOnly && !cur.dirty && cur.updatedMs === remote.updatedMs) return;   // our own write coming back
-      const m = mergeFields({ data: remote.data, ms: remote.fieldMs }, docOf(cur));
+      const m = mergeFields(docOf(remote), docOf(cur));
       if (sameSettings(m.data, remote.data)) { st.settings = remote; return; }
       // keep the local stamp when the local copy is the result and already newer; otherwise outdate both copies
       const keep = !cur.localOnly && cur.updatedMs > remote.updatedMs && sameSettings(m.data, cur.data);
-      st.settings = { data: m.data, fieldMs: m.ms, updatedMs: keep ? cur.updatedMs : Math.max(bumpMs(now(), cur), remote.updatedMs + 1), dirty: true, localOnly: false };
+      st.settings = { data: m.data, fieldMs: m.ms, items: m.items, updatedMs: keep ? cur.updatedMs : Math.max(bumpMs(now(), cur), remote.updatedMs + 1), dirty: true, localOnly: false };
     }
     // Signed into an account that already has data: the example budget goes away.
     function dropExamples(uid) {
@@ -1439,7 +1580,10 @@
         const s = st.settings;
         // the account's settings row (if any) was merged field by field in pull(); what still holds example values is reset
         if (s && s.localOnly) st.settings = null;
-        else if (s && hasExampleFlags(s.data)) st.settings = { data: stripExample(s.data), fieldMs: fieldStamps(s), updatedMs: bumpMs(t, s), dirty: true, localOnly: false };
+        else if (s && hasExampleFlags(s.data)) {
+          const rec = { data: stripExample(s.data), fieldMs: fieldStamps(s), updatedMs: bumpMs(t, s), dirty: true, localOnly: false };
+          st.settings = Object.assign(rec, { items: entryInfo(Object.assign({}, rec, { items: s.items })) });
+        }
       });
     }
     async function push(client, uid, gen) {
@@ -1509,7 +1653,15 @@
           : stamp(v) ? Math.min(Math.round(v), t)
           : sts || (!isDefaultField(k, settings[k]) ? UNTIMED_MS : 0);
       }
-      return { items, settings, settingsTs: sts, settingsMs };
+      // entry stamps of goals and categories (written since they exist); older files: their lists count as a whole.
+      // A list without any stamp (UNTIMED_MS) is not merged entry by entry: it only fills an example, empty or
+      // missing list, never adds to the user's own.
+      const fis = isObj(data.settingsItemsUpdatedAt) ? data.settingsItemsUpdatedAt : {};
+      const settingsItems = {};
+      for (const k of ENTRY_KEYS) {
+        settingsItems[k] = settings && settingsMs[k] > UNTIMED_MS ? entriesOf(k, fis[k], settings[k], settingsMs[k], exFlag(settings, k), t) : null;
+      }
+      return { items, settings, settingsTs: sts, settingsMs, settingsItems };
     }
     function importInto(st, parsed) {
       let added = 0, updated = 0, skipped = 0, settingsUpdated = false;
@@ -1532,13 +1684,13 @@
         // field by field, like a sync: a field from the file replaces the device's value only when it changed later;
         // fields that still held example values in the file are not imported
         const cur = st.settings;
-        const base = cur ? docOf(cur) : { data: clone(SETTINGS_DEFAULTS), ms: Object.assign({}, ZERO_MS) };
+        const base = docOf(cur || { data: clone(SETTINGS_DEFAULTS), fieldMs: Object.assign({}, ZERO_MS), updatedMs: 0 });
         const ms = {};
         for (const k of SETTINGS_KEYS) ms[k] = exFlag(parsed.settings, k) ? -1 : parsed.settingsMs[k];
-        const m = mergeFields(base, { data: parsed.settings, ms });
+        const m = mergeFields(base, { data: parsed.settings, ms, items: parsed.settingsItems });
         if (!sameSettings(m.data, base.data)) {
           const top = Math.max(0, ...SETTINGS_KEYS.map(k => m.ms[k]));
-          st.settings = { data: m.data, fieldMs: m.ms, updatedMs: Math.max(top, cur ? (cur.updatedMs || 0) + 1 : 0), dirty: true, localOnly: false };
+          st.settings = { data: m.data, fieldMs: m.ms, items: m.items, updatedMs: Math.max(top, cur ? (cur.updatedMs || 0) + 1 : 0), dirty: true, localOnly: false };
           settingsUpdated = true;
         }
       }
@@ -1553,6 +1705,7 @@
         if (S.settings && S.settings.updatedMs > 0) {
           out.settingsUpdatedAt = S.settings.updatedMs;
           out.settingsFieldsUpdatedAt = fieldStamps(S.settings);
+          out.settingsItemsUpdatedAt = entryInfo(S.settings);
         }
         return out;
       },
@@ -1732,7 +1885,7 @@
           // the example settings stay device-only until the user enters a value of their own
           const keepLocal = !!(prev && prev.localOnly) && onlyExampleOrDefault(data);
           const updatedMs = bumpMs(t, prev);
-          st.settings = { data, fieldMs: stampFields(prev, data, updatedMs), updatedMs, dirty: !keepLocal, localOnly: keepLocal };
+          st.settings = { data, fieldMs: stampFields(prev, data, updatedMs), items: stampEntries(prev, data, updatedMs), updatedMs, dirty: !keepLocal, localOnly: keepLocal };
         });
         afterWrite();
       },

@@ -486,7 +486,8 @@ test("push/pull round trip between two devices; examples are never uploaded", as
   const [srow] = server.rows("budget_settings");
   assert.deepEqual(without(srow.data, "_ms"), { startBalance: 1000, goals: [], limits: { cafe: 3000 }, categories: [] });
   // per-field stamps: goals and categories still have their (removed) example values' 0, the others were set now
-  assert.deepEqual(srow.data._ms, { startBalance: a.t, goals: 0, limits: a.t, categories: 0, at: a.t });
+  const noEntries = { since: 0, ms: {}, gone: {} };
+  assert.deepEqual(srow.data._ms, { startBalance: a.t, goals: 0, limits: a.t, categories: 0, at: a.t, items: { goals: noEntries, categories: noEntries } });
   assert.equal(srow.client_updated_ms, a.t);
   assert.equal(server.log.filter(l => l.op === "upsert").every(l => l.onConflict === (l.table === "transactions" ? "user_id,id" : "user_id")), true);
   assert.ok(server.log.filter(l => l.op === "select").every(l => l.filters.some(f => f[0] === "eq" && f[1] === "user_id" && f[2] === uid)));
@@ -1750,7 +1751,7 @@ test("v2 settings: a v1 server row migrates and merges per field with a v2 devic
   assert.deepEqual(a.snap.settings, want);
   let row = server.rows("budget_settings")[0];
   assert.deepEqual(without(row.data, "_ms"), want, "the union is pushed as v2, without the v1 goal");
-  assert.deepEqual(Object.keys(row.data._ms).sort(), ["at", "categories", "goals", "limits", "startBalance"]);
+  assert.deepEqual(Object.keys(row.data._ms).sort(), ["at", "categories", "goals", "items", "limits", "startBalance"]);
   assert.equal(a.sync.pending, 0);
 
   const b = await new Device({ server, seed: null }).ready();
@@ -1808,13 +1809,14 @@ test("v2 settings: a v1 backup file migrates and merges per field; categories it
     settings: { startBalance: 777, goal: GOAL_V1, limits: { cafe: 5 } },
     settingsUpdatedAt: 15_000, settingsFieldsUpdatedAt: { startBalance: 15_000, goal: 15_000, limits: 15_000 }, tx: [],
   };
-  // goals edited on the device after the file: kept; start balance and limits older here: taken from the file
+  // goals edited on the device after the file: kept, and the file's goal (never deleted here) joins them, after the
+  // device's own (goals merge entry by entry); start balance and limits older here: taken from the file
   const d = await new Device({ seed: null, clock: 10_000 }).ready();
   await d.store.saveSettings({ ...DEFAULT_SETTINGS, startBalance: 50, categories: [CAT] });
   d.t = 20_000; await uiSaveSettings(d, { goals: [GOAL] });
   d.t = 100_000;
   assert.equal((await d.store.backup.import(v1file)).settingsUpdated, true);
-  assert.deepEqual(d.snap.settings, { startBalance: 777, goals: [GOAL], limits: { cafe: 5 }, categories: [CAT] });
+  assert.deepEqual(d.snap.settings, { startBalance: 777, goals: [GOAL, GOAL_V1_AS_V2], limits: { cafe: 5 }, categories: [CAT] });
   assert.deepEqual(d.kv().settings.fieldMs, { startBalance: 15_000, goals: 20_000, limits: 15_000, categories: 10_000 });
 
   // goals older on the device: the file's goal arrives as goals = [g_main], with the file's goal stamp
