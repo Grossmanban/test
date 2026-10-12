@@ -732,6 +732,13 @@
         <div><dt>В месяц</dt><dd>${st.perMonth ? "≈" + NB + money(st.perMonth) : "—"}</dd></div>
       </dl>
       ${goalStatusHtml(g, st)}
+      ${(() => {
+        if (st.done) return "";
+        const pace = goalPace(g, goals);
+        if (!(pace > 0)) return "";
+        const when = reachMonth(st.left, pace);
+        return `<p class="goal-pace">${icon("TrendingUp")}В текущем темпе (≈${NB}${money(pace)} в месяц) накопите к ${monthLabelDat(when)}.</p>`;
+      })()}
       ${st.done ? "" : `<button class="btn btn-gold" data-goal-add="${esc(g.id)}" ${canEdit ? "" : "disabled"}>${icon("PiggyBank")}Отложить</button>`}
     </article>`;
   }
@@ -765,9 +772,100 @@
           </button>`;
         }).join("")}
       </div>
+      ${(() => { const P = savingsPlan(); return P.need > 0 ? `<p class="hint goal-more">${icon("Lightbulb")}Чтобы успеть к срокам, откладывайте ≈${NB}${money(P.need)} в месяц${P.cf && P.need > P.spare ? `: это больше, чем остаётся свободным. <button type="button" class="link-btn" data-do="goals-view">Что делать</button>` : "."}</p>` : ""; })()}
       ${goals.length > shown.length ? `<p class="hint goal-more">И ещё ${goals.length - shown.length} ${plural(goals.length - shown.length, ["цель", "цели", "целей"])} на вкладке «Цели».</p>` : ""}
       <button class="btn btn-gold" data-do="saving" ${canEdit ? "" : "disabled"}>${icon("PiggyBank")}Отложить в копилку</button>`;
   }
+  /* ── Savings recommendations ─────────────────── */
+  const DISCRETIONARY = new Set(["cafe", "fun", "clothes", "beauty", "travel", "gifts", "sport", "other"]);
+  // averages over the last (up to) three complete months that have any income
+  function cashflow() {
+    const months = [];
+    for (let k = 1; k <= 3; k++) {
+      const ym = shiftYm(CUR_YM, -k), st = monthStats(ym);
+      if (st.inc > 0) months.push({ ym, st });
+    }
+    if (!months.length) return null;
+    const avg = f => r2(months.reduce((sum, m) => sum + f(m.st), 0) / months.length);
+    const byCat = {};
+    for (const m of months) for (const [c, v] of Object.entries(m.st.byCat)) byCat[c] = (byCat[c] || 0) + v.sum / months.length;
+    return { n: months.length, inc: avg(s => s.inc), exp: avg(s => s.exp), sav: avg(s => s.sav), byCat };
+  }
+  // average monthly saving into one goal over the same months (the current pace)
+  function goalPace(g, goals) {
+    let sum = 0, n = 0;
+    for (let k = 1; k <= 3; k++) { const ym = shiftYm(CUR_YM, -k); if (monthStats(ym).inc > 0) { sum += goalSavedInMonth(g, ym, goals); n++; } }
+    return n ? r2(sum / n) : 0;
+  }
+  function monthLabel(ym) { const [y, m] = ymParts(ym); return `${M_NOM[m - 1].toLowerCase()} ${y}`; }
+  function monthLabelDat(ym) { const [y, m] = ymParts(ym); return `${M_DAT[m - 1]} ${y}`; }   // «к февралю 2027»
+  // the month a goal is reached when `perMonth` goes in from this month on
+  function reachMonth(left, perMonth) {
+    if (!(perMonth > 0)) return null;
+    return shiftYm(CUR_YM, Math.max(0, Math.ceil(left / perMonth) - 1));
+  }
+  function savingsPlan() {
+    const goals = settings().goals, cf = cashflow();
+    const open = goals.map(g => ({ g, st: goalStats(g, goals) })).filter(x => !x.st.done);
+    const dated = open.filter(x => x.st.perMonth > 0), free = open.filter(x => !x.g.deadline);
+    const need = r2(dated.reduce((sum, x) => sum + x.st.perMonth, 0));
+    const hasSafety = goals.some(g => g.icon === "ShieldCheck" || g.icon === "Umbrella" || /подушк|резерв|запас/i.test(g.name));
+    return { goals, cf, open, dated, free, need, hasSafety, spare: cf ? r2(cf.inc - cf.exp) : null };
+  }
+  function planCardHtml() {
+    const P = savingsPlan(), cf = P.cf;
+    const canEdit = S.status === "ready" && !S.readOnly;
+    const rows = [];
+    if (!cf) {
+      rows.push(`<p class="plan-lead">Добавьте доходы и расходы хотя бы за один полный месяц, и я посчитаю, сколько реально откладывать без ущерба для бюджета.</p>`);
+      if (P.need > 0) rows.push(`<p class="plan-line">Чтобы успеть к срокам ваших целей, нужно откладывать <b>${money(P.need)}</b> в месяц.</p>`);
+    } else {
+      const pct = cf.inc > 0 ? Math.round(P.need / cf.inc * 100) : 0;
+      rows.push(`<dl class="plan-stats">
+          <div><dt>Свободно в среднем</dt><dd>${money(Math.max(0, P.spare))}<small>доход ${money(cf.inc)} − расходы ${money(cf.exp)}</small></dd></div>
+          <div><dt>Нужно для целей в срок</dt><dd>${P.need > 0 ? money(P.need) : "—"}<small>${P.need > 0 ? `${pct}% дохода` : "у целей нет срока"}</small></dd></div>
+          <div><dt>Ориентир 50/30/20</dt><dd>${money(Math.round(cf.inc * 0.2 / 10) * 10)}<small>20% дохода в месяц</small></dd></div>
+        </dl>`);
+      if (P.spare <= 0) {
+        rows.push(`<div class="status is-warn">${icon("TriangleAlert")}<span>Расходы съедают весь доход${cf.n > 1 ? ` (в среднем за ${cf.n} мес.)` : ""}. Сначала найдите, где сократить траты, иначе откладывать не из чего.</span></div>`);
+      } else if (P.need > P.spare) {
+        const gap = r2(P.need - P.spare);
+        const k = P.spare / P.need;
+        rows.push(`<div class="status is-warn">${icon("TriangleAlert")}<span>На все сроки не хватает <b>${money(gap)}</b> в месяц. Варианты:</span></div>`);
+        const moves = P.dated.map(x => {
+          const per = Math.floor(x.st.perMonth * k / 10) * 10;
+          const when = reachMonth(x.st.left, per);
+          return when ? `<li>«${esc(x.g.name)}»: откладывать ${money(per)} в месяц и перенести срок на <b>${monthLabel(when)}</b></li>` : "";
+        }).join("");
+        const cuts = Object.entries(cf.byCat)
+          .filter(([c]) => DISCRETIONARY.has(c) || (findCat(c) && findCat(c).custom))
+          .sort((a, b) => b[1] - a[1]).slice(0, 3)
+          .map(([c, v]) => `<li>Сократить «${esc((findCat(c) || CAT.other).name)}»: сейчас ≈ ${money(Math.round(v / 10) * 10)} в месяц</li>`).join("");
+        rows.push(`<ul class="plan-list">${moves}${cuts}</ul>`);
+      } else if (P.need > 0) {
+        rows.push(`<div class="status is-good">${icon("CircleCheck")}<span>План реален: откладывайте <b>${money(P.need)}</b> в месяц${P.spare - P.need > 0 ? `, и ещё останется ≈ ${money(r2(P.spare - P.need))}` : ""}.</span></div>`);
+      }
+      // goals without a deadline share half of what is left after the dated ones
+      const rest = Math.max(0, r2(P.spare - P.need));
+      if (P.free.length && rest > 0) {
+        const per = Math.floor(rest / 2 / P.free.length / 10) * 10;
+        if (per > 0) rows.push(`<ul class="plan-list">${P.free.map(x => {
+          const when = reachMonth(x.st.left, per);
+          return `<li>«${esc(x.g.name)}» без срока: при ${money(per)} в месяц накопите к <b>${monthLabelDat(when)}</b></li>`;
+        }).join("")}</ul>`);
+      }
+      if (!P.hasSafety) {
+        const lo = Math.round(cf.exp * 3 / 100) * 100, hi = Math.round(cf.exp * 6 / 100) * 100;
+        rows.push(`<div class="plan-safety">${icon("ShieldCheck")}<span><b>Подушка безопасности</b> обычно равна расходам за 3–6 месяцев: для вас это ${money(lo)}–${money(hi)}.</span>
+          <button class="btn btn-sm btn-ghost" data-do="goal-safety" data-target="${lo}" ${canEdit ? "" : "disabled"}>Поставить цель</button></div>`);
+      }
+    }
+    return `<section class="card plan-card" aria-labelledby="planTitle">
+        <div class="card-head"><div><p class="eyebrow">Рекомендации</p><h2 id="planTitle">Сколько откладывать</h2></div></div>
+        ${rows.join("")}
+      </section>`;
+  }
+
   // the «Цели» view
   function renderGoalsView() {
     const el = $("#viewGoals");
@@ -784,7 +882,7 @@
         <button class="btn btn-primary" data-do="goal-new" ${canEdit ? "" : "disabled"}>${icon("Plus")}Новая цель</button>
       </div>`;
     if (S.status !== "ready") { el.innerHTML = head + `<div class="skeleton"></div>`; return; }
-    el.innerHTML = head + (goals.length
+    el.innerHTML = head + planCardHtml() + (goals.length
       ? `<div class="goal-grid">${goals.map(g => goalCardHtml(g, goals, canEdit)).join("")}</div>`
       : `<div class="card empty"><div class="empty-ic">${icon("Target")}</div><h3>Целей пока нет</h3>
           <p>Начните с подушки безопасности: обычно советуют запас на 3–6 месяцев расходов. Потом добавьте отпуск, технику или учёбу.</p>
@@ -1243,18 +1341,18 @@
     el.innerHTML = icons.map(n =>
       `<label class="icon-opt" title=""><input type="radio" name="${name}" value="${n}" ${n === selected ? "checked" : ""} aria-label="${n}"><span>${icon(n)}</span></label>`).join("");
   }
-  function openGoal(id) {
+  function openGoal(id, preset = {}) {
     if (S.status !== "ready" || S.readOnly) return;
     const goals = settings().goals;
     const g = id ? goals.find(x => x.id === id) || null : null;
     if (!g && goals.length >= 20) { toast("Можно завести до 20 целей. Удалите выполненную, чтобы добавить новую."); return; }
     editingGoal = g;
     $("#goalDlgTitle").textContent = g ? "Изменить цель" : "Новая цель";
-    $("#gName").value = g ? g.name : "";
-    $("#gTarget").value = g ? inputAmount(g.target) : "";
+    $("#gName").value = g ? g.name : (preset.name || "");
+    $("#gTarget").value = g ? inputAmount(g.target) : (preset.target ? inputAmount(preset.target) : "");
     $("#gDeadline").value = g ? g.deadline : "";
     $("#gInitial").value = g ? inputAmount(g.initial) : "";
-    iconGrid($("#gIcons"), "gicon", GOAL_ICONS, g ? g.icon : (goals.length ? "Target" : "ShieldCheck"));
+    iconGrid($("#gIcons"), "gicon", GOAL_ICONS, g ? g.icon : (preset.icon || (goals.length ? "Target" : "ShieldCheck")));
     $("#goalDelete").hidden = !g;
     $("#goalErr").hidden = true;
     goalDlg.showModal();
@@ -1644,6 +1742,7 @@
     if (el.dataset.payCard) { payCard(el.dataset.payCard); return; }
     switch (el.dataset.do) {
       case "goal-new": if (txDlg.open) txDlg.close(); openGoal(null); break;
+      case "goal-safety": openGoal(null, { name: "Подушка безопасности", target: Number(el.dataset.target) || 0, icon: "ShieldCheck" }); break;
       case "goals-view": setView("goals"); break;
       case "saving": openTx(null, { type: "saving" }); break;
       case "cat-new": openCatEditor(null, el.dataset.type, true); break;
