@@ -7,7 +7,8 @@
 //     row (the trigger returns NULL), an equal one is applied again;
 //   * RLS: a signed-in user reads and writes only rows with user_id = auth.uid();
 //     the anon role gets nothing;
-//   * check constraints of the schema (type, amount, date range, id format, …);
+//   * check constraints of the schema (type, amount, date range, id format, goal_id format,
+//     settings document size measured like octet_length(data::text) of jsonb, …);
 //   * realtime postgres_changes events to subscribed channels (filter user_id=eq.<uid>).
 // It can simulate network failure (whole server or one device), lost responses,
 // rate limits, unconfirmed e-mail, revoked sessions and late-committed rows.
@@ -22,7 +23,28 @@ export const FAKE_URL = "https://fake.supabase.co";
 export const FAKE_ANON_KEY = "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ role: "anon", iss: "supabase" })).toString("base64url") + ".c2lnbmF0dXJl";
 export const FAKE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ role: "service_role" })).toString("base64url") + ".c2lnbmF0dXJl";
 
-const TX_COLS = ["user_id", "id", "type", "amount", "category", "note", "date", "created_ms", "example", "deleted", "client_updated_ms", "updated_at"];
+const TX_COLS = ["user_id", "id", "type", "amount", "category", "note", "date", "created_ms", "goal_id", "example", "deleted", "client_updated_ms", "updated_at"];
+export const SETTINGS_MAX_BYTES = 65536;   // schema: budget_settings_data_size
+
+// A JSON value as Postgres prints jsonb (data::text): keys sorted by length then bytes, ", " and ": " separators,
+// non-ASCII as is, only " \ and control characters escaped. Lone surrogates and NUL are refused like jsonb does.
+export function pgJsonText(v) {
+  if (v === null) return "null";
+  if (typeof v === "boolean") return String(v);
+  if (typeof v === "number") { if (!Number.isFinite(v)) throw new Error("not JSON"); return JSON.stringify(v); }
+  if (typeof v === "string") {
+    if (/\u0000/.test(v)) throw Object.assign(new Error("unsupported Unicode escape sequence"), { pg: "22P05" });
+    if (!v.isWellFormed()) throw Object.assign(new Error("Unicode low surrogate must follow a high surrogate"), { pg: "22P02" });
+    return JSON.stringify(v);
+  }
+  if (Array.isArray(v)) return "[" + v.map(pgJsonText).join(", ") + "]";
+  const keys = Object.keys(v).filter(k => v[k] !== undefined).sort((a, b) => {
+    const la = Buffer.byteLength(a), lb = Buffer.byteLength(b);
+    return la !== lb ? la - lb : Buffer.compare(Buffer.from(a), Buffer.from(b));
+  });
+  return "{" + keys.map(k => pgJsonText(k) + ": " + pgJsonText(v[k])).join(", ") + "}";
+}
+export const pgJsonBytes = v => Buffer.byteLength(pgJsonText(v));
 
 function tsUs(s) {
   const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/.exec(String(s));
@@ -61,6 +83,8 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
     rateLimitAuth: false,
     realtime: true,
     backdateNextMs: 0,           // next write gets updated_at this far in the past (a long transaction)
+    settingsMaxBytes: SETTINGS_MAX_BYTES,   // budget_settings_data_size (an older schema.sql had 32768)
+    noGoalIdColumn: false,       // the project still runs an older schema.sql (no transactions.goal_id)
     refreshRetryMs: 0,           // how long getSession() keeps retrying an expired session's refresh offline
     hooks: { beforeUpsert: null, beforeSelect: null },
     changeListeners: new Set(),  // (table, [{ eventType, row, old }]) for adapters (e.g. a WebSocket mock)
@@ -119,6 +143,10 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
     if (r.note != null && String(r.note).length > 200) return bad("transactions_note_length");
     if (r.date != null && !validDate(r.date)) return pgErr(400, "22008", `date/time field value out of range: "${r.date}"`);
     if (!(Number(r.created_ms ?? 0) >= 0 && Number(r.client_updated_ms ?? 0) >= 0)) return bad("transactions_ms_range");
+    if (r.goal_id != null && !(typeof r.goal_id === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(r.goal_id))) return bad("transactions_goal_id_format");
+    for (const k of ["id", "category", "note", "goal_id"]) {
+      if (typeof r[k] === "string" && (r[k].includes("\u0000") || !r[k].isWellFormed())) return pgErr(400, "22P05", "unsupported Unicode escape sequence");
+    }
     if (!r.deleted && (r.type == null || r.amount == null || r.date == null)) return bad("transactions_live_row_complete");
     if ("updated_at" in r) return null;   // the trigger overwrites it anyway
     return null;
@@ -140,7 +168,7 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
         changes.push({ eventType: "UPDATE", row: next, old });
       } else {
         const base = table === "transactions"
-          ? { user_id: r.user_id, id: r.id, type: null, amount: null, category: "", note: "", date: null, created_ms: 0, example: false, deleted: false, client_updated_ms: 0 }
+          ? { user_id: r.user_id, id: r.id, type: null, amount: null, category: "", note: "", date: null, created_ms: 0, goal_id: null, example: false, deleted: false, client_updated_ms: 0 }
           : { user_id: r.user_id, data: {}, client_updated_ms: 0 };
         const next = { ...base, ...r, updated_at: server.stamp() };
         if (table === "transactions") { next.category ??= ""; next.note ??= ""; next.example ??= false; next.deleted ??= false; next.created_ms ??= 0; }
@@ -284,8 +312,16 @@ class Query {
       for (const r of rows) {
         if ((r.user_id ?? uid) !== uid) return pgErr(403, "42501", `new row violates row-level security policy for table "${this.table}"`);
         if ("updated_at" in r) return pgErr(400, "FAKE1", "client must not send updated_at");
-        if (this.table === "transactions") { const e = s._checkTx(r); if (e) return e; }
+        if (this.table === "transactions") {
+          if (s.noGoalIdColumn && "goal_id" in r) return pgErr(400, "PGRST204", "Could not find the 'goal_id' column of 'transactions' in the schema cache");
+          const e = s._checkTx(r); if (e) return e;
+        }
         else if (!r.data || typeof r.data !== "object" || Array.isArray(r.data)) return pgErr(400, "23514", 'violates check constraint "budget_settings_data_object"');
+        else {
+          let bytes;
+          try { bytes = pgJsonBytes(r.data); } catch (e) { return pgErr(400, e.pg || "22P02", e.message); }
+          if (bytes > s.settingsMaxBytes) return pgErr(400, "23514", 'new row for relation "budget_settings" violates check constraint "budget_settings_data_size"');
+        }
       }
       if (s.hooks.beforeUpsert) await s.hooks.beforeUpsert(this.table, rows, c);
       if (c._down()) return netError();

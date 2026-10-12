@@ -16,62 +16,14 @@
 \set as_nouid 'reset role; set request.jwt.claims = ''{"role":"authenticated"}''; set role authenticated;'
 \set as_service 'reset role; set request.jwt.claims = ''{"role":"service_role"}''; set role service_role;'
 \set A '''aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'''
+-- the largest settings document of the app and its size, from tests/helpers/max-settings.mjs (run.sh)
+\set maxdoc `cat "$MAXDOC_FILE"`
+\set maxdoc_bytes `cat "$MAXDOC_BYTES_FILE"`
 \set B '''bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'''
 
--- ---------------------------------------------------------------------
--- Test helpers (security invoker: statements run as the current role)
--- ---------------------------------------------------------------------
+-- Test helpers t.ok / t.fails / t.affects (helpers.sql)
 :as_admin
-create schema t;
-create table t.results (n serial primary key, ok boolean not null, name text not null);
-grant usage on schema t to public;
-grant select, insert on t.results to public;
-grant usage on sequence t.results_n_seq to public;
-
-create function t.ok(name text, cond boolean) returns text language plpgsql as $$
-declare
-  passed boolean := coalesce(cond, false);
-  num int;
-begin
-  insert into t.results (ok, name) values (passed, name) returning n into num;
-  return case when passed then 'ok ' else 'not ok ' end || num || ' - ' || name;
-end $$;
-
--- The statement must fail with the given SQLSTATE.
-create function t.fails(name text, stmt text, state text) returns text language plpgsql as $$
-declare
-  got text;
-  msg text;
-begin
-  begin
-    execute stmt;
-  exception when others then
-    get stacked diagnostics got = returned_sqlstate, msg = message_text;
-  end;
-  return t.ok(format('%s [want %s, got %s]', name, state,
-                     coalesce(got || ' ' || msg, 'success')),
-              got is not distinct from state);
-end $$;
-
--- The statement must succeed and affect exactly n rows.
-create function t.affects(name text, stmt text, n bigint) returns text language plpgsql as $$
-declare
-  cnt bigint;
-  got text;
-  msg text;
-begin
-  begin
-    execute stmt;
-    get diagnostics cnt = row_count;
-  exception when others then
-    get stacked diagnostics got = returned_sqlstate, msg = message_text;
-  end;
-  return t.ok(format('%s [want %s row(s), got %s]', name, n,
-                     coalesce(cnt::text, 'error ' || got || ' ' || msg)),
-              got is null and cnt = n);
-end $$;
-
-grant execute on all functions in schema t to public;
+\ir helpers.sql
 
 -- ---------------------------------------------------------------------
 -- 1. Structure (as superuser)
@@ -120,6 +72,12 @@ select t.ok('both tables are in publication supabase_realtime',
 select t.ok('primary keys are (user_id, id) and (user_id)',
   pg_get_constraintdef((select oid from pg_constraint where conname = 'transactions_pkey')) = 'PRIMARY KEY (user_id, id)'
   and pg_get_constraintdef((select oid from pg_constraint where conname = 'budget_settings_pkey')) = 'PRIMARY KEY (user_id)');
+select t.ok('transactions.goal_id: nullable text without a default (v2)',
+  (select data_type = 'text' and is_nullable = 'YES' and column_default is null from information_schema.columns
+   where table_schema = 'public' and table_name = 'transactions' and column_name = 'goal_id'));
+select t.ok('checks: goal_id format [A-Za-z0-9_-]{1,32}, settings document up to 64 KB',
+  pg_get_constraintdef((select oid from pg_constraint where conname = 'transactions_goal_id_format')) like '%goal_id ~ %^[A-Za-z0-9_-]{1,32}$%'
+  and pg_get_constraintdef((select oid from pg_constraint where conname = 'budget_settings_data_size')) like '%<= 65536%');
 select t.ok('schema applied twice: exactly one trigger per table',
   (select count(*) = 2 from pg_trigger where not tgisinternal
    and tgrelid in ('public.transactions'::regclass, 'public.budget_settings'::regclass)));
@@ -157,6 +115,11 @@ select t.ok('A: updated_at stamped by server on insert',
   (select updated_at > now() - interval '1 minute' and updated_at <= clock_timestamp()
    from public.transactions where id = 'tx3'));
 select t.ok('A: sees exactly own 3 rows', (select count(*) from public.transactions) = 3);
+select t.affects('A: a saving with goal_id, as the client sends it',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sav1', 'saving', 500, 'savings', '', '2026-10-06', 1759700000000, 'g_car', false, false, 1000)$$, 1);
+select t.ok('A: goal_id round trip', (select goal_id = 'g_car' and type = 'saving' from public.transactions where id = 'sav1'));
+select t.ok('A: rows written without goal_id have NULL (= the first goal)', (select bool_and(goal_id is null) from public.transactions where id in ('tx1', 'tx2', 'tx3')));
 select t.affects('A: insert own settings',
   $$insert into public.budget_settings (data, client_updated_ms) values ('{"startBalance": 1000, "goal": null, "limits": {}}', 1000)$$, 1);
 
@@ -169,6 +132,13 @@ select t.ok('B: sees none of A''s settings', (select count(*) from public.budget
 select t.affects('B: update of A''s row affects nothing',
   $$update public.transactions set note = 'hacked', client_updated_ms = 9000000000000 where id = 'tx1'$$, 0);
 select t.affects('B: delete of A''s row affects nothing', $$delete from public.transactions where id = 'tx1'$$, 0);
+select t.ok('B: A''s saving and its goal_id are invisible', (select count(*) from public.transactions where id = 'sav1' or goal_id is not null) = 0);
+select t.affects('B: moving A''s saving to another goal affects nothing',
+  $$update public.transactions set goal_id = 'g_evil', client_updated_ms = 9000000000000 where id = 'sav1'$$, 0);
+select t.fails('B: cannot upsert over A''s saving with a goal_id',
+  $$insert into public.transactions (user_id, id, type, amount, date, goal_id, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sav1', 'saving', 1, '2026-10-01', 'g_evil', 9000000000000)
+    on conflict (user_id, id) do update set goal_id = excluded.goal_id, client_updated_ms = excluded.client_updated_ms$$, '42501');
 select t.fails('B: cannot insert a row for A',
   $$insert into public.transactions (user_id, id, type, amount, date, client_updated_ms)
     values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'evil', 'expense', 1, '2026-10-01', 1)$$, '42501');
@@ -180,6 +150,8 @@ select t.affects('B: same id "tx1" is a separate row in B''s namespace',
   $$insert into public.transactions (user_id, id, type, amount, date, client_updated_ms)
     values ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'tx1', 'expense', 7, '2026-10-02', 1)$$, 1);
 select t.ok('B: sees only own tx1', (select count(*) = 1 and bool_and(user_id = :B) from public.transactions));
+select t.affects('B: own saving with goal_id', $$insert into public.transactions (id, type, amount, date, goal_id, client_updated_ms)
+    values ('bsav1', 'saving', 70, '2026-10-02', 'g_house', 1)$$, 1);
 select t.fails('B: cannot move own row to A (user_id immutable)',
   $$update public.transactions set user_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' where id = 'tx1'$$, '23514');
 select t.fails('B: cannot insert settings for A',
@@ -196,6 +168,9 @@ select t.affects('B: update touches only own settings row', $$update public.budg
 select t.ok('A''s tx1 untouched by B', (select note = 'Пятёрочка' and client_updated_ms = 1000 from public.transactions where user_id = :A and id = 'tx1'));
 select t.ok('A''s settings untouched by B', (select data ->> 'startBalance' = '1000' from public.budget_settings where user_id = :A));
 select t.ok('two rows with id tx1, one per user', (select count(*) = 2 from public.transactions where id = 'tx1'));
+select t.ok('A''s goal_id untouched by B, B''s own goal_id stored',
+  (select goal_id = 'g_car' and client_updated_ms = 1000 from public.transactions where user_id = :A and id = 'sav1')
+  and (select goal_id = 'g_house' from public.transactions where user_id = :B and id = 'bsav1'));
 
 -- ---------------------------------------------------------------------
 -- 5. Last writer wins on transactions (as A)
@@ -247,6 +222,37 @@ select t.ok('LWW: batch result per row',
   (select bool_and(case id when 'tx1' then note = 'NEWER' when 'tx2' then note = 'BATCH-NEW' and amount = 60000
                            when 'tx4' then note = 'BATCH-INS' and example end)
           and count(*) = 3 from public.transactions where id in ('tx1', 'tx2', 'tx4')));
+
+select t.affects('LWW goal_id: a newer write moves the saving to another goal',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sav1', 'saving', 500, 'savings', '', '2026-10-06', 1759700000000, 'g_trip', false, false, 2000)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id, example = excluded.example,
+      deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 1);
+select t.affects('LWW goal_id: an older write is ignored',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sav1', 'saving', 500, 'savings', '', '2026-10-06', 1759700000000, 'g_old', false, false, 1500)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id, example = excluded.example,
+      deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 0);
+select t.ok('LWW goal_id: newer value kept', (select goal_id = 'g_trip' and client_updated_ms = 2000 from public.transactions where id = 'sav1'));
+select t.affects('LWW goal_id: a newer write with NULL clears it (back to the first goal)',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sav1', 'saving', 500, 'savings', '', '2026-10-06', 1759700000000, null, false, false, 3000)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id, example = excluded.example,
+      deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 1);
+select t.ok('LWW goal_id: cleared', (select goal_id is null from public.transactions where id = 'sav1'));
+select t.affects('PostgREST-style bulk upsert with goal_id: a row without the key gets NULL',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, example, deleted, client_updated_ms)
+    select user_id, id, type, amount, category, note, date, created_ms, goal_id, example, deleted, client_updated_ms
+    from json_populate_recordset(null::public.transactions, '[
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "sav2", "type": "saving", "amount": 10, "date": "2026-10-07", "goal_id": "g_trip", "client_updated_ms": 5000},
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "sav3", "type": "saving", "amount": 20, "date": "2026-10-07", "client_updated_ms": 5000}]')
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id, example = excluded.example,
+      deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 2);
+select t.ok('bulk upsert: goal_id per row', (select bool_and(case id when 'sav2' then goal_id = 'g_trip' else goal_id is null end) from public.transactions where id in ('sav2', 'sav3')));
 
 -- PostgREST builds bulk upserts with json_populate_recordset; supabase-js sends
 -- NULL for keys missing in some objects. Minimal tombstone + full row together:
@@ -332,6 +338,16 @@ select t.fails('NULL client_updated_ms rejected', $$insert into public.transacti
 select t.fails('live row without date rejected', $$insert into public.transactions (id, type, amount) values ('c21', 'expense', 1)$$, '23514');
 select t.fails('live row without type rejected', $$insert into public.transactions (id, amount, date) values ('c22', 1, '2026-10-01')$$, '23514');
 select t.fails('live row without amount rejected', $$insert into public.transactions (id, type, date) values ('c23', 'expense', '2026-10-01')$$, '23514');
+select t.affects('goal_id of 32 chars of [A-Za-z0-9_-] accepted',
+  format($$insert into public.transactions (id, type, amount, date, goal_id) values ('g1', 'saving', 1, '2026-10-01', %L)$$, 'g_' || repeat('Z', 26) || '_-09'), 1);
+select t.affects('goal_id NULL accepted', $$insert into public.transactions (id, type, amount, date, goal_id) values ('g2', 'saving', 1, '2026-10-01', null)$$, 1);
+select t.fails('goal_id of 33 chars rejected', format($$insert into public.transactions (id, type, amount, date, goal_id) values ('g3', 'saving', 1, '2026-10-01', %L)$$, repeat('g', 33)), '23514');
+select t.fails('empty goal_id rejected', $$insert into public.transactions (id, type, amount, date, goal_id) values ('g4', 'saving', 1, '2026-10-01', '')$$, '23514');
+select t.fails('goal_id with a space rejected', $$insert into public.transactions (id, type, amount, date, goal_id) values ('g5', 'saving', 1, '2026-10-01', 'g car')$$, '23514');
+select t.fails('goal_id with Cyrillic rejected', $$insert into public.transactions (id, type, amount, date, goal_id) values ('g6', 'saving', 1, '2026-10-01', 'цель')$$, '23514');
+select t.fails('goal_id with a trailing newline rejected', $$insert into public.transactions (id, type, amount, date, goal_id) values ('g7', 'saving', 1, '2026-10-01', E'g_x\n')$$, '23514');
+select t.fails('goal_id with a quote or a dot rejected', $$insert into public.transactions (id, type, amount, date, goal_id) values ('g8', 'saving', 1, '2026-10-01', 'g''x.y')$$, '23514');
+select t.fails('an update to an invalid goal_id rejected', $$update public.transactions set goal_id = 'no good', client_updated_ms = 9999 where id = 'g1'$$, '23514');
 select t.fails('tombstone with an invalid type still rejected', $$insert into public.transactions (id, type, deleted) values ('c24', 'bogus', true)$$, '23514');
 
 -- ---------------------------------------------------------------------
@@ -361,8 +377,23 @@ select t.fails('settings: data must be an object (array)', $$update public.budge
 select t.fails('settings: data must be an object (string)', $$update public.budget_settings set data = '"x"', client_updated_ms = 3000$$, '23514');
 select t.fails('settings: data must be an object (json null)', $$update public.budget_settings set data = 'null', client_updated_ms = 3000$$, '23514');
 select t.fails('settings: data SQL NULL rejected', $$update public.budget_settings set data = null, client_updated_ms = 3000$$, '23502');
-select t.fails('settings: data over 32 KB rejected',
-  $$update public.budget_settings set data = jsonb_build_object('x', repeat('a', 40000)), client_updated_ms = 3000$$, '23514');
+select t.affects('settings: the largest v2 document the app makes (20 goals, 60 categories, 100 limits, _ms) is accepted',
+  format($$update public.budget_settings set data = %L::jsonb, client_updated_ms = 3000$$, :'maxdoc'), 1);
+select t.ok(format('settings: its size as the server measures it (%s bytes) is what the client and the fake server compute', :'maxdoc_bytes'),
+  (select octet_length(data::text) = :maxdoc_bytes from public.budget_settings));
+select t.ok('settings: far below the 64 KB limit (room for unknown fields and later versions)',
+  (select octet_length(data::text) < 65536 - 30000 from public.budget_settings));
+select t.ok('settings: stored whole (20 goals, 60 categories, 100 limits)',
+  (select jsonb_array_length(data -> 'goals') = 20 and jsonb_array_length(data -> 'categories') = 60
+          and (select count(*) from jsonb_object_keys(data -> 'limits')) = 100 and data -> 'goals' -> 0 ->> 'name' = repeat('₪', 60)
+   from public.budget_settings));
+select t.affects('settings: exactly 65536 bytes accepted',
+  $$update public.budget_settings set data = jsonb_build_object('x', repeat('a', 65527)), client_updated_ms = 3001$$, 1);
+select t.ok('settings: (that is octet_length 65536)', (select octet_length(data::text) = 65536 from public.budget_settings));
+select t.fails('settings: 65537 bytes rejected',
+  $$update public.budget_settings set data = jsonb_build_object('x', repeat('a', 65528)), client_updated_ms = 3002$$, '23514');
+select t.fails('settings: 64 KB of 2-byte characters counted in bytes, rejected',
+  $$update public.budget_settings set data = jsonb_build_object('x', repeat('ж', 32764)), client_updated_ms = 3002$$, '23514');
 select t.fails('settings: user_id cannot change',
   $$update public.budget_settings set user_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', client_updated_ms = 3000$$, '23514');
 select t.affects('settings: owner can delete own settings', $$delete from public.budget_settings$$, 1);
@@ -435,6 +466,7 @@ select t.ok('cascade: B''s data kept',
 --     with a FOR ALL TABLES publication, and with a fresh empty publication.
 -- ---------------------------------------------------------------------
 select count(*) as rows_before from public.transactions \gset
+select count(*) as goal_rows_before from public.transactions where goal_id is not null \gset
 drop publication supabase_realtime;
 \connect - postgres
 \ir ../../supabase/schema.sql
@@ -457,6 +489,12 @@ alter publication supabase_realtime owner to postgres;
 \connect - supabase_admin
 select t.ok('re-run adds both tables to a fresh publication',
   (select count(*) = 2 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public'));
+select t.ok('after all re-runs: one goal_id column, one goal_id check, goal_id values intact',
+  (select count(*) = 1 from pg_attribute where attrelid = 'public.transactions'::regclass and attname = 'goal_id' and not attisdropped)
+  and (select count(*) = 1 from pg_constraint where conrelid = 'public.transactions'::regclass and conname = 'transactions_goal_id_format')
+  and (select count(*) = 1 from pg_constraint where conrelid = 'public.budget_settings'::regclass and conname = 'budget_settings_data_size')
+  and :goal_rows_before > 0
+  and (select count(*) from public.transactions where goal_id is not null) = :goal_rows_before);
 select t.ok('after all re-runs: still 4+4 policies, 2 triggers, data intact',
   (select count(*) = 8 from pg_policies where schemaname = 'public')
   and (select count(*) = 2 from pg_trigger where not tgisinternal

@@ -1154,10 +1154,10 @@
     renderNotice();
     try {
       await store.deleteMany(ex.map(t => t.id), done => { S.clearing.done = done; renderNotice(); });
-      const ex = settings().example;
-      if (ex && Object.keys(ex).length) {
+      const exFlags = settings().example;
+      if (exFlags && Object.keys(exFlags).length) {
         const next = settingsDoc();
-        for (const k of Object.keys(ex)) if (k in DEFAULTS) next[k] = JSON.parse(JSON.stringify(DEFAULTS[k]));
+        for (const k of Object.keys(exFlags)) if (k in DEFAULTS) next[k] = JSON.parse(JSON.stringify(DEFAULTS[k]));
         delete next.example;
         await store.saveSettings(next);
       }

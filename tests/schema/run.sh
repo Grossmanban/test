@@ -10,7 +10,9 @@
 #   KEEP=1           keep the directory (cluster is still stopped)
 #   PG_OS_USER       OS user that runs postgres when this script runs as root (default postgres)
 #
-# Exit code 0 = schema applied twice without errors and every test passed.
+# Exit code 0 = schema applied twice without errors and every test passed (tests.sql), and an upgrade
+# from the previous release's schema (schema-v1.sql, with data) works (upgrade.sql).
+# Needs node (the largest settings document comes from tests/helpers/max-settings.mjs).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,6 +75,17 @@ run_psql() {   # run_psql <db role> <file> [extra psql args]
 
 echo "== shim (Supabase-like roles, auth schema, publication)"
 run_psql supabase_admin "$HERE/shim.sql" -d postgres
+# a second, identical database for the upgrade test (before any schema.sql touches budget_test)
+"$PSQL" -X -q -v ON_ERROR_STOP=1 -h "$WORK" -p $PORT -U supabase_admin -d postgres \
+  -c "create database budget_upgrade template budget_test owner postgres"
+
+echo "== largest settings document (tests/helpers/max-settings.mjs)"
+node "$ROOT/tests/helpers/max-settings.mjs" >"$WORK/max-settings.out"
+node -e 'const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const fs = require("fs");
+  fs.writeFileSync(process.argv[2], JSON.stringify(o.wire)); fs.writeFileSync(process.argv[3], String(o.wireBytes));' \
+  "$WORK/max-settings.out" "$WORK/max-settings.json" "$WORK/max-settings.bytes"
+export MAXDOC_FILE="$WORK/max-settings.json" MAXDOC_BYTES_FILE="$WORK/max-settings.bytes"
+echo "   $(cat "$MAXDOC_BYTES_FILE") bytes as octet_length(data::text)"
 
 for pass in 1 2; do
   echo "== apply supabase/schema.sql as role postgres (pass $pass)"
@@ -92,6 +105,17 @@ PGOPTIONS='-c client_min_messages=warning' \
 status=$?
 set -e
 cat "$WORK/tests.out"
+
+echo "== upgrade: schema-v1.sql with data, then supabase/schema.sql (twice)"
+run_psql postgres "$HERE/schema-v1.sql" -d budget_upgrade >"$WORK/apply-v1.out" 2>&1 || { cat "$WORK/apply-v1.out"; exit 1; }
+set +e
+PGOPTIONS='-c client_min_messages=warning' \
+  run_psql supabase_admin "$HERE/upgrade.sql" -d budget_upgrade -At >"$WORK/upgrade.out" 2>&1
+ustatus=$?
+set -e
+cat "$WORK/upgrade.out"
+cat "$WORK/upgrade.out" >>"$WORK/tests.out"
+[ "$ustatus" -ne 0 ] && status=$ustatus
 
 passed=$(grep -c '^ok ' "$WORK/tests.out" || true)
 failed=$(grep -c '^not ok ' "$WORK/tests.out" || true)

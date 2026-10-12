@@ -222,21 +222,25 @@
     return utf8Len(JSON.stringify(v)) + extra;
   }
   const iconOf = (v, dflt) => (typeof v === "string" && ICON_RE.test(v) ? v : dflt);
+  // entries the UI could not show (no id, no name, no target, …) are dropped; a missing or unknown icon gets the default
   function goalOf(g) {
     if (!isObj(g) || typeof g.id !== "string" || !GOAL_ID_RE.test(g.id) || typeof g.name !== "string") return null;
+    const name = cleanText(g.name.trim(), 60, true).trim();
     const target = finite(g.target) && g.target <= MAX_AMOUNT ? r2(g.target) : 0;
     const deadline = g.deadline == null ? "" : g.deadline;
     const initial = g.initial == null ? 0 : g.initial;
-    if (!(target > 0) || (deadline !== "" && !validDate(deadline)) || !finite(initial) || initial < 0 || initial > MAX_AMOUNT) return null;
+    if (!name || !(target > 0) || (deadline !== "" && !validDate(deadline)) || !finite(initial) || initial < 0 || initial > MAX_AMOUNT) return null;
     return {
-      id: g.id, name: cleanText(g.name.trim(), 60, true), target, deadline, initial: r2(initial),
+      id: g.id, name, target, deadline, initial: r2(initial),
       icon: iconOf(g.icon, "Target"),
       createdAt: finite(g.createdAt) && g.createdAt >= 0 && g.createdAt <= MAX_DATE_MS ? Math.round(g.createdAt) : 0,
     };
   }
   function categoryOf(c) {
     if (!isObj(c) || typeof c.id !== "string" || !CAT_ID_RE.test(c.id) || (c.type !== "income" && c.type !== "expense") || typeof c.name !== "string") return null;
-    const out = { id: c.id, type: c.type, name: cleanText(c.name.trim(), 32, true), icon: iconOf(c.icon, "Ellipsis") };
+    const name = cleanText(c.name.trim(), 32, true).trim();
+    if (!name) return null;
+    const out = { id: c.id, type: c.type, name, icon: iconOf(c.icon, "Tag") };
     if (c.archived === true) out.archived = true;
     return out;
   }

@@ -1,5 +1,5 @@
 -- =====================================================================
--- Домашняя бухгалтерия: схема базы данных для Supabase
+-- Money honey: схема базы данных для Supabase
 --
 -- Как применить: Supabase → SQL Editor → New query → вставьте весь файл
 -- → Run. Скрипт можно запускать повторно: он ничего не удаляет из данных,
@@ -8,8 +8,10 @@
 --
 -- Contract (docs/ARCHITECTURE.md, store-pwa.js):
 --   * public.transactions    one row per transaction, PK (user_id, id),
---                            deletions are tombstones (deleted = true)
+--                            deletions are tombstones (deleted = true);
+--                            goal_id = the goal a saving went to (NULL = the first goal)
 --   * public.budget_settings one jsonb document per user, PK user_id
+--                            ({ startBalance, goals, limits, categories, _ms })
 --   * updated_at is stamped by the server (clock_timestamp()) on every
 --     insert/update; clients never set it. Pull cursor = max(updated_at).
 --   * Last writer wins: an UPDATE whose client_updated_ms is smaller than the
@@ -29,7 +31,7 @@ create table if not exists public.transactions (
                                   references auth.users (id) on delete cascade,
   id                text          not null,
   type              text,                     -- 'income' | 'expense' | 'saving'
-  amount            numeric(14,2),            -- rubles, > 0
+  amount            numeric(14,2),            -- shekels (ILS), > 0
   category          text          not null default '',
   note              text          not null default '',
   date              date,
@@ -50,10 +52,16 @@ create table if not exists public.budget_settings (
   constraint budget_settings_pkey primary key (user_id)
 );
 
+-- Added in v2 (Money honey). "add column if not exists" upgrades a project created
+-- with an older schema.sql; the existing rows get NULL (= the first goal).
+alter table public.transactions add column if not exists goal_id text;
+
 comment on table public.transactions is
-  'Домашняя бухгалтерия: операции (доходы, расходы, копилка). Удаление = deleted:true.';
+  'Money honey: операции (доходы, расходы, копилка). Удаление = deleted:true.';
 comment on table public.budget_settings is
-  'Домашняя бухгалтерия: настройки пользователя (стартовый баланс, цель, лимиты).';
+  'Money honey: настройки пользователя (стартовый баланс, цели, лимиты, свои категории).';
+comment on column public.transactions.goal_id is
+  'Saving operations: id of the goal (settings.goals[].id) the money went to. NULL = the first goal.';
 comment on column public.transactions.updated_at is
   'Server time of the last accepted write (trigger, clock_timestamp()). Sync cursor.';
 comment on column public.transactions.client_updated_ms is
@@ -75,6 +83,7 @@ alter table public.transactions
   drop constraint if exists transactions_note_length,
   drop constraint if exists transactions_date_range,
   drop constraint if exists transactions_ms_range,
+  drop constraint if exists transactions_goal_id_format,
   drop constraint if exists transactions_live_row_complete,
   add constraint transactions_id_format
     check (char_length(id) between 1 and 64 and id ~ '^[A-Za-z0-9_-]+$'),
@@ -90,6 +99,8 @@ alter table public.transactions
     check (date between date '1900-01-01' and date '2199-12-31'),
   add constraint transactions_ms_range
     check (created_ms >= 0 and client_updated_ms >= 0),
+  add constraint transactions_goal_id_format
+    check (goal_id ~ '^[A-Za-z0-9_-]{1,32}$'),
   add constraint transactions_live_row_complete
     check (deleted or (type is not null and amount is not null and date is not null));
 
@@ -99,8 +110,10 @@ alter table public.budget_settings
   drop constraint if exists budget_settings_ms_range,
   add constraint budget_settings_data_object
     check (jsonb_typeof(data) = 'object'),
+  -- 64 KB: the app keeps a document (20 goals, 60 categories, limits, field
+  -- stamps) under 60 000 bytes of this measure; the rest is headroom
   add constraint budget_settings_data_size
-    check (octet_length(data::text) <= 32768),
+    check (octet_length(data::text) <= 65536),
   add constraint budget_settings_ms_range
     check (client_updated_ms >= 0);
 
@@ -268,3 +281,7 @@ end
 $$;
 
 commit;
+
+-- PostgREST caches the schema: make the API see a column added above right away
+-- (hosted Supabase also reloads on DDL by itself).
+notify pgrst, 'reload schema';

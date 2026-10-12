@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru" data-view="learn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Обучение — harness</title>
+<link rel="stylesheet" href="/public/fonts.css">
+<link rel="stylesheet" href="/src/app.css">
+<link rel="stylesheet" href="/src/learn.css">
+</head>
+<body>
+<!-- top bar and tabs copied from src/app.html; only the «Обучение» view is live -->
+<div class="app">
+  <header class="topbar">
+    <div class="brand-row">
+      <div class="brand">
+        <div class="brand-mark" data-icon="Wallet"></div>
+        <div>
+          <h1>Money honey</h1>
+          <p>Доходы, расходы и цели в шекелях</p>
+        </div>
+      </div>
+      <div class="top-tools" id="pwaTop"></div>
+    </div>
+    <button class="btn btn-primary" id="addBtn" aria-label="Новая операция"><span data-icon="Plus"></span>Новая операция</button>
+  </header>
+  <nav class="viewtabs" id="viewTabs" role="tablist" aria-label="Разделы">
+    <button type="button" role="tab" id="tabBudget" data-view="budget" aria-selected="false" tabindex="-1"><span data-icon="Wallet"></span><span>Бюджет</span></button>
+    <button type="button" role="tab" id="tabGoals" data-view="goals" aria-selected="false" tabindex="-1"><span data-icon="Target"></span><span>Цели</span></button>
+    <button type="button" role="tab" id="tabLearn" data-view="learn" aria-selected="true" aria-controls="viewLearn"><span data-icon="GraduationCap"></span><span>Обучение</span></button>
+  </nav>
+  <section class="view" id="viewLearn" role="tabpanel" aria-labelledby="tabLearn"></section>
+</div>
+<div class="toast" id="toast" hidden></div>
+<div class="sr" id="live" role="status" aria-live="polite"></div>
+
+<script src="/__lucide.js"></script>
+<script src="/tests/learn/mock-api.js"></script>
+<script src="/src/lessons.js"></script>
+<script src="/src/learn.js"></script>
+<script>window.__mount();</script>
+</body>
+</html>

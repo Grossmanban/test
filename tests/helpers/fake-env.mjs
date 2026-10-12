@@ -79,7 +79,7 @@ export function createWindow({
   return win;
 }
 
-// a tiny deterministic example budget (the real one is src/seed.js)
+// a tiny deterministic example budget (the real one is src/seed.js), settings v2
 export const fakeSeed = {
   calls: [],
   make(todayIso) {
@@ -87,16 +87,32 @@ export const fakeSeed = {
     const ym = todayIso.slice(0, 7);
     return {
       settings: {
-        startBalance: 52400,
-        goal: { name: "Отпуск", target: 250000, deadline: "2027-05-01", initial: 96000 },
-        limits: { groceries: 25000, cafe: 8000 },
-        example: { startBalance: true, goal: true, limits: true },
+        startBalance: 5240,
+        goals: [{ id: "g_trip", name: "Отпуск", target: 25000, deadline: "2027-05-01", initial: 9600, icon: "Plane", createdAt: 1 }],
+        limits: { groceries: 2500, cafe: 800 },
+        categories: [{ id: "c_market", type: "expense", name: "Шук", icon: "ShoppingBasket" }],
+        example: { startBalance: true, goals: true, limits: true, categories: true },
       },
       tx: [
-        { id: "ex01", type: "expense", category: "housing", amount: 45000, note: "Аренда", date: `${ym}-01`, createdAt: 1, example: true },
-        { id: "ex02", type: "income", category: "salary", amount: 70000, note: "Зарплата", date: `${ym}-05`, createdAt: 2, example: true },
-        { id: "ex03", type: "saving", category: "savings", amount: 15000, note: "В копилку", date: `${ym}-05`, createdAt: 3, example: true },
+        { id: "ex01", type: "expense", category: "housing", amount: 4500, note: "Аренда", date: `${ym}-01`, createdAt: 1, example: true },
+        { id: "ex02", type: "income", category: "salary", amount: 7000, note: "Зарплата", date: `${ym}-05`, createdAt: 2, example: true },
+        { id: "ex03", type: "saving", category: "savings", amount: 1500, note: "В копилку", date: `${ym}-05`, createdAt: 3, goalId: "g_trip", example: true },
       ],
+    };
+  },
+};
+// the same in the v1 shape (one goal, no categories), as an older src/seed.js made it
+export const legacySeed = {
+  make(todayIso) {
+    const v2 = fakeSeed.make.call({ calls: [] }, todayIso);
+    return {
+      settings: {
+        startBalance: 5240,
+        goal: { name: "Отпуск", target: 25000, deadline: "2027-05-01", initial: 9600 },
+        limits: { groceries: 2500, cafe: 800 },
+        example: { startBalance: true, goal: true, limits: true },
+      },
+      tx: v2.tx.map(({ goalId, ...t }) => t),
     };
   },
 };
