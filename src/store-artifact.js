@@ -50,10 +50,23 @@
     return out;
   }
 
+  const GOAL_ID = /^[A-Za-z0-9_-]{1,32}$/;
+  // the user's first goal as app.js reads the document (v1 `goal` = "g_main"; not the example's): saving operations
+  // without goalId belong to it
+  function firstGoalId(s) {
+    if (!s || typeof s !== "object") return null;
+    if (s.example && typeof s.example === "object" && (s.example.goals || s.example.goal)) return null;
+    const list = Array.isArray(s.goals) ? s.goals : s.goal && typeof s.goal === "object" ? [Object.assign({ id: "g_main" }, s.goal)] : [];
+    const g = list.find(x => x && typeof x === "object" && typeof x.name === "string" && x.name.trim() && typeof x.target === "number" && x.target > 0);
+    if (!g) return null;
+    return typeof g.id === "string" && GOAL_ID.test(g.id) ? g.id : "g_main";
+  }
+
   window.createBudgetStore = function createBudgetStore() {
     const snap = { status: "loading", tx: [], settings: null, readOnly: false };
     let onChange = () => {};
     let settingsRef = null, txCol = null, settingsQueue = Promise.resolve();
+    let lastSettings = null;   // the settings as last written here or delivered, whichever came later
     const emit = () => onChange({ ...snap, tx: snap.tx.slice() });
 
     async function connect() {
@@ -66,7 +79,7 @@
       let gotS = false, gotT = false;
       const ready = () => { if (gotS && gotT) snap.status = "ready"; emit(); };
       const onErr = () => { snap.status = "offline"; emit(); };
-      settingsRef.onSnapshot(s => { snap.settings = s.exists ? s.data() : null; gotS = true; ready(); }, onErr);
+      settingsRef.onSnapshot(s => { snap.settings = s.exists ? s.data() : null; lastSettings = snap.settings; gotS = true; ready(); }, onErr);
       txCol.onSnapshot(s => { snap.tx = s.docs.map(d => ({ ...d.data(), id: d.id })); gotT = true; ready(); }, onErr);
     }
     function need() { if (!txCol) throw fail("revoked"); }
@@ -88,7 +101,20 @@
       saveSettings(next) {
         need();
         const body = JSON.parse(JSON.stringify(next));
-        const run = settingsQueue.then(() => guarded(() => settingsRef.set(body)));   // one write at a time per document
+        const run = settingsQueue.then(async () => {             // one write at a time per document
+          // The first goal stops being first (deleted, or moved): its savings without goalId get its id written
+          // down first, so they stay with it (and come back with it on «Вернуть») instead of moving to the new first goal.
+          const was = firstGoalId(lastSettings);
+          if (was && firstGoalId(body) !== was) {
+            for (const t of snap.tx.slice()) {
+              if (t.type !== "saving" || t.example === true || (typeof t.goalId === "string" && GOAL_ID.test(t.goalId))) continue;
+              const pinned = Object.assign({}, t, { goalId: was, updatedAt: Date.now() });
+              await guarded(() => txCol.doc(t.id).set(txBody(pinned)));
+            }
+          }
+          await guarded(() => settingsRef.set(body));
+          lastSettings = body;
+        });
         settingsQueue = run.catch(() => {});
         return run;
       },

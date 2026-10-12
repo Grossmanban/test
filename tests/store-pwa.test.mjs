@@ -8,7 +8,7 @@ import { existsSync } from "node:fs";
 import { createWindow, FakeStorage, fakeSeed, legacySeed, loadScript, sleep, waitFor, createBroadcastBus } from "./helpers/fake-env.mjs";
 import { createFakeIndexedDB } from "./helpers/fake-idb.mjs";
 import { createFakeSupabase, FAKE_URL, FAKE_ANON_KEY, FAKE_SERVICE_KEY, tsUs, pgJsonBytes } from "./helpers/fake-supabase.mjs";
-import { maxSettings } from "./helpers/max-settings.mjs";
+import { maxSettings, maxSettingsWire, MAX_GONE } from "./helpers/max-settings.mjs";
 
 const SRC = new URL("../src/store-pwa.js", import.meta.url).pathname;
 const SEED_SRC = new URL("../src/seed.js", import.meta.url).pathname;
@@ -1790,7 +1790,7 @@ test("v2 settings: goals and custom categories merge per field; offline edits on
   for (const d of [a, b]) assert.deepEqual(d.snap.settings, both);
   assert.deepEqual(without(server.rows("budget_settings")[0].data, "_ms"), both);
 
-  // the same field: the later edit wins as a whole (archiving on a, renaming on b later)
+  // the same category on both: the later edit of it wins (archiving on a, renaming on b later)
   a.tick(60_000); await uiSaveSettings(a, { categories: [{ ...CAT, archived: true }, CAT2] });
   b.tick(120_000); await uiSaveSettings(b, { categories: [{ ...CAT, name: "Рынок" }, CAT2], limits: { [CAT.id]: 400 } });
   await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
@@ -1990,6 +1990,297 @@ test("v2 settings: «Удалить пример» on the v2 example resets ever
   assert.equal(ipad.sync.pending, 0);
 });
 
+/* ── v2 settings: goals and categories merge entry by entry; savings keep their goal ─────── */
+const G3 = { id: "g_bike", name: "Велосипед", target: 3000, deadline: "", initial: 0, icon: "Bike", createdAt: 3 };
+const G4 = { id: "g_sofa", name: "Диван", target: 4000, deadline: "", initial: 0, icon: "Sofa", createdAt: 4 };
+const C3 = { id: "c_vaad01", type: "expense", name: "Ваад байт", icon: "Building2" };
+const C4 = { id: "c_btl001", type: "income", name: "Пособие", icon: "HandCoins" };
+
+async function twoSignedIn(initial) {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  if (initial) { await a.store.saveSettings(initial); await a.store.sync.syncNow(); }
+  const b = await new Device({ server, seed: null }).ready();
+  await b.signIn("anna@example.com");
+  return { server, a, b };
+}
+
+test("v2 entries: two devices add different goals offline: both goals survive, savings keep their goal", async () => {
+  const { server, a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL] });
+  a.win.setOnline(false); b.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { goals: [...a.snap.settings.goals, GOAL2] });
+  const sa = await a.store.saveTx(null, saving({ goalId: GOAL2.id, note: "на отпуск" }));
+  b.tick(120_000); await uiSaveSettings(b, { goals: [...b.snap.settings.goals, G3] });
+  const sb = await b.store.saveTx(null, saving({ goalId: G3.id, note: "на велосипед" }));
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) {
+    const ids = d.snap.settings.goals.map(g => g.id);
+    assert.deepEqual(ids.sort(), [GOAL.id, GOAL2.id, G3.id].sort(), "both new goals survive on " + (d === a ? "a" : "b"));
+    for (const s of [sa, sb]) assert.ok(ids.includes(d.find(s).goalId), "saving " + s + " still has its goal");
+  }
+  assert.equal(server.rows("budget_settings")[0].data.goals.length, 3);
+});
+
+test("v2 entries: two devices add different custom categories offline: both survive (no operation falls back to «Прочее»)", async () => {
+  const { a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, categories: [CAT] });
+  a.win.setOnline(false); b.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { categories: [...a.snap.settings.categories, C3] });
+  await a.store.saveTx(null, tx({ category: C3.id }));
+  b.tick(120_000); await uiSaveSettings(b, { categories: [...b.snap.settings.categories, C4] });
+  await b.store.saveTx(null, tx({ type: "income", category: C4.id }));
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) assert.deepEqual(d.snap.settings.categories.map(c => c.id).sort(), [CAT.id, C3.id, C4.id].sort());
+});
+
+test("v2 entries: a goal deleted on one device and another goal added offline on the other: the deleted one stays deleted, the new one stays", async () => {
+  for (const laterIsDelete of [false, true]) {
+    const { a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2] });
+    a.win.setOnline(false); b.win.setOnline(false);
+    const del = async () => { a.tick(laterIsDelete ? 120_000 : 60_000); await uiSaveSettings(a, { goals: [GOAL] }); };
+    const add = async () => { b.tick(laterIsDelete ? 60_000 : 120_000); await uiSaveSettings(b, { goals: [...b.snap.settings.goals, G3] }); };
+    await del(); await add();
+    a.win.setOnline(true); b.win.setOnline(true);
+    await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+    for (const d of [a, b]) assert.deepEqual(d.snap.settings.goals.map(g => g.id), [GOAL.id, G3.id], `laterIsDelete=${laterIsDelete}`);
+  }
+});
+
+test("v2 entries: sign-in after anonymous use with a goal and a category of its own keeps the account's goals and categories; the account's first goal stays first", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const phone = await new Device({ server, seed: null }).ready();
+  await phone.signIn("anna@example.com");
+  await phone.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL_V1_AS_V2, GOAL2], categories: [CAT] });
+  const legacy = await phone.store.saveTx(null, saving());   // no goalId: belongs to the first goal (g_main)
+  await phone.store.sync.syncNow();
+
+  // iPad, a day later: «Удалить пример», then a goal and a category of its own, then signs in
+  const ipad = await new Device({ server, clock: T0 + 86_400_000 }).ready();
+  await uiClearExamples(ipad);
+  ipad.tick(); await uiSaveSettings(ipad, { goals: [G3] });
+  ipad.tick(); await uiSaveSettings(ipad, { categories: [C3] });
+  await ipad.signIn("anna@example.com");
+  await phone.store.sync.syncNow();
+  for (const d of [phone, ipad]) {
+    const s = d.snap.settings;
+    assert.deepEqual(s.goals.map(g => g.id), [GOAL_V1_AS_V2.id, GOAL2.id, G3.id], "union, the account's goals first");
+    assert.deepEqual(s.categories.map(c => c.id), [CAT.id, C3.id]);
+    assert.equal("goalId" in d.find(legacy), false);
+  }
+});
+
+test("v2 entries: a backup from another device imported here keeps goals and categories added on this device since", async () => {
+  const e = await new Device({ seed: null, clock: 10_000 }).ready();
+  await e.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL], categories: [CAT] });
+  const d = await new Device({ seed: null, clock: 10_000 }).ready();
+  await d.store.backup.import(JSON.parse(JSON.stringify(e.store.backup.export())));
+  d.t = 20_000; await uiSaveSettings(d, { goals: [GOAL, G3], categories: [CAT, C4] });
+  e.t = 30_000; await uiSaveSettings(e, { goals: [GOAL, GOAL2], categories: [CAT, C3] });
+  d.t = 40_000; await d.store.backup.import(JSON.parse(JSON.stringify(e.store.backup.export())));
+  assert.deepEqual(d.snap.settings.goals.map(g => g.id), [GOAL.id, G3.id, GOAL2.id]);
+  assert.deepEqual(d.snap.settings.categories.map(c => c.id), [CAT.id, C4.id, C3.id]);
+  // and a goal deleted here after the backup was made does not come back from it
+  d.t = 50_000; await uiSaveSettings(d, { goals: [GOAL, GOAL2] });
+  d.t = 60_000; await d.store.backup.import(JSON.parse(JSON.stringify(e.store.backup.export())));
+  assert.deepEqual(d.snap.settings.goals.map(g => g.id), [GOAL.id, GOAL2.id]);
+});
+
+test("v2 entries: the same goal edited on both devices: the later edit wins", async () => {
+  const { a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2] });
+  a.win.setOnline(false); b.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { goals: [{ ...GOAL, target: 1 }, GOAL2] });
+  b.tick(120_000); await uiSaveSettings(b, { goals: [{ ...GOAL, target: 2 }, GOAL2] });
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) assert.equal(d.snap.settings.goals[0].target, 2);
+});
+
+// what the UI computes: the goal a saving belongs to (goalId, or the first goal)
+const goalOfTx = (t, goals) => (t.goalId ? goals.find(g => g.id === t.goalId) || null : goals[0] || null);
+const savedIn = (d, goalId) => d.snap.tx.filter(t => t.type === "saving" && (goalOfTx(t, d.snap.settings.goals) || {}).id === goalId).reduce((s, t) => s + t.amount, 0);
+
+test("v2 entries: deleting the first goal does not move its savings without goalId into the next goal", async () => {
+  const d = await new Device({ seed: null }).ready();
+  await d.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL_V1_AS_V2, GOAL2] });
+  await d.store.saveTx(null, saving({ amount: 700 }));                       // v1-style: no goalId → g_main
+  await d.store.saveTx(null, saving({ amount: 50, goalId: GOAL2.id }));
+  assert.deepEqual([savedIn(d, "g_main"), savedIn(d, GOAL2.id)], [700, 50]);
+  d.tick(); await uiSaveSettings(d, { goals: [GOAL2] });                     // «Удалить цель» on g_main
+  assert.equal(savedIn(d, GOAL2.id), 50, "the trip goal does not get the car's 700");
+  d.tick(); await uiSaveSettings(d, { goals: [GOAL_V1_AS_V2, GOAL2] });      // «Вернуть»
+  assert.deepEqual([savedIn(d, "g_main"), savedIn(d, GOAL2.id)], [700, 50], "undo brings the savings back with the goal");
+});
+
+test("v2 entries: sign-in after anonymous use (v1 data: one goal, savings without goalId) into an account with goals keeps each saving with its goal", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const phone = await new Device({ server, seed: null }).ready();
+  await phone.signIn("anna@example.com");
+  await phone.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2] });
+  await phone.store.saveTx(null, saving({ amount: 300 }));                   // the account's first goal
+  await phone.store.sync.syncNow();
+  const old = await new Device({ server, seed: null, clock: T0 + 3600_000 }).ready();
+  old.win.idb.poke("budget-pwa", "kv", "settings", { data: { startBalance: 0, goal: GOAL_V1, limits: {} }, fieldMs: { startBalance: 1, goal: T0 + 1000, limits: 1 }, updatedMs: T0 + 1000, dirty: true, localOnly: false });
+  await old.restart();
+  await old.store.saveTx(null, saving({ amount: 900 }));                     // belongs to g_main on this device
+  assert.equal(savedIn(old, "g_main"), 900);
+  await old.signIn("anna@example.com");
+  await phone.store.sync.syncNow();
+  for (const d of [phone, old]) {
+    assert.deepEqual(d.snap.settings.goals.map(g => g.id), [GOAL.id, GOAL2.id, "g_main"]);
+    assert.deepEqual([savedIn(d, GOAL.id), savedIn(d, "g_main")], [300, 900]);
+  }
+});
+
+test("v2 entries: a stale third device cannot bring a deleted goal back; an edit made after the delete does", async () => {
+  const { server, a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2] });
+  const c = await new Device({ server, seed: null }).ready();
+  await c.signIn("anna@example.com");
+  c.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { goals: [GOAL] }); await a.store.sync.syncNow();
+  b.tick(70_000); await b.store.sync.syncNow();
+  c.tick(80_000); await uiSaveSettings(c, { goals: [...c.snap.settings.goals, G3] });   // stale: still holds GOAL2
+  c.win.setOnline(true); await c.store.sync.syncNow();
+  await a.store.sync.syncNow(); await b.store.sync.syncNow();
+  for (const d of [a, b, c]) assert.deepEqual(d.snap.settings.goals.map(g => g.id), [GOAL.id, G3.id]);
+  // b edits G3 offline after a deletes it: the later edit wins (like operations)
+  b.win.setOnline(false);
+  a.tick(100_000); await uiSaveSettings(a, { goals: [GOAL] }); await a.store.sync.syncNow();
+  b.tick(200_000); await uiSaveSettings(b, { goals: [GOAL, { ...G3, target: 3500 }] });
+  b.win.setOnline(true); await b.store.sync.syncNow(); await a.store.sync.syncNow(); await c.store.sync.syncNow();
+  for (const d of [a, b, c]) assert.deepEqual(d.snap.settings.goals.map(g => [g.id, g.target]), [[GOAL.id, GOAL.target], [G3.id, 3500]]);
+  for (const d of [a, b, c]) assert.equal(d.sync.pending, 0);
+});
+
+test("v2 entries: tombstones are capped; dropping old ones still keeps their entries deleted on a stale device", async () => {
+  const cats = Array.from({ length: 40 }, (_, i) => ({ id: "c_k" + String(i).padStart(3, "0"), type: "expense", name: "К" + i, icon: "Tag" }));
+  const { server, a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, categories: cats });
+  b.win.setOnline(false);
+  for (let i = 0; i < 36; i++) { a.tick(1000); await uiSaveSettings(a, { categories: a.snap.settings.categories.slice(1) }); }
+  await a.store.sync.syncNow();
+  const items = server.rows("budget_settings")[0].data._ms.items.categories;
+  assert.equal(Object.keys(items.gone).length, 30);
+  assert.ok(items.since > 0);
+  b.tick(100_000); await uiSaveSettings(b, { categories: [...b.snap.settings.categories, C3] });   // stale, adds one
+  b.win.setOnline(true); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) assert.deepEqual(d.snap.settings.categories.map(c => c.id), ["c_k036", "c_k037", "c_k038", "c_k039", C3.id]);
+});
+
+test("v2 entries: two lists that together hold more than 20 goals: the first 20 (the account's first), both devices agree, no endless re-push", async () => {
+  const mk = (p, n) => Array.from({ length: n }, (_, i) => ({ ...G3, id: `g_${p}${i}`, name: p + i, createdAt: i }));
+  const { server, a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: mk("x", 5) });
+  a.win.setOnline(false); b.win.setOnline(false);
+  a.tick(1000); await uiSaveSettings(a, { goals: [...a.snap.settings.goals, ...mk("a", 10)] });
+  b.tick(2000); await uiSaveSettings(b, { goals: [...b.snap.settings.goals, ...mk("b", 10)] });
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  // whoever reached the server first (the online event syncs both) keeps all 10 of its goals; the other gets 5 in
+  const first = server.rows("budget_settings")[0].data.goals[5].id.slice(2, 3), second = first === "a" ? "b" : "a";
+  const want = [...mk("x", 5), ...mk(first, 10), ...mk(second, 5)].map(g => g.id);
+  for (const d of [a, b]) assert.deepEqual(d.snap.settings.goals.map(g => g.id), want);
+  assert.deepEqual(server.rows("budget_settings")[0].data.goals.map(g => g.id), want);
+  const n = server.log.filter(l => l.op === "upsert" && l.table === "budget_settings").length;
+  await a.store.sync.syncNow(); await b.store.sync.syncNow();
+  assert.equal(server.log.filter(l => l.op === "upsert" && l.table === "budget_settings").length, n, "nothing left to push");
+});
+
+test("v2 entries: a row written by a version without entry stamps counts as a whole for entries older than it", async () => {
+  const { server, a } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL] });
+  const u = a.sync.user;
+  a.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { goals: [GOAL, GOAL2] });          // older than the row below
+  const t1 = a.t + 60_000;
+  server.put("budget_settings", { user_id: u.id, client_updated_ms: t1,
+    data: { ...DEFAULT_SETTINGS, goals: [{ ...GOAL, name: "Машина 2" }], _ms: { startBalance: 0, goals: t1, limits: 0, categories: 0, at: t1 } } });
+  a.tick(120_000); await uiSaveSettings(a, { goals: [...a.snap.settings.goals, G3] });   // newer than the row
+  a.win.setOnline(true); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings.goals.map(g => [g.id, g.name]), [[GOAL.id, "Машина 2"], [G3.id, G3.name]]);
+});
+
+test("v2 entries: the example's goals never join an account's goals; a sign-in while the example is shown keeps only the account's", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const phone = await new Device({ server, seed: null }).ready();
+  await phone.signIn("anna@example.com");
+  await phone.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL] });
+  await phone.store.sync.syncNow();
+  const ipad = await new Device({ server }).ready();
+  assert.ok(ipad.snap.settings.example.goals);
+  await ipad.signIn("anna@example.com");
+  assert.deepEqual(ipad.snap.settings.goals, [GOAL]);
+  assert.equal("example" in ipad.snap.settings, false);
+});
+
+test("v2 entries: malformed entry stamps in a row or a file are ignored, never crash, never reach the UI", async () => {
+  const { server, a } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL] });
+  const u = a.sync.user;
+  const t1 = a.t + 60_000;
+  const bad = { since: "x", ms: { [GOAL.id]: -5, g_trip: 9e15, __proto__x: 1 }, gone: JSON.parse('{"__proto__": 5, "bad id": 7, "g_car": "1", "g_ok": ' + (t1 + 10) + '}') };
+  server.put("budget_settings", { user_id: u.id, client_updated_ms: t1,
+    data: { ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2], _ms: { startBalance: 0, goals: t1, limits: 0, categories: 0, at: t1, items: { goals: bad, categories: [] } } } });
+  a.tick(120_000); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings.goals.map(g => g.id), [GOAL.id, GOAL2.id]);
+  assertV2(a.snap.settings);
+  assert.equal(a.sync.phase, "idle");
+  const out = a.store.backup.export();
+  const d = await new Device({ seed: null }).ready();
+  await d.store.backup.import({ ...out, settingsItemsUpdatedAt: { goals: bad, categories: "x" } });
+  assert.deepEqual(d.snap.settings.goals.map(g => g.id), [GOAL.id, GOAL2.id]);
+  assertV2(d.snap.settings);
+});
+
+test("v2 entries: backups carry entry stamps and tombstones; a restored device does not bring back a goal deleted in the account", async () => {
+  const { a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2] });
+  const file = JSON.parse(JSON.stringify(b.store.backup.export()));            // GOAL, GOAL2
+  assert.deepEqual(Object.keys(file.settingsItemsUpdatedAt).sort(), ["categories", "goals"]);
+  a.tick(60_000); await uiSaveSettings(a, { goals: [GOAL] }); await a.store.sync.syncNow();
+  b.tick(120_000); await b.store.sync.syncNow();
+  b.tick(1000); await b.store.backup.import(file);
+  await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) assert.deepEqual(d.snap.settings.goals.map(g => g.id), [GOAL.id]);
+  const fresh = await new Device({ seed: null, clock: a.t + 1000 }).ready();
+  await fresh.store.backup.import(JSON.parse(JSON.stringify(a.store.backup.export())));
+  assert.deepEqual(fresh.kv().settings.items, a.kv().settings.items);
+});
+
+test("v2 entries: pinning: only live savings without goalId; example records, explicit goals and other types are untouched; no tx write when the first goal stays", async () => {
+  const d = await new Device({ seed: null }).ready();
+  await d.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2] });
+  const s1 = await d.store.saveTx(null, saving());
+  const s2 = await d.store.saveTx(null, saving({ goalId: GOAL2.id }));
+  const e1 = await d.store.saveTx(null, tx());
+  const gone = await d.store.saveTx(null, saving()); await d.store.deleteTx(gone);
+  const before = JSON.stringify(d.kv().tx);
+  d.tick(); await uiSaveSettings(d, { goals: [{ ...GOAL, target: 1 }, GOAL2], startBalance: 5 });   // same first goal
+  assert.equal(JSON.stringify(d.kv().tx), before, "operations not rewritten");
+  d.tick(); await uiSaveSettings(d, { goals: [GOAL2, { ...GOAL, target: 1 }] });   // reorder: the first goal changes
+  assert.deepEqual([d.find(s1).goalId, d.find(s2).goalId, "goalId" in d.find(e1)], [GOAL.id, GOAL2.id, false]);
+  assert.equal("goalId" in d.kv().tx[gone], false);
+  // the example's goals never pin anything
+  const x = await new Device().ready();
+  const real = await x.store.saveTx(null, saving());
+  await uiClearExamples(x);
+  assert.equal("goalId" in x.find(real), false);
+});
+
+test("v2 entries: the largest stamps the store adds (_ms with entry stamps and MAX_GONE tombstones) fit next to the largest document it accepts", async () => {
+  const wire = maxSettingsWire();
+  const msBytes = pgJsonBytes({ _ms: wire._ms }) - 2;
+  assert.ok(57000 + msBytes < 65536, `57 000 + ${msBytes} bytes of _ms must stay under the server's 65 536`);
+  const d = await new Device({ seed: null }).ready();
+  const pad = n => ({ ...DEFAULT_SETTINGS, notes: "x".repeat(n) });
+  await d.store.saveSettings(pad(56_900));
+  await rejects(d.store.saveSettings(pad(57_100)), "invalid");
+  // the store keeps exactly MAX_GONE tombstones per list (tests/helpers/max-settings.mjs measures that many)
+  for (let i = 0; i < MAX_GONE + 5; i++) { d.tick(); await d.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [{ ...GOAL, id: "g_t" + i }] }); }
+  d.tick(); await d.store.saveSettings(DEFAULT_SETTINGS);
+  assert.equal(Object.keys(d.kv().settings.items.goals.gone).length, MAX_GONE);
+});
+
 /* ── store-artifact.js (claude.ai artifact) ─────────────────────────────── */
 
 test("artifact store: goalId goes into the transaction document for savings only", async () => {
@@ -2019,4 +2310,50 @@ test("artifact store: goalId goes into the transaction document for savings only
   assert.equal("goalId" in body(e1), false);
   assert.equal("goalId" in body(s2), false);
   assert.equal(body("r1").goalId, "g_trip");
+});
+
+function artifactStore(initial = {}) {
+  const docs = new Map(Object.entries(initial).map(([k, v]) => [k, JSON.parse(JSON.stringify(v))]));
+  const subs = new Set();
+  const deliver = s => s.cb(s.col
+    ? { docs: [...docs.keys()].filter(p => p.startsWith(s.path + "/") && !p.slice(s.path.length + 1).includes("/")).map(p => ({ id: p.split("/").pop(), data: () => JSON.parse(JSON.stringify(docs.get(p))) })) }
+    : { exists: docs.has(s.path), data: () => JSON.parse(JSON.stringify(docs.get(s.path))) });
+  const notify = () => { for (const s of subs) setTimeout(() => deliver(s), 0); };
+  const ref = (path, col) => ({
+    id: path.split("/").pop(),
+    set: async body => { docs.set(path, JSON.parse(JSON.stringify(body))); notify(); },
+    delete: async () => { docs.delete(path); notify(); },
+    onSnapshot: cb => { const s = { path, col, cb }; subs.add(s); setTimeout(() => deliver(s), 0); },
+    collection: name => colRef(path + "/" + name),
+  });
+  let n = 0;
+  const colRef = path => ({ ...ref(path, true), doc: id => ref(path + "/" + (id || "auto" + ++n)) });
+  const holder = Object.create(globalThis);
+  holder.claude = { use: name => (name === "db" ? { doc: p => ref(p) } : { id: async () => "viewer1" }) };
+  loadScript(new URL("../src/store-artifact.js", import.meta.url).pathname, holder);
+  const store = holder.createBudgetStore();
+  const out = { store, docs, snap: null };
+  store.init(s => { out.snap = s; });
+  return out;
+}
+
+test("artifact store: deleting the first goal (also a v1 document's goal) keeps its savings without goalId with it", async () => {
+  const P = "data/users/viewer1/budget", T = id => P + "/tx/" + id;
+  const a = artifactStore({
+    [P]: { startBalance: 0, goal: GOAL_V1, limits: {} },                          // v1: goal = g_main
+    [T("s1")]: saving({ amount: 700 }), [T("s2")]: saving({ amount: 50, goalId: GOAL2.id }), [T("e1")]: tx(),
+    [T("x1")]: saving({ amount: 9, example: true }),
+  });
+  await waitFor(() => a.snap && a.snap.status === "ready", { what: "artifact ready" });
+  await a.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL_V1_AS_V2, GOAL2] });   // a goal added: g_main stays first
+  assert.equal("goalId" in a.docs.get(T("s1")), false);
+  await waitFor(() => Array.isArray(a.snap.settings.goals));
+  await a.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [GOAL2] });                  // «Убрать цель» g_main
+  assert.deepEqual(["s1", "s2", "e1", "x1"].map(id => a.docs.get(T(id)).goalId), ["g_main", GOAL2.id, undefined, undefined]);
+  assert.deepEqual(Object.keys(a.docs.get(P)).sort(), ["categories", "goals", "limits", "startBalance"], "no v1 goal written back");
+  // the example's goals pin nothing
+  const b = artifactStore({ [P]: { ...DEFAULT_SETTINGS, goals: [GOAL], example: { goals: true } }, [T("s1")]: saving() });
+  await waitFor(() => b.snap && b.snap.status === "ready", { what: "artifact ready" });
+  await b.store.saveSettings(DEFAULT_SETTINGS);
+  assert.equal("goalId" in b.docs.get(T("s1")), false);
 });

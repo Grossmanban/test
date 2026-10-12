@@ -361,22 +361,23 @@
     return info;
   }
   // info of list field k as one side holds it. raw: the stored / transmitted info (anything else: an older version's
-  // list, counted as a whole); fieldMs: the field's stamp; max: stamps above it are not trusted (a row's
-  // client_updated_ms, a backup's import time)
+  // list, counted as a whole); fieldMs: the field's stamp; max: later stamps count as max (a row's
+  // client_updated_ms, a backup's import time), like the field stamps
   function entriesOf(k, raw, list, fieldMs, example, max) {
     const ids = (Array.isArray(list) ? list : []).map(e => e && e.id).filter(id => entryId(k, id));
     const info = { since: 0, ms: {}, gone: {} };
     if (example) { for (const id of ids) info.ms[id] = 0; return info; }
-    const ok = v => finite(v) && v >= 0 && v <= (max == null ? MAX_DATE_MS : max);
+    const top = max == null ? MAX_DATE_MS : max;
+    const val = v => (finite(v) && v >= 0 ? Math.min(v, top) : -1);
     if (!isObj(raw) || !isObj(raw.ms) || !isObj(raw.gone)) {
       info.since = fieldMs;
       for (const id of ids) info.ms[id] = fieldMs;
       return info;
     }
-    info.since = ok(raw.since) ? raw.since : 0;
-    for (const id of ids) info.ms[id] = own(raw.ms, id) && ok(raw.ms[id]) ? raw.ms[id] : fieldMs;
+    info.since = Math.max(0, val(raw.since));
+    for (const id of ids) info.ms[id] = own(raw.ms, id) && val(raw.ms[id]) >= 0 ? val(raw.ms[id]) : fieldMs;
     const present = new Set(ids);
-    for (const id of Object.keys(raw.gone)) if (entryId(k, id) && !present.has(id) && ok(raw.gone[id])) info.gone[id] = raw.gone[id];
+    for (const id of Object.keys(raw.gone)) if (entryId(k, id) && !present.has(id) && val(raw.gone[id]) >= 0) info.gone[id] = val(raw.gone[id]);
     return pruneGone(info);
   }
   function entryInfo(rec) {
@@ -568,6 +569,21 @@
   // a stored record's goal (savings only): records from older versions have none (= the first goal)
   const goalIdOf = r => (r.type === "saving" && typeof r.goalId === "string" && GOAL_ID_RE.test(r.goalId) ? r.goalId : null);
   const liveRecord = r => isObj(r) && !r.deleted && TYPES.includes(r.type) && finite(r.amount) && r.amount > 0 && typeof r.date === "string";
+  // the user's first goal (not the example's): it owns the saving operations without goalId
+  const firstGoal = d => (isObj(d) && !exFlag(d, "goals") && Array.isArray(d.goals) && d.goals.length ? d.goals[0].id : null);
+  // Saving operations without goalId belong to the first goal. When that stops being the first goal (deleted, or
+  // another list joins in front of it), they get its id written down, so they stay with it (and come back with it
+  // on «Вернуть») instead of moving to whichever goal is first now. Returns how many records changed.
+  function pinSavings(st, goalId, t) {
+    let n = 0;
+    for (const id of Object.keys(st.tx)) {
+      const r = st.tx[id];
+      if (!liveRecord(r) || r.type !== "saving" || goalIdOf(r) || r.localOnly || r.example === true) continue;
+      st.tx[id] = Object.assign({}, r, { goalId, updatedMs: bumpMs(t, r), dirty: true });
+      n++;
+    }
+    return n;
+  }
 
   /* ── Supabase rows ⇄ local records ─────────── */
   function recToRow(r, uid) {
@@ -1357,6 +1373,9 @@
           } else {                                 // anonymous local use: keep everything and upload it
             for (const id in st.tx) if (!st.tx[id].localOnly) st.tx[id].dirty = true;
             const s = st.settings;
+            // this device's goals join the account's after them: its savings without goalId keep their goal
+            const first = s && !s.localOnly ? firstGoal(s.data) : null;
+            if (first) pinSavings(st, first, now());
             if (s && !s.localOnly) {
               // fields left at their defaults on a device that was not signed in never override the account's values
               const ms = fieldStamps(s);
@@ -1880,12 +1899,16 @@
         const data = settingsData(next, true);
         await boot();
         const t = now();
-        await commit(["settings"], st => {
+        // the operations are rewritten only when the first goal changes (see pinSavings)
+        const before = S.settings ? firstGoal(S.settings.data) : null;
+        await commit(before && firstGoal(data) !== before ? ["settings", "tx"] : ["settings"], st => {
           const prev = st.settings;
           // the example settings stay device-only until the user enters a value of their own
           const keepLocal = !!(prev && prev.localOnly) && onlyExampleOrDefault(data);
           const updatedMs = bumpMs(t, prev);
           st.settings = { data, fieldMs: stampFields(prev, data, updatedMs), items: stampEntries(prev, data, updatedMs), updatedMs, dirty: !keepLocal, localOnly: keepLocal };
+          const was = prev ? firstGoal(prev.data) : null;
+          if (was && firstGoal(data) !== was && st.tx) pinSavings(st, was, t);
         });
         afterWrite();
       },

@@ -4,7 +4,8 @@
 // check the same document against the size limit.
 //
 //   node tests/helpers/max-settings.mjs   → prints { doc, wire, wireBytes } as JSON
-//   (wire = doc plus the _ms field stamps the store adds when it pushes; wireBytes = octet_length(wire::jsonb::text))
+//   (wire = doc plus the largest _ms the store adds when it pushes: field stamps, entry stamps, tombstones;
+//    wireBytes = octet_length(wire::jsonb::text))
 import { pgJsonBytes } from "./fake-supabase.mjs";
 
 const ID = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -34,8 +35,19 @@ export function maxSettings() {
     example: { startBalance: true, goals: true, limits: true, categories: true },
   };
 }
+// the most tombstones the store keeps per list (MAX_GONE in src/store-pwa.js)
+export const MAX_GONE = 30;
+// _ms as the store pushes it at its largest: field stamps, a stamp for every goal and category, MAX_GONE tombstones
+// per list with ids at their length cap
 export function maxSettingsWire(at = TS) {
-  return { ...maxSettings(), _ms: { startBalance: at, goals: at, limits: at, categories: at, at } };
+  const doc = maxSettings();
+  const gone = (prefix, len) => Object.fromEntries(Array.from({ length: MAX_GONE }, (_, i) =>
+    [prefix + String(i).padStart(2, "0") + pick(i + 50, len - prefix.length - 2), at]));
+  const items = {
+    goals: { since: at, ms: Object.fromEntries(doc.goals.map(g => [g.id, at])), gone: gone("g_z", 32) },
+    categories: { since: at, ms: Object.fromEntries(doc.categories.map(c => [c.id, at])), gone: gone("c_z", 22) },
+  };
+  return { ...doc, _ms: { startBalance: at, goals: at, limits: at, categories: at, at, items } };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
