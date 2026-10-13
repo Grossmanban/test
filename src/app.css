@@ -48,7 +48,7 @@
     --surface-2: #18231f;
     --ink: #e5eeea;
     --ink-2: #a3b2ac;
-    --muted: #7b8a84;
+    --muted: #808f89;
     --line: #22302b;
     --line-strong: #31413a;
     --field-line: #64776e;
@@ -81,7 +81,7 @@
   --surface-2: #18231f;
   --ink: #e5eeea;
   --ink-2: #a3b2ac;
-  --muted: #7b8a84;
+  --muted: #808f89;
   --line: #22302b;
   --line-strong: #31413a;
   --field-line: #64776e;
@@ -466,7 +466,8 @@ dialog::backdrop { background: rgba(5, 14, 11, 0.5); }
 .seg-2 { grid-template-columns: 1fr 1fr; }
 .seg-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .seg-4 span { padding: 0 4px; font-size: 13.5px; }
-@media (max-width: 430px) { .seg-4 span .ic { display: none; } .seg-4 span { font-size: 13px; } }
+@media (max-width: 430px) { .seg-4 span .ic { display: none; } .seg-wide.seg-4 span { font-size: 13px; } }
+@media (max-width: 340px) { .seg-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .seg-wide label { position: relative; }
 .seg-wide span {
   display: flex; align-items: center; justify-content: center; gap: 6px; height: 38px; border-radius: 9px;
@@ -589,7 +590,8 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .plan-card .card-head { margin-bottom: 0; }
 .plan-card .status { margin-bottom: 0; }
 .plan-lead { margin: 0; color: var(--ink-2); font-size: 14px; max-width: 70ch; }
-.plan-line { margin: 0; font-size: 14px; }
+.plan-need { margin: 0; font-size: 14px; color: var(--ink-2); }
+.plan-need b { color: var(--ink); }
 .plan-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 0; }
 .plan-stats div { min-width: 0; padding: 12px; border-radius: 14px; background: var(--surface-2); }
 .plan-stats dt { font-size: 12px; color: var(--muted); font-weight: 600; }
@@ -851,3 +853,8 @@ select.input { -webkit-appearance: none; appearance: none; background-image: non
   #typeFilter button { padding: 0 4px; font-size: 13px; min-width: 44px; }
 }
 @media (pointer: coarse) and (min-width: 641px) { .viewtabs button { height: 44px; } }
+/* v3 review: accounts manager names wrap, inline links are finger-sized, toasts clear landscape sheet footers */
+#accsBody .cats-name b { white-space: normal; overflow-wrap: anywhere; }
+.goal-more .link-btn { white-space: nowrap; }
+@media (pointer: coarse) { .link-btn { padding: 13px 2px; margin: -13px -2px; } }
+@media (min-width: 641px) and (max-height: 500px) { dialog .toast { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); } }

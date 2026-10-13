@@ -51,7 +51,7 @@
     if (typeof d.account === "string" && ID.test(d.account)) out.account = d.account;
     if (d.type === "transfer" && typeof d.toAccount === "string" && ID.test(d.toAccount) && d.toAccount !== out.account) out.toAccount = d.toAccount;
     const p = d.plan;
-    if (d.type === "expense" && p && typeof p.id === "string" && ID.test(p.id) && Number.isInteger(p.n) && Number.isInteger(p.of) && p.n >= 1 && p.n <= p.of && p.of <= 36) out.plan = { id: p.id, n: p.n, of: p.of };
+    if (d.type === "expense" && p && typeof p.id === "string" && ID.test(p.id) && Number.isInteger(p.n) && Number.isInteger(p.of) && p.n >= 1 && p.n <= p.of && p.of >= 2 && p.of <= 36) out.plan = { id: p.id, n: p.n, of: p.of };
     if (d.example === true) out.example = true;
     return out;
   }

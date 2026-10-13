@@ -82,6 +82,25 @@
   };
   const ACCOUNT_ICONS = ["Landmark", "Building2", "Banknote", "Coins", "Wallet", "WalletCards", "CreditCard", "Smartphone",
     "PiggyBank", "HandCoins", "Briefcase", "Vault", "Gem", "ShieldCheck", "Heart", "Star"];
+  // names the icon pickers read to VoiceOver
+  const ICON_RU = {
+    ShoppingBag: "Пакет с покупками", Store: "Магазин", Utensils: "Вилка и нож", Pizza: "Пицца", Coffee: "Кофе",
+    Beer: "Пиво", Wine: "Вино", Cake: "Торт", Apple: "Яблоко", Milk: "Молоко", House: "Дом", Building2: "Здание",
+    Sofa: "Диван", Lamp: "Лампа", Hammer: "Молоток", Wrench: "Гаечный ключ", Plug: "Вилка розетки", Droplets: "Вода",
+    Flame: "Огонь", Zap: "Молния", Car: "Машина", Fuel: "Заправка", Bus: "Автобус", Train: "Поезд", Bike: "Велосипед",
+    CarTaxiFront: "Такси", Plane: "Самолёт", Luggage: "Чемодан", Hotel: "Отель", Ship: "Корабль", HeartPulse: "Пульс",
+    Pill: "Таблетка", Stethoscope: "Стетоскоп", Syringe: "Шприц", Glasses: "Очки", Baby: "Малыш", School: "Школа",
+    GraduationCap: "Шапка выпускника", BookOpen: "Книга", Puzzle: "Пазл", PawPrint: "Лапа", Dog: "Собака",
+    Cat: "Кошка", Dumbbell: "Гантель", Trophy: "Кубок", Music: "Музыка", Gamepad2: "Геймпад", Film: "Кино",
+    Ticket: "Билет", Camera: "Фотоаппарат", Palette: "Палитра", Scissors: "Ножницы", Sparkles: "Блёстки",
+    Shirt: "Футболка", Watch: "Часы", Gem: "Бриллиант", Gift: "Подарок", HandHeart: "Рука с сердцем", Church: "Храм",
+    Flower2: "Цветок", Smartphone: "Телефон", Laptop: "Ноутбук", Tv: "Телевизор", Wifi: "Wi-Fi",
+    Headphones: "Наушники", CreditCard: "Карта", Landmark: "Банк", Coins: "Монеты", Banknote: "Купюры",
+    HandCoins: "Деньги в руке", Briefcase: "Портфель", Calculator: "Калькулятор", ReceiptText: "Чек",
+    Percent: "Процент", Tag: "Ярлык", Package: "Посылка", Truck: "Грузовик", Leaf: "Лист", Sun: "Солнце",
+    Star: "Звезда", Target: "Мишень", ShieldCheck: "Щит", Umbrella: "Зонт", TreePalm: "Пальма", Heart: "Сердце",
+    PiggyBank: "Копилка", Rocket: "Ракета", Wallet: "Кошелёк", WalletCards: "Карты", Vault: "Сейф",
+  };
 
   // a category record by id, built-in or the user's own (archived ones still resolve for old operations)
   function findCat(id) {
@@ -281,10 +300,12 @@
       && typeof t.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(t.date);
   }
   const sgn = t => t.type === "income" ? 1 : t.type === "transfer" ? 0 : -1;
-  // the account an operation touches (its source for a transfer); unknown or missing ids fall back to the default
+  // the account an operation touches (its source for a transfer). Operations written before the first real account
+  // stay on the implicit "a_main" while it exists, so changing the main account only affects new operations.
   function accountIdOf(t) {
     const st = settings();
-    return t.account && st.accounts.some(a => a.id === t.account) ? t.account : st.defaultAccount;
+    if (t.account && st.accounts.some(a => a.id === t.account)) return t.account;
+    return st.accounts.some(a => a.id === "a_main") ? "a_main" : st.defaultAccount;
   }
   const findAccount = id => settings().accounts.find(a => a.id === id) || null;
   const activeAccounts = () => settings().accounts.filter(a => !a.archived);
@@ -497,7 +518,8 @@
     const isCur = ym === CUR_YM;
     const dayCut = isCur ? Number(TODAY.slice(8, 10)) : 31;
     const st = monthStats(ym);
-    const prev = monthStats(prevYm, isCur ? dayCut : 31);
+    // the change compares the same days of both months (the current month may already hold planned split parts)
+    const prev = monthStats(prevYm, isCur ? dayCut : 31), cur = isCur ? monthStats(ym, dayCut) : st;
     const cmp = isCur ? `к${NB}1–\u2060${Math.min(dayCut, daysIn(prevYm))}${NB}${M_GEN[pm - 1]}` : `к${NB}${M_DAT[pm - 1]}`;
     const v = x => ready ? x : "—";
     const rate = st.inc > 0 ? Math.round(st.sav / st.inc * 100) : null;
@@ -505,12 +527,12 @@
       <div class="kpi">
         <div class="kpi-label"><span class="kpi-dot bg-income">${icon("ArrowDownLeft")}</span>Доходы</div>
         <div class="kpi-value">${v(money(st.inc))}</div>
-        <div class="kpi-sub">${ready ? deltaHtml(st.inc, prev.inc, true, cmp) : "&nbsp;"}</div>
+        <div class="kpi-sub">${ready ? deltaHtml(cur.inc, prev.inc, true, cmp) : "&nbsp;"}</div>
       </div>
       <div class="kpi">
         <div class="kpi-label"><span class="kpi-dot bg-expense">${icon("ArrowUpRight")}</span>Расходы</div>
         <div class="kpi-value">${v(money(st.exp))}</div>
-        <div class="kpi-sub">${ready ? deltaHtml(st.exp, prev.exp, false, cmp) : "&nbsp;"}</div>
+        <div class="kpi-sub">${ready ? deltaHtml(cur.exp, prev.exp, false, cmp) : "&nbsp;"}</div>
       </div>
       <div class="kpi">
         <div class="kpi-label"><span class="kpi-dot bg-saving">${icon("PiggyBank")}</span>В копилку</div>
@@ -541,12 +563,13 @@
       next: here > TODAY ? here : billingDate(card, shiftYm(CUR_YM, 1)),
     };
   }
-  // what the bank should pay on a billing date: the card debt the day before it, less what was paid since
+  // what the bank should pay on a billing date: the card debt the day before it. A payment recorded on or after the
+  // billing date settles that bill (the issuer's cut-off may differ); whatever it did not cover stays as card debt
+  // and comes back with the next bill.
   function cardDue(card, billIso) {
     const owed = -(accountBalances(dayBefore(billIso)).get(card.id) || 0);
-    let paid = 0;
-    for (const t of S.tx) if (t.type === "transfer" && t.toAccount === card.id && t.date >= billIso && t.date <= TODAY) paid += t.amount;
-    return r2(Math.max(0, owed - paid));
+    for (const t of S.tx) if (t.type === "transfer" && t.toAccount === card.id && t.date >= billIso && t.date <= TODAY) return 0;
+    return r2(Math.max(0, owed));
   }
   // future installments of split purchases still to come on a card
   function cardFuture(card) {
@@ -557,7 +580,7 @@
   // cards whose last bill has not been paid yet (shown as a prompt to record the bank → card transfer)
   function cardsDue() {
     const out = [];
-    for (const card of activeAccounts().filter(a => a.kind === "card")) {
+    for (const card of settings().accounts.filter(a => a.kind === "card")) {
       const { last } = cardDates(card);
       if (card.createdAt && last < isoOf(new Date(card.createdAt))) continue;
       const due = cardDue(card, last);
@@ -576,9 +599,11 @@
     const el = $("#accCard");
     if (!el) return;
     if (S.status !== "ready") { el.innerHTML = `<div class="skeleton"></div>`; return; }
-    const st = settings(), accs = activeAccounts(), bal = accountBalances(TODAY);
-    const money0 = accs.filter(a => a.kind !== "card").reduce((sum, a) => sum + bal.get(a.id), 0);
-    const debt = accs.filter(a => a.kind === "card").reduce((sum, a) => sum - bal.get(a.id), 0);
+    const st = settings(), bal = accountBalances(TODAY);
+    // hidden accounts still count while they hold money (or a card debt), so the rows add up to the totals
+    const accs = st.accounts.filter(a => !a.archived || Math.abs(bal.get(a.id)) > 0.004);
+    const money0 = st.accounts.filter(a => a.kind !== "card").reduce((sum, a) => sum + bal.get(a.id), 0);
+    const debt = st.accounts.filter(a => a.kind === "card").reduce((sum, a) => sum - bal.get(a.id), 0);
     const canEdit = !S.readOnly;
     const single = accs.length === 1 && accs[0].virtual;
     const dues = cardsDue();
@@ -593,8 +618,8 @@
       </div>
       ${dues.map(d => {
         const [, m, dd] = dParts(d.date);
-        return `<div class="status is-warn acc-due">${icon("CalendarClock")}<span>Списание по карте <b>${esc(d.card.name)}</b> ${dd}${NB}${M_GEN[m - 1]}: <b>${money(d.due)}</b></span>
-          <button class="btn btn-sm btn-primary" data-pay-card="${esc(d.card.id)}" ${canEdit ? "" : "disabled"}>Провести</button></div>`;
+        return `<div class="status is-warn acc-due">${icon("CalendarClock")}<span>Списание по карте <b>«${esc(d.card.name)}»</b> ${dd}${NB}${M_GEN[m - 1]}: <b>${money(d.due)}</b></span>
+          <button class="btn btn-sm btn-primary" data-pay-card="${esc(d.card.id)}" aria-label="Провести списание по карте «${esc(d.card.name)}»: ${money(d.due)}" ${canEdit ? "" : "disabled"}>Провести</button></div>`;
       }).join("")}
       <div class="acc-list">
         ${accs.map(a => {
@@ -602,7 +627,7 @@
           const neg = a.kind === "card" ? b < -0.004 : b < -0.004;
           return `<div class="acc-row">
             <span class="tx-ic ${a.kind === "card" ? "bg-card" : "bg-acc"}">${icon(a.icon)}</span>
-            <span class="acc-name"><b>${esc(a.name)}</b><small>${esc(accountMeta(a, b))}</small></span>
+            <span class="acc-name"><b>${esc(a.name)}</b><small>${a.archived ? "скрыт · " : ""}${esc(accountMeta(a, b))}</small></span>
             <span class="acc-bal num ${neg ? (a.kind === "card" ? "t-ink2" : "t-bad") : ""}">${a.kind === "card" ? (b < -0.004 ? `долг ${money(-b)}` : money(b)) : money(b)}</span>
           </div>`;
         }).join("")}
@@ -681,9 +706,10 @@
     let mLeft = null, perMonth = null, need = null, overdue = false;
     if (g.deadline) {
       mLeft = monthsBetween(CUR_YM, g.deadline);
-      if (left > 0 && mLeft > 0) {
+      const months = mLeft > 0 ? mLeft : g.deadline >= TODAY ? 1 : 0;   // a deadline later this month: this month
+      if (left > 0 && months > 0) {
         const leftAtStart = r2(Math.max(0, g.target - (saved - thisMonth)));
-        perMonth = Math.ceil(leftAtStart / mLeft / 10) * 10;      // rounded up to 10 ₪
+        perMonth = Math.ceil(leftAtStart / months / 10) * 10;     // rounded up to 10 ₪
         need = r2(perMonth - thisMonth);
       } else if (left > 0) overdue = true;
     }
@@ -712,7 +738,7 @@
     let deadlineHtml = "без срока";
     if (g.deadline) {
       const [dy, dm, dd] = dParts(g.deadline);
-      deadlineHtml = `${dd}${NB}${M_GEN[dm - 1]} ${dy}<small>${st.mLeft > 0 ? `осталось ${st.mLeft}${NB}мес.` : "срок наступил"}</small>`;
+      deadlineHtml = `${dd}${NB}${M_GEN[dm - 1]} ${dy}<small>${st.mLeft > 0 ? `осталось ${st.mLeft}${NB}мес.` : g.deadline >= TODAY ? "в этом месяце" : "срок наступил"}</small>`;
     }
     return `<article class="card goal-card${st.done ? " is-done" : ""}" aria-label="Цель «${esc(g.name)}»">
       <div class="goal-top">
@@ -736,7 +762,7 @@
         if (st.done) return "";
         const pace = goalPace(g, goals);
         if (!(pace > 0)) return "";
-        const when = reachMonth(st.left, pace);
+        const when = reachMonth(st.left, pace, st.thisMonth);
         return `<p class="goal-pace">${icon("TrendingUp")}В текущем темпе (≈${NB}${money(pace)} в месяц) накопите к ${monthLabelDat(when)}.</p>`;
       })()}
       ${st.done ? "" : `<button class="btn btn-gold" data-goal-add="${esc(g.id)}" ${canEdit ? "" : "disabled"}>${icon("PiggyBank")}Отложить</button>`}
@@ -772,7 +798,7 @@
           </button>`;
         }).join("")}
       </div>
-      ${(() => { const P = savingsPlan(); return P.need > 0 ? `<p class="hint goal-more">${icon("Lightbulb")}Чтобы успеть к срокам, откладывайте ≈${NB}${money(P.need)} в месяц${P.cf && P.need > P.spare ? `: это больше, чем остаётся свободным. <button type="button" class="link-btn" data-do="goals-view">Что делать</button>` : "."}</p>` : ""; })()}
+      ${(() => { const P = savingsPlan(); return P.need > 0 ? `<p class="hint goal-more">${icon("Lightbulb")}<span>Чтобы успеть к срокам, откладывайте ≈${NB}${money(P.need)} в месяц${P.cf && P.need > P.spare ? `: это больше, чем остаётся свободным. <button type="button" class="link-btn" data-do="goals-view">Что делать</button>` : "."}</span></p>` : ""; })()}
       ${goals.length > shown.length ? `<p class="hint goal-more">И ещё ${goals.length - shown.length} ${plural(goals.length - shown.length, ["цель", "цели", "целей"])} на вкладке «Цели».</p>` : ""}
       <button class="btn btn-gold" data-do="saving" ${canEdit ? "" : "disabled"}>${icon("PiggyBank")}Отложить в копилку</button>`;
   }
@@ -780,29 +806,32 @@
   const DISCRETIONARY = new Set(["cafe", "fun", "clothes", "beauty", "travel", "gifts", "sport", "other"]);
   // averages over the last (up to) three complete months that have any income
   function cashflow() {
+    // tracking starts with the first operation; that month is usually partial, so it counts only with income in it
+    const firstYm = ymOf(S.tx.reduce((m, t) => (t.date < m ? t.date : m), TODAY));
     const months = [];
     for (let k = 1; k <= 3; k++) {
       const ym = shiftYm(CUR_YM, -k), st = monthStats(ym);
-      if (st.inc > 0) months.push({ ym, st });
+      if (ym > firstYm || (ym === firstYm && st.inc > 0)) months.push({ ym, st });
     }
-    if (!months.length) return null;
+    if (!months.length || !months.some(m => m.st.inc > 0)) return null;
     const avg = f => r2(months.reduce((sum, m) => sum + f(m.st), 0) / months.length);
     const byCat = {};
     for (const m of months) for (const [c, v] of Object.entries(m.st.byCat)) byCat[c] = (byCat[c] || 0) + v.sum / months.length;
-    return { n: months.length, inc: avg(s => s.inc), exp: avg(s => s.exp), sav: avg(s => s.sav), byCat };
+    return { n: months.length, months: months.map(m => m.ym), inc: avg(s => s.inc), exp: avg(s => s.exp), sav: avg(s => s.sav), byCat };
   }
   // average monthly saving into one goal over the same months (the current pace)
   function goalPace(g, goals) {
-    let sum = 0, n = 0;
-    for (let k = 1; k <= 3; k++) { const ym = shiftYm(CUR_YM, -k); if (monthStats(ym).inc > 0) { sum += goalSavedInMonth(g, ym, goals); n++; } }
-    return n ? r2(sum / n) : 0;
+    const cf = cashflow();
+    return cf ? r2(cf.months.reduce((sum, ym) => sum + goalSavedInMonth(g, ym, goals), 0) / cf.n) : 0;
   }
   function monthLabel(ym) { const [y, m] = ymParts(ym); return `${M_NOM[m - 1].toLowerCase()} ${y}`; }
   function monthLabelDat(ym) { const [y, m] = ymParts(ym); return `${M_DAT[m - 1]} ${y}`; }   // «к февралю 2027»
-  // the month a goal is reached when `perMonth` goes in from this month on
-  function reachMonth(left, perMonth) {
+  // the month a goal is reached when `perMonth` goes in every month from this one on (this month only tops up
+  // what was already put aside in it)
+  function reachMonth(left, perMonth, thisMonth = 0) {
     if (!(perMonth > 0)) return null;
-    return shiftYm(CUR_YM, Math.max(0, Math.ceil(left / perMonth) - 1));
+    const extra = Math.max(0, perMonth - thisMonth);
+    return left <= extra ? CUR_YM : shiftYm(CUR_YM, Math.ceil((left - extra) / perMonth));
   }
   function savingsPlan() {
     const goals = settings().goals, cf = cashflow();
@@ -818,12 +847,12 @@
     const rows = [];
     if (!cf) {
       rows.push(`<p class="plan-lead">Добавьте доходы и расходы хотя бы за один полный месяц, и я посчитаю, сколько реально откладывать без ущерба для бюджета.</p>`);
-      if (P.need > 0) rows.push(`<p class="plan-line">Чтобы успеть к срокам ваших целей, нужно откладывать <b>${money(P.need)}</b> в месяц.</p>`);
+      if (P.need > 0) rows.push(`<p class="plan-need">Чтобы успеть к срокам ваших целей, нужно откладывать <b>${money(P.need)}</b> в месяц.</p>`);
     } else {
       const pct = cf.inc > 0 ? Math.round(P.need / cf.inc * 100) : 0;
       rows.push(`<dl class="plan-stats">
           <div><dt>Свободно в среднем</dt><dd>${money(Math.max(0, P.spare))}<small>доход ${money(cf.inc)} − расходы ${money(cf.exp)}</small></dd></div>
-          <div><dt>Нужно для целей в срок</dt><dd>${P.need > 0 ? money(P.need) : "—"}<small>${P.need > 0 ? `${pct}% дохода` : "у целей нет срока"}</small></dd></div>
+          <div><dt>Нужно для целей в срок</dt><dd>${P.need > 0 ? money(P.need) : "—"}<small>${P.need > 0 ? `${pct}% дохода` : (!P.goals.length ? "целей пока нет" : P.open.some(x => x.st.overdue) ? "срок прошёл: обновите дату" : !P.open.length ? "все цели достигнуты" : "у целей нет срока")}</small></dd></div>
           <div><dt>Ориентир 50/30/20</dt><dd>${money(Math.round(cf.inc * 0.2 / 10) * 10)}<small>20% дохода в месяц</small></dd></div>
         </dl>`);
       if (P.spare <= 0) {
@@ -834,7 +863,7 @@
         rows.push(`<div class="status is-warn">${icon("TriangleAlert")}<span>На все сроки не хватает <b>${money(gap)}</b> в месяц. Варианты:</span></div>`);
         const moves = P.dated.map(x => {
           const per = Math.floor(x.st.perMonth * k / 10) * 10;
-          const when = reachMonth(x.st.left, per);
+          const when = reachMonth(x.st.left, per, x.st.thisMonth);
           return when ? `<li>«${esc(x.g.name)}»: откладывать ${money(per)} в месяц и перенести срок на <b>${monthLabel(when)}</b></li>` : "";
         }).join("");
         const cuts = Object.entries(cf.byCat)
@@ -850,7 +879,7 @@
       if (P.free.length && rest > 0) {
         const per = Math.floor(rest / 2 / P.free.length / 10) * 10;
         if (per > 0) rows.push(`<ul class="plan-list">${P.free.map(x => {
-          const when = reachMonth(x.st.left, per);
+          const when = reachMonth(x.st.left, per, x.st.thisMonth);
           return `<li>«${esc(x.g.name)}» без срока: при ${money(per)} в месяц накопите к <b>${monthLabelDat(when)}</b></li>`;
         }).join("")}</ul>`);
       }
@@ -989,6 +1018,9 @@
     renderGoal();
     renderGoalsView();
     renderLedger(d);
+    // open managers follow every change, including «Вернуть» and edits from another device
+    const ad = document.getElementById("accsDlg"); if (ad && ad.open) renderAccountsManager();
+    const cd = document.getElementById("catsDlg"); if (cd && cd.open) renderCatsManager();
     if (lastSnap) for (const cb of snapListeners) { try { cb(lastSnap); } catch (e) { console.error(e); } }
   }
 
@@ -1150,7 +1182,9 @@
   const accChip = (name, a, sel) =>
     `<label class="chip-opt"><input type="radio" name="${name}" value="${esc(a.id)}" ${a.id === sel ? "checked" : ""}><span>${icon(a.icon)}${esc(a.name)}</span></label>`;
   function renderAccChips(type, sel, toSel) {
-    const accs = activeAccounts();
+    // hidden accounts stay selectable for the operation being edited (and a preset destination such as a hidden card's bill)
+    const keep = editing ? [accountIdOf(editing), editing.toAccount] : [toSel];
+    const accs = settings().accounts.filter(a => !a.archived || keep.includes(a.id));
     const field = $("#accField"), toField = $("#toField");
     const single = accs.length < 2;
     if (type === "transfer") {
@@ -1164,7 +1198,7 @@
       }
       // money usually moves out of the bank, cash or a wallet; a card is a source only when chosen explicitly
       const selAcc = accs.find(a => a.id === sel);
-      const from = selAcc && (selAcc.kind !== "card" || !accTouched) ? sel : settings().defaultAccount;
+      const from = selAcc && (selAcc.kind !== "card" || accTouched) ? sel : settings().defaultAccount;
       const to = accs.some(a => a.id === toSel && a.id !== from) ? toSel : (accs.find(a => a.id !== from && a.kind === "cash") || accs.find(a => a.id !== from)).id;
       $("#accChips").innerHTML = accs.map(a => accChip("account", a, from)).join("");
       $("#toChips").innerHTML = accs.map(a => accChip("toAccount", a, to)).join("");
@@ -1201,7 +1235,7 @@
       const date = $("#txDate").value || TODAY;
       const months = Array.from({ length: Math.min(n, 3) }, (_, k) => M_NOM[dParts(addMonths(date, k))[1] - 1].toLowerCase());
       $("#splitHint").textContent = total > 0
-        ? `${n} ${plural(n, ["платёж", "платежа", "платежей"])} по ${money(Math.floor(total * 100 / n) / 100)}: ${months.join(", ")}${n > 3 ? "…" : ""}. Каждый попадёт в бюджет своего месяца.`
+        ? `${n} ${plural(n, ["платёж", "платежа", "платежей"])} по ${money(Math.floor(Math.round(total * 100) / n) / 100)}: ${months.join(", ")}${n > 3 ? "…" : ""}. Каждый попадёт в бюджет своего месяца.`
         : `${n} ${plural(n, ["платёж", "платежа", "платежей"])}: каждый попадёт в бюджет своего месяца.`;
     }
   }
@@ -1241,11 +1275,14 @@
       const cur = $('#txForm input[name="category"]:checked');
       const acc = $('#txForm input[name="account"]:checked');
       renderCatChips(e.target.value, cur ? cur.value : null);
-      renderAccChips(e.target.value, acc ? acc.value : null);
+      const nc = $('#txForm input[name="category"]:checked');
+      renderAccChips(e.target.value, accTouched && acc ? acc.value : (nc && rememberedAccount(nc.value)) || null);
       if (!editing) $("#txDlgTitle").textContent = TX_TITLES[e.target.value];
     } else if (name === "category" && !accTouched) {
-      const remembered = rememberedAccount(e.target.value);
-      if (remembered && $(`#txForm input[name="account"][value="${CSS.escape(remembered)}"]`)) $(`#txForm input[name="account"][value="${CSS.escape(remembered)}"]`).checked = true;
+      // the account remembered for this category, otherwise the main one
+      const want = rememberedAccount(e.target.value) || settings().defaultAccount;
+      const r = $(`#txForm input[name="account"][value="${CSS.escape(want)}"]`);
+      if (r) r.checked = true;
     } else if (name === "account") {
       accTouched = true;
       // a transfer cannot go to the account it comes from
@@ -1276,6 +1313,7 @@
       if (toEl.value === account) { fail("Выберите разные счета: откуда и куда."); return; }
     }
     const splitN = type === "expense" && !(editing && editing.plan) && $("#splitOn").checked && !$("#splitField").hidden ? Number($("#splitN").value) : 0;
+    if (splitN >= 2 && Math.round(amount * 100) < splitN) { fail(`Сумму меньше ${splitN} агорот не разбить на ${splitN} платежей.`); return; }
     const base = {
       type, date,
       category: type === "saving" ? "savings" : type === "transfer" ? "transfer" : (catEl ? catEl.value : "other"),
@@ -1296,9 +1334,9 @@
       if (splitN >= 2) {
         // split purchase: N parts on the card, one per month, the last part takes the rounding remainder
         const planId = mintId("p_");
-        const part = Math.floor(amount * 100 / splitN) / 100;
+        const cents = Math.round(amount * 100), partC = Math.floor(cents / splitN);
         for (let k = 0; k < splitN; k++) {
-          const amt = k === splitN - 1 ? r2(amount - part * (splitN - 1)) : part;
+          const amt = (k === splitN - 1 ? cents - partC * (splitN - 1) : partC) / 100;
           const data = { ...base, amount: amt, date: addMonths(date, k), plan: { id: planId, n: k + 1, of: splitN }, createdAt: base.createdAt + k };
           await store.saveTx(k === 0 && editing ? editing.id : null, data);
         }
@@ -1356,7 +1394,7 @@
   let editingGoal = null;
   function iconGrid(el, name, icons, selected) {
     el.innerHTML = icons.map(n =>
-      `<label class="icon-opt" title=""><input type="radio" name="${name}" value="${n}" ${n === selected ? "checked" : ""} aria-label="${n}"><span>${icon(n)}</span></label>`).join("");
+      `<label class="icon-opt" title=""><input type="radio" name="${name}" value="${n}" ${n === selected ? "checked" : ""} aria-label="${esc(ICON_RU[n] || n)}"><span>${icon(n)}</span></label>`).join("");
   }
   function openGoal(id, preset = {}) {
     if (S.status !== "ready" || S.readOnly) return;
@@ -1470,7 +1508,7 @@
     catDlg.close();
     try {
       await saveSettings({ categories: next });
-      toast(used ? `Категория «${gone.name}» скрыта` : `Категория «${gone.name}» удалена`, { label: "Вернуть", run: () => saveSettings({ categories: restoreEntry(settings().categories, prev, gone.id) }).catch(e => toast(errText(e))) });
+      toast(used ? `Категория «${gone.name}» скрыта` : `Категория «${gone.name}» удалена`, { label: "Вернуть", run: () => saveSettings({ categories: restoreEntry(settings().categories, prev, gone.id) }).then(() => toast(`Категория «${gone.name}» возвращена`)).catch(e => toast(errText(e))) });
       if (catsDlg.open) renderCatsManager();
     } catch (ex) { toast(errText(ex)); }
   });
@@ -1562,6 +1600,7 @@
     const isCard = kind === "card";
     $("#accCardFields").hidden = !isCard;
     $("#accSignRow").hidden = isCard;
+    $("#aDefaultRow").hidden = isCard;   // a card is never the main account
     $("#aOpeningLabel").textContent = isCard ? "Долг по карте на начало учёта" : "Остаток на начало учёта";
     $("#aOpeningHint").textContent = isCard
       ? "Сколько уже потрачено по карте и ещё не списано с банка. Если записываете с чистого листа, оставьте 0."
@@ -1598,7 +1637,6 @@
     $("#aBilling").value = String(a && a.billingDay || 10);
     $("#aLimit").value = a && a.creditLimit ? inputAmount(a.creditLimit) : "";
     $("#aDefault").checked = a ? st.defaultAccount === a.id : false;
-    $("#aDefaultRow").hidden = false;
     accKindChanged();
     const used = a ? accUsage(a.id) : 0;
     $("#accRemove").hidden = !a || st.accounts.filter(x => !x.archived).length < 2;
@@ -1631,16 +1669,20 @@
       const lim = parseAmount($("#aLimit").value);
       if (lim && !Number.isNaN(lim) && lim > 0) acc.creditLimit = lim; else delete acc.creditLimit;
     } else { delete acc.billingDay; delete acc.payFrom; delete acc.creditLimit; }
-    const list = settings().accounts.map(a => ({ ...a }));
+    let list = settings().accounts.map(a => ({ ...a }));
+    // the first own account replaces the implicit, empty and unused «Основной счёт» (e.g. right after «Удалить пример»)
+    const phantom = !editingAcc && kind !== "card" && !txDlg.open && list.length === 1 && list[0].virtual && !list[0].opening && accUsage(list[0].id) === 0;
+    if (phantom) list = [];
     const next = editingAcc ? list.map(a => a.id === acc.id ? acc : a) : [...list, acc];
-    let def = settings().defaultAccount;
+    let def = phantom ? acc.id : settings().defaultAccount;
     if ($("#aDefault").checked && kind !== "card") def = acc.id;
+    else if (!$("#aDefault").checked && editingAcc && def === acc.id) def = (next.find(x => x.id !== acc.id && x.kind !== "card" && !x.archived) || { id: def }).id;
     if (def === acc.id && kind === "card") def = (next.find(a => a.kind !== "card" && !a.archived) || next[0]).id;
     try {
       await saveSettings({ accounts: next, defaultAccount: def });
       accDlg.close();
       toast(editingAcc ? "Счёт сохранён" : `Счёт «${name}» добавлен`);
-      if (accsDlg.open) renderAccountsManager();
+      if (accsDlg.open) { renderAccountsManager(); ($(`#accsBody [data-acc-edit="${CSS.escape(acc.id)}"]`) || $("#accsAdd")).focus(); }
       if (txDlg.open) { const type = $('#txForm input[name="type"]:checked').value; renderAccChips(type, type === "transfer" ? null : acc.id); renderSplit(); }
     } catch (ex) { fail(errText(ex)); }
   });
@@ -1654,8 +1696,8 @@
     accDlg.close();
     try {
       await saveSettings({ accounts: next, defaultAccount: def });
-      toast(used ? `Счёт «${gone.name}» скрыт` : `Счёт «${gone.name}» удалён`, { label: "Вернуть", run: () => saveSettings({ accounts: restoreEntry(settings().accounts, prev, gone.id) }).catch(e => toast(errText(e))) });
-      if (accsDlg.open) renderAccountsManager();
+      toast(used ? `Счёт «${gone.name}» скрыт` : `Счёт «${gone.name}» удалён`, { label: "Вернуть", run: () => saveSettings({ accounts: restoreEntry(settings().accounts, prev, gone.id) }).then(() => toast(`Счёт «${gone.name}» возвращён`)).catch(e => toast(errText(e))) });
+      if (accsDlg.open) { renderAccountsManager(); $("#accsAdd").focus(); }
     } catch (ex) { toast(errText(ex)); }
   });
   $("#accsBody").addEventListener("click", async e => {
@@ -1677,7 +1719,7 @@
     if (!card) return;
     const d = cardsDue().find(x => x.card.id === cardId);
     openTx(null, { type: "transfer", account: card.payFrom || settings().defaultAccount, toAccount: card.id,
-      amount: d ? d.due : undefined, date: d ? d.date : TODAY, note: `Списание по карте ${card.name}` });
+      amount: d ? d.due : undefined, date: d ? d.date : TODAY, note: `Списание по карте «${card.name}»` });
   }
 
   /* ── Clear example data ────────────────────── */
