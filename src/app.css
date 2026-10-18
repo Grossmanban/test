@@ -456,6 +456,7 @@ dialog::backdrop { background: rgba(5, 14, 11, 0.5); }
 .input[type="date"] { text-align: left; -webkit-appearance: none; appearance: none; display: flex; align-items: center; }
 .input[type="date"]::-webkit-date-and-time-value { text-align: left; margin: 0; }
 .input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.input::placeholder { color: var(--muted); opacity: 1; }
 .money-input { position: relative; }
 .money-input .input { padding-right: 34px; }
 .money-input::after { content: "₪"; position: absolute; right: 13px; top: 50%; transform: translateY(-50%); color: var(--muted); font-weight: 700; pointer-events: none; }
@@ -779,8 +780,8 @@ select.input { -webkit-appearance: none; appearance: none; background-image: non
   .kpi-dot { width: 22px; height: 22px; border-radius: 7px; }
   .bc-amount { font-size: 36px; }
 }
-/* sheets on short or narrow screens: sticky footer, one scroller */
-@media (max-width: 640px), (max-height: 500px) {
+/* sheets on phones and iPads (v3 sheets can outgrow an iPad in landscape): sticky footer, one scroller */
+@media (max-width: 640px), (max-height: 1040px) {
   .dlg { --dlg-pb: 0px; }
   .dlg-foot {
     position: sticky; bottom: 0; z-index: 2; background: var(--surface); border-top: 1px solid var(--line);
@@ -818,7 +819,7 @@ select.input { -webkit-appearance: none; appearance: none; background-image: non
   .btn-sm { height: 44px; }
   .fab { height: 56px; }
   .seg button { height: 44px; }
-  .today-btn { height: 36px; }
+  .today-btn { height: 44px; }
   .bc-edit { height: 44px; min-width: 44px; justify-content: center; }
   .cat-chip { height: 44px; }
   .chip-opt span { height: 44px; }

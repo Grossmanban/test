@@ -230,11 +230,16 @@ interface Account {
 // Both are left out while unset (a budget without accounts keeps the v2 document shape).
 // Migration v2 → v3: with no accounts the app behaves as if
 //   accounts = [{ id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", opening: startBalance }].
+// While the example's start balance is shown, that implicit a_main opens at 0 (the example's money is not the user's).
 // Writers that create the first real account write that a_main record explicitly (opening = startBalance) and
 // keep `startBalance` equal to the net opening of all accounts (non-card openings minus card openings) so v2
 // clients still show the right total. Exception: when the implicit a_main is empty (opening 0) and no operation
 // uses it (e.g. right after «Удалить пример»), the first non-card account the user creates replaces it and becomes
-// the default account.
+// the default account (cards created before it and paid from a_main are moved to it).
+// «Удалить пример» removes the example's accounts: those flagged by example.accounts, and in the PWA also any still
+// identical to the seed's (the flag goes away with the user's first own account). Example accounts the user's own
+// operations use stay, with opening 0. A start balance that is not the example's (e.g. from a v2 backup loaded over
+// the example) stays as the opening of a_main.
 
 type TxType = "income" | "expense" | "saving" | "transfer";
 interface Tx {               // additions to v2
@@ -287,7 +292,8 @@ Known limitations, until that device updates to v3:
 
 Balances (UI): account balance = opening (card: −opening) + incomes − expenses − savings − transfers out + transfers in,
 counting operations dated ≤ the cut-off. A card's balance is negative while money is owed. «Деньги» = sum of
-non-card balances; «Долг по картам» = −sum of card balances, over all accounts including hidden ones (a hidden account
+non-card balances plus any card credit (a positive card balance, e.g. a refund after the bill); «Долг по картам» = sum
+of what the cards that owe money owe; both over all accounts including hidden ones (a hidden account
 that still holds money or a debt stays listed, marked «скрыт»); the headline balance stays the net total (as in v2).
 Card cycle: the charge on billingDay of month M covers card operations dated from billingDay of month M−1 up to the
 day before billingDay of month M; on or after the billing day the app proposes the transfer payFrom → card for that

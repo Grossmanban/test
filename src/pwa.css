@@ -140,7 +140,7 @@
 .pwa-ver { text-align: center; font-size: 12px; }
 
 /* phones: no sticky footer in this sheet, so it keeps its own bottom padding */
-@media (max-width: 640px), (max-height: 500px) {
+@media (max-width: 640px), (max-height: 1040px) {
   .pwa-dlg .dlg { --dlg-pb: calc(18px + env(safe-area-inset-bottom, 0px)); }
 }
 @media (max-width: 640px) {

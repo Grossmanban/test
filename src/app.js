@@ -602,8 +602,9 @@
     const st = settings(), bal = accountBalances(TODAY);
     // hidden accounts still count while they hold money (or a card debt), so the rows add up to the totals
     const accs = st.accounts.filter(a => !a.archived || Math.abs(bal.get(a.id)) > 0.004);
-    const money0 = st.accounts.filter(a => a.kind !== "card").reduce((sum, a) => sum + bal.get(a.id), 0);
-    const debt = st.accounts.filter(a => a.kind === "card").reduce((sum, a) => sum - bal.get(a.id), 0);
+    // a card in credit (a refund after the bill) is money; only what cards owe is debt
+    const money0 = st.accounts.reduce((sum, a) => sum + (a.kind !== "card" ? bal.get(a.id) : Math.max(0, bal.get(a.id))), 0);
+    const debt = st.accounts.filter(a => a.kind === "card").reduce((sum, a) => sum + Math.max(0, -bal.get(a.id)), 0);
     const canEdit = !S.readOnly;
     const single = accs.length === 1 && accs[0].virtual;
     const dues = cardsDue();
@@ -1047,6 +1048,10 @@
     // an open sheet sits in the top layer above the page: the toast (and its «Вернуть») goes into the topmost one
     const host = [...document.querySelectorAll("dialog[open]")].pop() || document.body;
     if (el.parentNode !== host) host.appendChild(el);
+    // inside a sheet the toast sits just above the sheet's buttons
+    el.style.bottom = "";
+    const foot = host !== document.body && host.querySelector(".dlg-foot");
+    if (foot) requestAnimationFrame(() => { if (el.parentNode === host) el.style.bottom = `${innerHeight - Math.min(foot.getBoundingClientRect().top, host.getBoundingClientRect().bottom) + 8}px`; });
     const live = $("#live"); live.textContent = "";
     setTimeout(() => { live.textContent = action ? `${msg}. Кнопка «${action.label}» внизу экрана` : msg; }, 60);
     if (action) $("#toastAct").onclick = () => { el.hidden = true; action.run(); };
@@ -1357,7 +1362,7 @@
   });
   $("#splitOn").addEventListener("change", renderSplit);
   $("#splitN").addEventListener("change", renderSplit);
-  $("#txDelete").addEventListener("click", () => { $("#txConfirm").hidden = false; $("#txConfirmYes").focus(); });
+  $("#txDelete").addEventListener("click", () => { $("#txConfirm").hidden = false; $("#txConfirmYes").focus({ preventScroll: true }); $("#txConfirm").scrollIntoView({ block: "center" }); });
   $("#txConfirmNo").addEventListener("click", () => { $("#txConfirm").hidden = true; });
   $("#txConfirmYes").addEventListener("click", async () => {
     if (!editing) return;
@@ -1670,9 +1675,13 @@
       if (lim && !Number.isNaN(lim) && lim > 0) acc.creditLimit = lim; else delete acc.creditLimit;
     } else { delete acc.billingDay; delete acc.payFrom; delete acc.creditLimit; }
     let list = settings().accounts.map(a => ({ ...a }));
-    // the first own account replaces the implicit, empty and unused «Основной счёт» (e.g. right after «Удалить пример»)
-    const phantom = !editingAcc && kind !== "card" && !txDlg.open && list.length === 1 && list[0].virtual && !list[0].opening && accUsage(list[0].id) === 0;
-    if (phantom) list = [];
+    // the example's start balance is not the user's money: it does not become the opening of «Основной счёт»
+    if (settings().example && settings().example.startBalance) list = list.map(a => a.virtual ? { ...a, opening: 0 } : a);
+    // the first own bank, cash or wallet replaces the implicit, empty and unused «Основной счёт» (e.g. right after
+    // «Удалить пример»), also when a card paid from it was added first
+    const emptyMain = a => a.id === "a_main" && !a.opening && a.name === "Основной счёт" && accUsage("a_main") === 0;
+    const phantom = !editingAcc && kind !== "card" && !txDlg.open && list.some(emptyMain) && list.every(a => emptyMain(a) || a.kind === "card");
+    if (phantom) list = list.filter(a => !emptyMain(a)).map(a => a.payFrom === "a_main" ? { ...a, payFrom: acc.id } : a);
     const next = editingAcc ? list.map(a => a.id === acc.id ? acc : a) : [...list, acc];
     let def = phantom ? acc.id : settings().defaultAccount;
     if ($("#aDefault").checked && kind !== "card") def = acc.id;
@@ -1692,11 +1701,12 @@
     const gone = editingAcc, used = accUsage(gone.id) > 0;
     const next = used ? prev.map(a => a.id === gone.id ? { ...a, archived: true } : a) : prev.filter(a => a.id !== gone.id);
     let def = settings().defaultAccount;
-    if (def === gone.id) def = (next.find(a => !a.archived && a.kind !== "card") || next.find(a => !a.archived) || next[0]).id;
+    const wasMain = def === gone.id;
+    if (wasMain) def = (next.find(a => !a.archived && a.kind !== "card") || next.find(a => !a.archived) || next[0]).id;
     accDlg.close();
     try {
       await saveSettings({ accounts: next, defaultAccount: def });
-      toast(used ? `Счёт «${gone.name}» скрыт` : `Счёт «${gone.name}» удалён`, { label: "Вернуть", run: () => saveSettings({ accounts: restoreEntry(settings().accounts, prev, gone.id) }).then(() => toast(`Счёт «${gone.name}» возвращён`)).catch(e => toast(errText(e))) });
+      toast(used ? `Счёт «${gone.name}» скрыт` : `Счёт «${gone.name}» удалён`, { label: "Вернуть", run: () => saveSettings({ accounts: restoreEntry(settings().accounts, prev, gone.id), ...(wasMain ? { defaultAccount: gone.id } : {}) }).then(() => toast(`Счёт «${gone.name}» возвращён`)).catch(e => toast(errText(e))) });
       if (accsDlg.open) { renderAccountsManager(); $("#accsAdd").focus(); }
     } catch (ex) { toast(errText(ex)); }
   });
@@ -1730,8 +1740,13 @@
     renderNotice();
     try {
       await store.deleteMany(ex.map(t => t.id), done => { S.clearing.done = done; renderNotice(); });
-      const exFlags = settings().example;
-      if (exFlags && Object.keys(exFlags).length) {
+      const exFlags = settings().example || {};
+      // accounts still exactly as the example made them are the example's, even once the flag went with the user's
+      // first own account (the PWA seed is known; the artifact relies on the flag)
+      const seedList = window.BudgetSeed ? window.BudgetSeed.make(TODAY).settings.accounts : [];
+      const seedAcc = a => !!exFlags.accounts || seedList.some(x => x.id === a.id && x.kind === a.kind && x.name === a.name && x.opening === a.opening);
+      const exAccounts = settings().accounts.some(a => !a.virtual && seedAcc(a));
+      if (Object.keys(exFlags).length || exAccounts) {
         const st = settings(), next = settingsDoc();
         for (const k of Object.keys(exFlags)) if (k in DEFAULTS) next[k] = JSON.parse(JSON.stringify(DEFAULTS[k]));
         // the user's own operations keep the example goal, category or account they were made into: it becomes
@@ -1739,13 +1754,17 @@
         const mine = S.tx.filter(t => t.example !== true);
         if (exFlags.goals) next.goals = st.goals.filter(g => mine.some(t => t.type === "saving" && goalOfTx(t, st.goals) === g)).map(g => ({ ...g, initial: 0 }));
         if (exFlags.categories) next.categories = st.categories.filter(c => mine.some(t => t.category === c.id)).map(c => ({ ...c }));
-        if (exFlags.accounts) {
-          const kept = st.accounts.filter(a => !a.virtual && mine.some(t => t.account === a.id || t.toAccount === a.id)).map(a => ({ ...a, opening: 0 }));
+        if (exAccounts) {
+          // a start balance that is not the example's (e.g. from a v2 backup loaded over the example) stays the user's
+          const own = exFlags.accounts && !exFlags.startBalance ? st.startBalance : 0;
+          const kept = st.accounts.filter(a => !a.virtual && (!seedAcc(a) || mine.some(t => t.account === a.id || t.toAccount === a.id)))
+            .map(a => seedAcc(a) ? { ...a, opening: 0 } : { ...a });
+          if (own && kept.length && !kept.some(a => a.id === "a_main")) kept.unshift({ id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", opening: own, createdAt: 0 });
           if (kept.length) {
             next.accounts = kept;
             next.defaultAccount = kept.some(a => a.id === st.defaultAccount) ? st.defaultAccount : (kept.find(a => a.kind !== "card") || kept[0]).id;
-          } else delete next.defaultAccount;
-          next.startBalance = 0;
+            next.startBalance = r2(kept.reduce((sum, a) => sum + (a.kind === "card" ? -a.opening : a.opening), 0));
+          } else { delete next.defaultAccount; next.startBalance = own; }
         }
         if (!next.accounts || !next.accounts.length) { delete next.accounts; delete next.defaultAccount; }
         delete next.example;
@@ -1788,7 +1807,7 @@
     }, 150));
     dlg.addEventListener("close", () => {
       dlg.classList.remove("kb-open");
-      const t = $("#toast"); if (dlg.contains(t)) document.body.appendChild(t);
+      const t = $("#toast"); if (dlg.contains(t)) { t.style.bottom = ""; document.body.appendChild(t); }
     });
   }
   $$("dialog").forEach(enhanceDialog);
@@ -2021,4 +2040,8 @@
   render();
   drawGuilloche();
   store.init(applySnapshot);
+  // an installed app resumed on a new day starts over, so «сегодня», due card bills and new operations use the new date
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && isoOf(new Date()) !== TODAY && !document.querySelector("dialog[open]")) location.reload();
+  });
 })();
