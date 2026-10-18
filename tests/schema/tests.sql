@@ -78,6 +78,25 @@ select t.ok('transactions.goal_id: nullable text without a default (v2)',
 select t.ok('checks: goal_id format [A-Za-z0-9_-]{1,32}, settings document up to 64 KB',
   pg_get_constraintdef((select oid from pg_constraint where conname = 'transactions_goal_id_format')) like '%goal_id ~ %^[A-Za-z0-9_-]{1,32}$%'
   and pg_get_constraintdef((select oid from pg_constraint where conname = 'budget_settings_data_size')) like '%<= 65536%');
+select t.ok('transactions v3 columns: account, to_account, plan_id text; plan_n, plan_of smallint; nullable, no default',
+  (select count(*) = 5 and bool_and(is_nullable = 'YES' and column_default is null
+          and data_type = case when column_name in ('plan_n', 'plan_of') then 'smallint' else 'text' end)
+   from information_schema.columns
+   where table_schema = 'public' and table_name = 'transactions'
+     and column_name in ('account', 'to_account', 'plan_id', 'plan_n', 'plan_of')));
+select t.ok('v3 columns are documented (column comments)',
+  (select bool_and(col_description('public.transactions'::regclass, attnum) is not null) from pg_attribute
+   where attrelid = 'public.transactions'::regclass and attname in ('account', 'to_account', 'plan_id', 'plan_n', 'plan_of')));
+select t.ok('checks: type allows transfer; the 8 v3 checks exist once each',
+  pg_get_constraintdef((select oid from pg_constraint where conname = 'transactions_type_valid')) like '%''transfer''%'
+  and (select count(*) = 8 and count(distinct conname) = 8 from pg_constraint
+       where conrelid = 'public.transactions'::regclass and contype = 'c' and conname in (
+         'transactions_account_format', 'transactions_to_account_format', 'transactions_to_account_transfer_only',
+         'transactions_transfer_accounts', 'transactions_plan_id_format', 'transactions_plan_complete',
+         'transactions_plan_range', 'transactions_plan_expense_only')));
+select t.ok('checks: account, to_account and plan_id use the id pattern ^[A-Za-z0-9_-]{1,32}$',
+  (select count(*) = 3 and bool_and(pg_get_constraintdef(oid) like '%^[A-Za-z0-9\_-]{1,32}$%') from pg_constraint
+   where conname in ('transactions_account_format', 'transactions_to_account_format', 'transactions_plan_id_format')));
 select t.ok('schema applied twice: exactly one trigger per table',
   (select count(*) = 2 from pg_trigger where not tgisinternal
    and tgrelid in ('public.transactions'::regclass, 'public.budget_settings'::regclass)));
@@ -120,6 +139,30 @@ select t.affects('A: a saving with goal_id, as the client sends it',
     values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sav1', 'saving', 500, 'savings', '', '2026-10-06', 1759700000000, 'g_car', false, false, 1000)$$, 1);
 select t.ok('A: goal_id round trip', (select goal_id = 'g_car' and type = 'saving' from public.transactions where id = 'sav1'));
 select t.ok('A: rows written without goal_id have NULL (= the first goal)', (select bool_and(goal_id is null) from public.transactions where id in ('tx1', 'tx2', 'tx3')));
+select t.affects('A: a transfer between two accounts, as the client sends it (all columns)',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'tr1', 'transfer', 2000, 'transfer', 'На наличные', '2026-10-06', 1759710000000, null, 'a_leumi', 'a_cash', null, null, null, false, false, 1000)$$, 1);
+select t.affects('A: a split purchase on a card, 3 parts in one PostgREST-style bulk upsert',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    select user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms
+    from json_populate_recordset(null::public.transactions, '[
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "sp1", "type": "expense", "amount": 1000, "category": "home", "date": "2026-10-06", "account": "a_max", "plan_id": "p_tv", "plan_n": 1, "plan_of": 3, "client_updated_ms": 1000},
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "sp2", "type": "expense", "amount": 1000, "category": "home", "date": "2026-11-06", "account": "a_max", "plan_id": "p_tv", "plan_n": 2, "plan_of": 3, "client_updated_ms": 1000},
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "sp3", "type": "expense", "amount": 1000.01, "category": "home", "date": "2026-12-06", "account": "a_max", "plan_id": "p_tv", "plan_n": 3, "plan_of": 3, "client_updated_ms": 1000}]')
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 3);
+select t.ok('A: transfer round trip (type, account, to_account; no plan)',
+  (select type = 'transfer' and account = 'a_leumi' and to_account = 'a_cash' and plan_id is null and plan_n is null and plan_of is null
+   from public.transactions where id = 'tr1'));
+select t.ok('A: split parts round trip (plan_id shared, plan_n 1..3 of 3, smallint)',
+  (select count(*) = 3 and bool_and(plan_id = 'p_tv' and plan_of = 3 and account = 'a_max' and to_account is null)
+          and array_agg(plan_n order by date) = array[1, 2, 3]::smallint[] and pg_typeof(min(plan_n))::text = 'smallint'
+   from public.transactions where id in ('sp1', 'sp2', 'sp3')));
+select t.ok('A: rows written without the v3 columns have NULL in all five',
+  (select bool_and(account is null and to_account is null and plan_id is null and plan_n is null and plan_of is null)
+   from public.transactions where id in ('tx1', 'tx2', 'tx3', 'sav1')));
 select t.affects('A: insert own settings',
   $$insert into public.budget_settings (data, client_updated_ms) values ('{"startBalance": 1000, "goal": null, "limits": {}}', 1000)$$, 1);
 
@@ -163,6 +206,19 @@ select t.affects('B: update of A''s settings affects nothing', $$update public.b
 select t.affects('B: delete of A''s settings affects nothing', $$delete from public.budget_settings$$, 0);
 select t.affects('B: insert own settings', $$insert into public.budget_settings (user_id, data, client_updated_ms) values ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '{"startBalance": 5}', 1)$$, 1);
 select t.affects('B: update touches only own settings row', $$update public.budget_settings set data = '{"startBalance": 6}'$$, 1);
+select t.ok('B: A''s transfer and split parts are invisible',
+  (select count(*) from public.transactions where id in ('tr1', 'sp1', 'sp2', 'sp3') or account is not null or plan_id is not null) = 0);
+select t.affects('B: redirecting A''s transfer affects nothing',
+  $$update public.transactions set to_account = 'a_evil', client_updated_ms = 9000000000000 where id = 'tr1'$$, 0);
+select t.affects('B: deleting A''s split parts affects nothing', $$delete from public.transactions where plan_id = 'p_tv'$$, 0);
+select t.fails('B: cannot upsert over A''s transfer',
+  $$insert into public.transactions (user_id, id, type, amount, date, account, to_account, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'tr1', 'transfer', 1, '2026-10-01', 'a_leumi', 'a_evil', 9000000000000)
+    on conflict (user_id, id) do update set to_account = excluded.to_account, client_updated_ms = excluded.client_updated_ms$$, '42501');
+select t.affects('B: own transfer and own split part with the same ids as A''s',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, client_updated_ms)
+    values ('tr1', 'transfer', 5, '2026-10-02', 'a_main', 'a_wallet', null, null, null, 1),
+           ('sp1', 'expense', 5, '2026-10-02', 'a_card', null, 'p_tv', 1, 2, 1)$$, 2);
 
 :as_admin
 select t.ok('A''s tx1 untouched by B', (select note = 'Пятёрочка' and client_updated_ms = 1000 from public.transactions where user_id = :A and id = 'tx1'));
@@ -171,6 +227,11 @@ select t.ok('two rows with id tx1, one per user', (select count(*) = 2 from publ
 select t.ok('A''s goal_id untouched by B, B''s own goal_id stored',
   (select goal_id = 'g_car' and client_updated_ms = 1000 from public.transactions where user_id = :A and id = 'sav1')
   and (select goal_id = 'g_house' from public.transactions where user_id = :B and id = 'bsav1'));
+select t.ok('A''s transfer and split parts untouched by B, B''s own stored separately',
+  (select to_account = 'a_cash' and client_updated_ms = 1000 from public.transactions where user_id = :A and id = 'tr1')
+  and (select count(*) = 3 and bool_and(plan_of = 3) from public.transactions where user_id = :A and plan_id = 'p_tv')
+  and (select to_account = 'a_wallet' from public.transactions where user_id = :B and id = 'tr1')
+  and (select plan_of = 2 from public.transactions where user_id = :B and id = 'sp1'));
 
 -- ---------------------------------------------------------------------
 -- 5. Last writer wins on transactions (as A)
@@ -254,6 +315,82 @@ select t.affects('PostgREST-style bulk upsert with goal_id: a row without the ke
       deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 2);
 select t.ok('bulk upsert: goal_id per row', (select bool_and(case id when 'sav2' then goal_id = 'g_trip' else goal_id is null end) from public.transactions where id in ('sav2', 'sav3')));
 
+select t.affects('LWW v3: a newer write reverses the transfer',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'tr1', 'transfer', 2000, 'transfer', '', '2026-10-06', 1759710000000, null, 'a_cash', 'a_leumi', null, null, null, false, false, 2000)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 1);
+select t.affects('LWW v3: an older write with other accounts is ignored',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'tr1', 'transfer', 2000, 'transfer', '', '2026-10-06', 1759710000000, null, 'a_old', 'a_older', null, null, null, false, false, 1500)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 0);
+select t.affects('LWW v3: a plain UPDATE with an older client_updated_ms is ignored too',
+  $$update public.transactions set account = 'a_old', to_account = 'a_older', client_updated_ms = 1999 where id = 'tr1'$$, 0);
+select t.ok('LWW v3: the newer accounts are kept', (select account = 'a_cash' and to_account = 'a_leumi' and client_updated_ms = 2000 from public.transactions where id = 'tr1'));
+select t.affects('LWW v3: a newer write turns the transfer into a split part on a card (to_account cleared)',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'tr1', 'expense', 600, 'tech', '', '2026-10-06', 1759710000000, null, 'a_max', null, 'p_phone', 1, 2, false, false, 3000)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 1);
+select t.affects('LWW v3: an older write cannot bring the transfer back',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'tr1', 'transfer', 2000, 'transfer', '', '2026-10-06', 1759710000000, null, 'a_cash', 'a_leumi', null, null, null, false, false, 2500)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 0);
+select t.ok('LWW v3: split part stored',
+  (select type = 'expense' and account = 'a_max' and to_account is null and plan_id = 'p_phone' and plan_n = 1 and plan_of = 2
+   from public.transactions where id = 'tr1'));
+select t.affects('LWW v3: a newer write with NULLs clears the account and the plan',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'tr1', 'expense', 600, 'tech', '', '2026-10-06', 1759710000000, null, null, null, null, null, null, false, false, 4000)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 1);
+select t.ok('LWW v3: cleared', (select account is null and to_account is null and plan_id is null and plan_n is null and plan_of is null
+   from public.transactions where id = 'tr1'));
+select t.affects('bulk upsert v3: minimal tombstone of a split part + a new transfer + a v2-shaped row without v3 keys',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    select user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms
+    from json_populate_recordset(null::public.transactions, '[
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "sp3", "deleted": true, "client_updated_ms": 5000},
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "tr2", "type": "transfer", "amount": 3500, "category": "transfer",
+       "date": "2026-10-10", "account": "a_leumi", "to_account": "a_max", "client_updated_ms": 5000},
+      {"user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "id": "tx6", "type": "expense", "amount": 12, "date": "2026-10-10", "client_updated_ms": 5000}]')
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 3);
+select t.ok('bulk upsert v3: tombstone has no plan left, transfer and plain row stored',
+  (select deleted and plan_id is null and plan_n is null and plan_of is null and account is null from public.transactions where id = 'sp3')
+  and (select type = 'transfer' and account = 'a_leumi' and to_account = 'a_max' from public.transactions where id = 'tr2')
+  and (select account is null and to_account is null and plan_id is null from public.transactions where id = 'tx6'));
+select t.affects('undo delete v3: the split part comes back with its plan',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, account, to_account, plan_id, plan_n, plan_of, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sp3', 'expense', 1000.01, 'home', '', '2026-12-06', 1759710000000, null, 'a_max', null, 'p_tv', 3, 3, false, false, 6000)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      account = excluded.account, to_account = excluded.to_account, plan_id = excluded.plan_id, plan_n = excluded.plan_n,
+      plan_of = excluded.plan_of, example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 1);
+select t.affects('a v2 client''s upsert (no v3 columns in the payload) keeps the account and plan of a v3 row',
+  $$insert into public.transactions (user_id, id, type, amount, category, note, date, created_ms, goal_id, example, deleted, client_updated_ms)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'sp2', 'expense', 1000, 'home', 'v2 edit', '2026-11-06', 1759710000000, null, false, false, 6000)
+    on conflict (user_id, id) do update set type = excluded.type, amount = excluded.amount, category = excluded.category,
+      note = excluded.note, date = excluded.date, created_ms = excluded.created_ms, goal_id = excluded.goal_id,
+      example = excluded.example, deleted = excluded.deleted, client_updated_ms = excluded.client_updated_ms$$, 1);
+select t.ok('v2 edit stored, plan kept',
+  (select note = 'v2 edit' and account = 'a_max' and plan_id = 'p_tv' and plan_n = 2 and plan_of = 3 from public.transactions where id = 'sp2')
+  and (select not deleted and plan_n = 3 from public.transactions where id = 'sp3'));
+
 -- PostgREST builds bulk upserts with json_populate_recordset; supabase-js sends
 -- NULL for keys missing in some objects. Minimal tombstone + full row together:
 select t.affects('PostgREST-style bulk upsert: minimal tombstone + full new row',
@@ -303,8 +440,8 @@ select t.ok('pull query: own rows only, ordered by (updated_at, id), includes to
 -- ---------------------------------------------------------------------
 -- 6. Constraint violations (as A)
 -- ---------------------------------------------------------------------
-select t.fails('type must be income/expense/saving',
-  $$insert into public.transactions (id, type, amount, date) values ('c1', 'transfer', 1, '2026-10-01')$$, '23514');
+select t.violates('type must be income/expense/saving/transfer',
+  $$insert into public.transactions (id, type, amount, date) values ('c1', 'bogus', 1, '2026-10-01')$$, 'transactions_type_valid');
 select t.fails('amount 0 rejected', $$insert into public.transactions (id, type, amount, date) values ('c2', 'expense', 0, '2026-10-01')$$, '23514');
 select t.fails('negative amount rejected', $$insert into public.transactions (id, type, amount, date) values ('c3', 'expense', -5, '2026-10-01')$$, '23514');
 select t.fails('amount 0.004 rounds to 0.00 and is rejected', $$insert into public.transactions (id, type, amount, date) values ('c4', 'expense', 0.004, '2026-10-01')$$, '23514');
@@ -351,6 +488,136 @@ select t.fails('an update to an invalid goal_id rejected', $$update public.trans
 select t.fails('tombstone with an invalid type still rejected', $$insert into public.transactions (id, type, deleted) values ('c24', 'bogus', true)$$, '23514');
 
 -- ---------------------------------------------------------------------
+-- 6b. v3: accounts, transfers, installments (as A)
+--     Each negative case breaks exactly one check, named in the expectation:
+--     that name is what the client gets in the 23514 error message.
+-- ---------------------------------------------------------------------
+select t.affects('type transfer accepted: a_main → a_cash',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted)
+    values ('v3t1', 'transfer', 100, '2026-10-01', 'a_main', 'a_cash', null, null, null, false)$$, 1);
+select t.affects('transfer with 32-character ids of [A-Za-z0-9_-] accepted',
+  format($$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3t2', 'transfer', 1, '2026-10-01', %L, %L, null, null, null, false)$$,
+         'A_' || repeat('z', 26) || '_-09', repeat('9', 32)), 1);
+select t.affects('account on income, expense and saving accepted (without to_account)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted)
+    values ('v3a1', 'income', 1, '2026-10-01', 'a_main', null, null, null, null, false),
+           ('v3a2', 'expense', 1, '2026-10-01', 'a_cash', null, null, null, null, false),
+           ('v3a3', 'saving', 1, '2026-10-01', 'a_leumi', null, null, null, null, false)$$, 3);
+select t.affects('NULLs everywhere: income, expense, saving without any v3 column accepted',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted)
+    values ('v3n1', 'income', 1, '2026-10-01', null, null, null, null, null, false),
+           ('v3n2', 'expense', 1, '2026-10-01', null, null, null, null, null, false),
+           ('v3n3', 'saving', 1, '2026-10-01', null, null, null, null, null, false)$$, 3);
+select t.affects('split parts 1 of 2, 2 of 2, 36 of 36 accepted',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted)
+    values ('v3p1', 'expense', 1, '2026-10-01', 'a_max', null, 'p_a', 1, 2, false),
+           ('v3p2', 'expense', 1, '2026-11-01', 'a_max', null, 'p_a', 2, 2, false),
+           ('v3p3', 'expense', 1, '2026-10-01', 'a_max', null, 'p_b', 36, 36, false)$$, 3);
+select t.affects('plan_id of 32 characters accepted, and a split part needs no account',
+  format($$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3p4', 'expense', 1, '2026-10-01', null, null, %L, 1, 36, false)$$, 'p_' || repeat('Q', 26) || '_-09'), 1);
+select t.affects('tombstones: a minimal one, a deleted transfer without accounts, a deleted transfer to itself',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted)
+    values ('v3d1', null, null, null, null, null, null, null, null, true),
+           ('v3d2', 'transfer', null, null, null, null, null, null, null, true),
+           ('v3d3', 'transfer', 5, '2026-10-01', 'a_x', 'a_x', null, null, null, true)$$, 3);
+select t.violates('transfer without to_account rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e1', 'transfer', 1, '2026-10-01', 'a_main', null, null, null, null, false)$$, 'transactions_transfer_accounts');
+select t.violates('transfer without account rejected (a live transfer names its source)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e2', 'transfer', 1, '2026-10-01', null, 'a_cash', null, null, null, false)$$, 'transactions_transfer_accounts');
+select t.violates('transfer without either account rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e3', 'transfer', 1, '2026-10-01', null, null, null, null, null, false)$$, 'transactions_transfer_accounts');
+select t.violates('transfer to the same account rejected (to_account = account)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e4', 'transfer', 1, '2026-10-01', 'a_cash', 'a_cash', null, null, null, false)$$, 'transactions_transfer_accounts');
+select t.violates('to_account on an expense rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e5e', 'expense', 1, '2026-10-01', 'a_main', 'a_cash', null, null, null, false)$$, 'transactions_to_account_transfer_only');
+select t.violates('to_account on an income rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e5i', 'income', 1, '2026-10-01', 'a_main', 'a_cash', null, null, null, false)$$, 'transactions_to_account_transfer_only');
+select t.violates('to_account on a saving rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e5s', 'saving', 1, '2026-10-01', 'a_main', 'a_cash', null, null, null, false)$$, 'transactions_to_account_transfer_only');
+select t.violates('to_account on a deleted expense rejected too (only a transfer has one)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3e6', 'expense', 1, '2026-10-01', 'a_main', 'a_cash', null, null, null, true)$$, 'transactions_to_account_transfer_only');
+select t.violates('account with a space rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'expense', 1, '2026-10-01', 'a main', null, null, null, null, false)$$, 'transactions_account_format');
+select t.violates('account with Cyrillic rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'expense', 1, '2026-10-01', 'счёт', null, null, null, null, false)$$, 'transactions_account_format');
+select t.violates('account with a dot rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'expense', 1, '2026-10-01', 'a.b', null, null, null, null, false)$$, 'transactions_account_format');
+select t.violates('account with a trailing newline rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'expense', 1, '2026-10-01', E'a_x\n', null, null, null, null, false)$$, 'transactions_account_format');
+select t.violates('account with a quote rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'expense', 1, '2026-10-01', 'a''b', null, null, null, null, false)$$, 'transactions_account_format');
+select t.violates('empty account rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'expense', 1, '2026-10-01', '', null, null, null, null, false)$$, 'transactions_account_format');
+select t.violates('account of 33 characters rejected',
+  format($$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'expense', 1, '2026-10-01', %L, null, null, null, null, false)$$, repeat('a', 33)), 'transactions_account_format');
+select t.violates('to_account of 33 characters rejected',
+  format($$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'transfer', 1, '2026-10-01', 'a_main', %L, null, null, null, false)$$, repeat('b', 33)), 'transactions_to_account_format');
+select t.violates('to_account with a slash rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'transfer', 1, '2026-10-01', 'a_main', 'a/b', null, null, null, false)$$, 'transactions_to_account_format');
+select t.violates('empty to_account rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3f', 'transfer', 1, '2026-10-01', 'a_main', '', null, null, null, false)$$, 'transactions_to_account_format');
+select t.violates('plan_id of 33 characters rejected',
+  format($$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3g', 'expense', 1, '2026-10-01', null, null, %L, 1, 2, false)$$, repeat('p', 33)), 'transactions_plan_id_format');
+select t.violates('plan_id with a space rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3g', 'expense', 1, '2026-10-01', null, null, 'p x', 1, 2, false)$$, 'transactions_plan_id_format');
+select t.violates('empty plan_id rejected',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3g', 'expense', 1, '2026-10-01', null, null, '', 1, 2, false)$$, 'transactions_plan_id_format');
+select t.violates('partial plan rejected: plan_id only',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3h', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', null, null, false)$$, 'transactions_plan_complete');
+select t.violates('partial plan rejected: plan_id and plan_n without plan_of',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3h', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 1, null, false)$$, 'transactions_plan_complete');
+select t.violates('partial plan rejected: plan_id and plan_of without plan_n',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3h', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', null, 2, false)$$, 'transactions_plan_complete');
+select t.violates('partial plan rejected: plan_n and plan_of without plan_id',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3h', 'expense', 1, '2026-10-01', 'a_max', null, null, 1, 2, false)$$, 'transactions_plan_complete');
+select t.violates('partial plan rejected: plan_n only',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3h', 'expense', 1, '2026-10-01', 'a_max', null, null, 1, null, false)$$, 'transactions_plan_complete');
+select t.violates('partial plan rejected: plan_of only',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3h', 'expense', 1, '2026-10-01', 'a_max', null, null, null, 2, false)$$, 'transactions_plan_complete');
+select t.violates('plan out of range rejected: part 3 of 2 (n > of)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 3, 2, false)$$, 'transactions_plan_range');
+select t.violates('plan out of range rejected: part 0 of 2',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 0, 2, false)$$, 'transactions_plan_range');
+select t.violates('plan out of range rejected: part -1 of 2',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', -1, 2, false)$$, 'transactions_plan_range');
+select t.violates('plan out of range rejected: 1 of 1 (of = 1)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 1, 1, false)$$, 'transactions_plan_range');
+select t.violates('plan out of range rejected: 1 of 37 (of = 37)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 1, 37, false)$$, 'transactions_plan_range');
+select t.violates('plan out of range rejected: 37 of 37',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 37, 37, false)$$, 'transactions_plan_range');
+select t.violates('plan out of range rejected: 0 of 0',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 0, 0, false)$$, 'transactions_plan_range');
+select t.fails('plan_n beyond smallint rejected (22003)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3i', 'expense', 1, '2026-10-01', 'a_max', null, 'p_x', 40000, 2, false)$$, '22003');
+select t.fails('a fractional plan_n from JSON (PostgREST) rejected (22P02)',
+  $$insert into public.transactions (id, type, amount, date, plan_id, plan_n, plan_of)
+    select id, type, amount, date, plan_id, plan_n, plan_of from json_populate_recordset(null::public.transactions,
+      '[{"id": "v3i", "type": "expense", "amount": 1, "date": "2026-10-01", "plan_id": "p_x", "plan_n": 1.5, "plan_of": 2}]')$$, '22P02');
+select t.violates('plan on an income rejected (expenses only)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3j', 'income', 1, '2026-10-01', 'a_main', null, 'p_x', 1, 2, false)$$, 'transactions_plan_expense_only');
+select t.violates('plan on a saving rejected (expenses only)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3j', 'saving', 1, '2026-10-01', 'a_main', null, 'p_x', 1, 2, false)$$, 'transactions_plan_expense_only');
+select t.violates('plan on a transfer rejected (expenses only)',
+  $$insert into public.transactions (id, type, amount, date, account, to_account, plan_id, plan_n, plan_of, deleted) values ('v3j', 'transfer', 1, '2026-10-01', 'a_main', 'a_max', 'p_x', 1, 2, false)$$, 'transactions_plan_expense_only');
+select t.violates('update: sending a live transfer to its own source rejected',
+  $$update public.transactions set to_account = account, client_updated_ms = 9000 where id = 'v3t1'$$, 'transactions_transfer_accounts');
+select t.violates('update: dropping to_account from a live transfer rejected',
+  $$update public.transactions set to_account = null, client_updated_ms = 9000 where id = 'v3t1'$$, 'transactions_transfer_accounts');
+select t.violates('update: a transfer turned into an expense must drop to_account',
+  $$update public.transactions set type = 'expense', client_updated_ms = 9000 where id = 'v3t1'$$, 'transactions_to_account_transfer_only');
+select t.violates('update: a split part turned into income must drop its plan',
+  $$update public.transactions set type = 'income', client_updated_ms = 9000 where id = 'v3p1'$$, 'transactions_plan_expense_only');
+select t.violates('update: a split part cannot lose only plan_of',
+  $$update public.transactions set plan_of = null, client_updated_ms = 9000 where id = 'v3p1'$$, 'transactions_plan_complete');
+select t.violates('update: reviving a deleted transfer without its accounts rejected',
+  $$update public.transactions set deleted = false, amount = 1, date = '2026-10-01', client_updated_ms = 9000 where id = 'v3d2'$$, 'transactions_transfer_accounts');
+select t.affects('update: a transfer turned into an expense with to_account cleared accepted',
+  $$update public.transactions set type = 'expense', to_account = null, client_updated_ms = 9000 where id = 'v3t2'$$, 1);
+select t.ok('none of the rejected v3 rows was stored',
+  (select count(*) = 0 from public.transactions where id ~ '^v3[e-j]'));
+
+-- ---------------------------------------------------------------------
 -- 7. Settings: LWW, validation (as A)
 -- ---------------------------------------------------------------------
 select updated_at as s0 from public.budget_settings \gset
@@ -377,14 +644,17 @@ select t.fails('settings: data must be an object (array)', $$update public.budge
 select t.fails('settings: data must be an object (string)', $$update public.budget_settings set data = '"x"', client_updated_ms = 3000$$, '23514');
 select t.fails('settings: data must be an object (json null)', $$update public.budget_settings set data = 'null', client_updated_ms = 3000$$, '23514');
 select t.fails('settings: data SQL NULL rejected', $$update public.budget_settings set data = null, client_updated_ms = 3000$$, '23502');
-select t.affects('settings: the largest v2 document the app makes (20 goals, 60 categories, 100 limits, _ms) is accepted',
+select t.affects('settings: the largest document the app makes (20 goals, 60 categories, 100 limits, 20 accounts, _ms, _ms3) is accepted',
   format($$update public.budget_settings set data = %L::jsonb, client_updated_ms = 3000$$, :'maxdoc'), 1);
 select t.ok(format('settings: its size as the server measures it (%s bytes) is what the client and the fake server compute', :'maxdoc_bytes'),
   (select octet_length(data::text) = :maxdoc_bytes from public.budget_settings));
+-- the client refuses a document over 55 000 bytes and its stamps take at most 9 829 (src/store-pwa.js
+-- MAX_SETTINGS_BYTES): the largest document of known fields (45 252 with stamps) leaves room for later versions
 select t.ok('settings: far below the 64 KB limit (room for unknown fields and later versions)',
-  (select octet_length(data::text) < 65536 - 30000 from public.budget_settings));
-select t.ok('settings: stored whole (20 goals, 60 categories, 100 limits)',
+  (select octet_length(data::text) < 65536 - 15000 from public.budget_settings));
+select t.ok('settings: stored whole (20 goals, 60 categories, 100 limits, 20 accounts, _ms3)',
   (select jsonb_array_length(data -> 'goals') = 20 and jsonb_array_length(data -> 'categories') = 60
+          and jsonb_array_length(data -> 'accounts') = 20 and data ? '_ms3'
           and (select count(*) from jsonb_object_keys(data -> 'limits')) = 100 and data -> 'goals' -> 0 ->> 'name' = repeat('₪', 60)
    from public.budget_settings));
 select t.affects('settings: exactly 65536 bytes accepted',
@@ -427,6 +697,9 @@ select t.fails('service_role cannot change user_id either',
   $$update public.transactions set user_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' where user_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' and id = 'tx1'$$, '23514');
 select t.affects('service_role: older write is ignored too',
   $$update public.transactions set note = 'svc-old', client_updated_ms = 1 where user_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' and id = 'tx1'$$, 0);
+select t.violates('service_role is bound by the v3 checks too',
+  $$update public.transactions set to_account = account, client_updated_ms = 9999999 where user_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' and id = 'tr2'$$,
+  'transactions_transfer_accounts');
 
 -- ---------------------------------------------------------------------
 -- 10. Realtime: a DELETE's old key in the WAL carries user_id (replica identity
@@ -467,6 +740,10 @@ select t.ok('cascade: B''s data kept',
 -- ---------------------------------------------------------------------
 select count(*) as rows_before from public.transactions \gset
 select count(*) as goal_rows_before from public.transactions where goal_id is not null \gset
+select count(*) filter (where account is not null or to_account is not null or plan_id is not null) as v3_rows_before,
+       md5(string_agg(x::text, ',' order by x.user_id, x.id)) as tx_digest_before
+from public.transactions x \gset
+select md5(string_agg(x::text, ',' order by x.user_id)) as settings_digest_before from public.budget_settings x \gset
 drop publication supabase_realtime;
 \connect - postgres
 \ir ../../supabase/schema.sql
@@ -495,6 +772,16 @@ select t.ok('after all re-runs: one goal_id column, one goal_id check, goal_id v
   and (select count(*) = 1 from pg_constraint where conrelid = 'public.budget_settings'::regclass and conname = 'budget_settings_data_size')
   and :goal_rows_before > 0
   and (select count(*) from public.transactions where goal_id is not null) = :goal_rows_before);
+select t.ok('after all re-runs: every v3 check once, v3 values intact',
+  (select count(*) = 8 from pg_constraint where conrelid = 'public.transactions'::regclass and conname in (
+     'transactions_account_format', 'transactions_to_account_format', 'transactions_to_account_transfer_only',
+     'transactions_transfer_accounts', 'transactions_plan_id_format', 'transactions_plan_complete',
+     'transactions_plan_range', 'transactions_plan_expense_only'))
+  and :v3_rows_before > 0
+  and (select count(*) from public.transactions where account is not null or to_account is not null or plan_id is not null) = :v3_rows_before);
+select t.ok('after all re-runs: every row byte for byte the same, updated_at included (no row rewritten)',
+  (select md5(string_agg(x::text, ',' order by x.user_id, x.id)) = :'tx_digest_before' from public.transactions x)
+  and (select md5(string_agg(x::text, ',' order by x.user_id)) = :'settings_digest_before' from public.budget_settings x));
 select t.ok('after all re-runs: still 4+4 policies, 2 triggers, data intact',
   (select count(*) = 8 from pg_policies where schemaname = 'public')
   and (select count(*) = 2 from pg_trigger where not tgisinternal

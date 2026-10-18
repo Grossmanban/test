@@ -10,8 +10,9 @@
 #   KEEP=1           keep the directory (cluster is still stopped)
 #   PG_OS_USER       OS user that runs postgres when this script runs as root (default postgres)
 #
-# Exit code 0 = schema applied twice without errors and every test passed (tests.sql), and an upgrade
-# from the previous release's schema (schema-v1.sql, with data) works (upgrade.sql).
+# Exit code 0 = schema applied twice without errors and every test passed (tests.sql), upgrades from the
+# earlier releases' schemas with data work (schema-v1.sql + upgrade.sql, schema-v2.sql + upgrade-v2.sql), and
+# the catalog (fingerprint.sql) is identical after every run of schema.sql: fresh install, re-runs, upgrades.
 # Needs node (the largest settings document comes from tests/helpers/max-settings.mjs).
 set -euo pipefail
 
@@ -75,9 +76,23 @@ run_psql() {   # run_psql <db role> <file> [extra psql args]
 
 echo "== shim (Supabase-like roles, auth schema, publication)"
 run_psql supabase_admin "$HERE/shim.sql" -d postgres
-# a second, identical database for the upgrade test (before any schema.sql touches budget_test)
-"$PSQL" -X -q -v ON_ERROR_STOP=1 -h "$WORK" -p $PORT -U supabase_admin -d postgres \
-  -c "create database budget_upgrade template budget_test owner postgres"
+# identical databases for the upgrade tests (before any schema.sql touches budget_test)
+for db in budget_upgrade budget_upgrade_v2; do
+  "$PSQL" -X -q -v ON_ERROR_STOP=1 -h "$WORK" -p $PORT -U supabase_admin -d postgres \
+    -c "create database $db template budget_test owner postgres"
+done
+
+fingerprint() {   # fingerprint <db> <name>: canonical catalog text of what schema.sql defines -> $WORK/fp-<name>.txt
+  run_psql supabase_admin "$HERE/fingerprint.sql" -d "$1" -At >"$WORK/fp-$2.txt"
+}
+same_schema() {   # same_schema <name> <label>: "ok"/"not ok" line, compared with the fresh install (fp-pass1)
+  if [ -s "$WORK/fp-pass1.txt" ] && cmp -s "$WORK/fp-pass1.txt" "$WORK/fp-$1.txt"; then
+    echo "ok - schema fingerprint: $2"
+  else
+    echo "not ok - schema fingerprint: $2"
+    diff "$WORK/fp-pass1.txt" "$WORK/fp-$1.txt" | sed 's/^/#   /' || true   # diff exits 1: not fatal under set -e
+  fi
+}
 
 echo "== largest settings document (tests/helpers/max-settings.mjs)"
 node "$ROOT/tests/helpers/max-settings.mjs" >"$WORK/max-settings.out"
@@ -96,7 +111,9 @@ for pass in 1 2; do
     echo "schema.sql failed on pass $pass" >&2
     exit 1
   fi
+  fingerprint budget_test "pass$pass"
 done
+echo "   catalog: $(wc -l <"$WORK/fp-pass1.txt") objects (fingerprint.sql)"
 
 echo "== tests"
 set +e
@@ -105,6 +122,7 @@ PGOPTIONS='-c client_min_messages=warning' \
 status=$?
 set -e
 cat "$WORK/tests.out"
+fingerprint budget_test tests
 
 echo "== upgrade: schema-v1.sql with data, then supabase/schema.sql (twice)"
 run_psql postgres "$HERE/schema-v1.sql" -d budget_upgrade >"$WORK/apply-v1.out" 2>&1 || { cat "$WORK/apply-v1.out"; exit 1; }
@@ -116,6 +134,29 @@ set -e
 cat "$WORK/upgrade.out"
 cat "$WORK/upgrade.out" >>"$WORK/tests.out"
 [ "$ustatus" -ne 0 ] && status=$ustatus
+fingerprint budget_upgrade upgrade-v1
+
+echo "== upgrade: schema-v2.sql with data, then supabase/schema.sql (three times)"
+run_psql postgres "$HERE/schema-v2.sql" -d budget_upgrade_v2 >"$WORK/apply-v2.out" 2>&1 || { cat "$WORK/apply-v2.out"; exit 1; }
+set +e
+PGOPTIONS='-c client_min_messages=warning' \
+  run_psql supabase_admin "$HERE/upgrade-v2.sql" -d budget_upgrade_v2 -At >"$WORK/upgrade-v2.out" 2>&1
+ustatus=$?
+set -e
+cat "$WORK/upgrade-v2.out"
+cat "$WORK/upgrade-v2.out" >>"$WORK/tests.out"
+[ "$ustatus" -ne 0 ] && status=$ustatus
+fingerprint budget_upgrade_v2 upgrade-v2
+
+echo "== schema fingerprints (fingerprint.sql)"
+{
+  same_schema pass2 "a second run of schema.sql changes nothing"
+  same_schema tests "after tests.sql (three more runs of schema.sql) the catalog is unchanged"
+  same_schema upgrade-v1 "v1 project upgraded = fresh install"
+  same_schema upgrade-v2 "v2 project upgraded = fresh install"
+} >"$WORK/fingerprint.out"
+cat "$WORK/fingerprint.out"
+cat "$WORK/fingerprint.out" >>"$WORK/tests.out"
 
 passed=$(grep -c '^ok ' "$WORK/tests.out" || true)
 failed=$(grep -c '^not ok ' "$WORK/tests.out" || true)
