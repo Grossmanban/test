@@ -3229,10 +3229,8 @@ test("v3 review: supabase/README.md quotes the outdated-schema message the store
   assert.ok(readme.split("«" + head).length - 1 >= 2, "the upgrade notes quote it too");
 });
 
-// src/store-artifact.js is not part of this change: its txBody (line 54) still keeps a plan of one part, which the
-// contract (2 ≤ of ≤ 36), the server (transactions_plan_range) and the PWA store refuse. Fix there:
-// `… && p.n <= p.of && p.of >= 2 && p.of <= 36)`; then drop `todo` here.
-test("v3 review: the artifact store and the PWA store treat a one-part plan the same way", { todo: "src/store-artifact.js txBody must require plan.of >= 2" }, async () => {
+// the contract (2 ≤ of ≤ 36) and the server (transactions_plan_range) refuse a plan of one part: both adapters drop it
+test("v3 review: the artifact store and the PWA store treat a one-part plan the same way", async () => {
   const d = await new Device({ seed: null }).ready();
   const art = artifactStore();
   await waitFor(() => art.snap && art.snap.status === "ready", { what: "artifact ready" });
