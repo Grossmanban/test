@@ -4,15 +4,19 @@
 // that several "devices" share.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createWindow, FakeStorage, fakeSeed, legacySeed, loadScript, sleep, waitFor, createBroadcastBus } from "./helpers/fake-env.mjs";
 import { createFakeIndexedDB } from "./helpers/fake-idb.mjs";
-import { createFakeSupabase, FAKE_URL, FAKE_ANON_KEY, FAKE_SERVICE_KEY, tsUs, pgJsonBytes } from "./helpers/fake-supabase.mjs";
-import { maxSettings, maxSettingsWire, MAX_GONE } from "./helpers/max-settings.mjs";
+import { createFakeSupabase, FAKE_URL, FAKE_ANON_KEY, FAKE_SERVICE_KEY, tsUs, fmtUs, pgJsonBytes, V3_COLS } from "./helpers/fake-supabase.mjs";
+import { maxSettings, maxSettingsWire, stampBytes, MAX_GONE, MAX_ACCOUNTS } from "./helpers/max-settings.mjs";
+// src/store-pwa.js MAX_SETTINGS_BYTES: the largest document saveSettings and backup import accept
+const SETTINGS_CAP = 55_000;
 
 const SRC = new URL("../src/store-pwa.js", import.meta.url).pathname;
 const SEED_SRC = new URL("../src/seed.js", import.meta.url).pathname;
 const { createBudgetStore } = loadScript(SRC);
+// the store of the deployed v2 app (git show 79f1e3a:src/store-pwa.js), for the v2 ⇄ v3 compatibility tests
+const createV2Store = loadScript(new URL("./helpers/store-pwa-v2.js", import.meta.url).pathname).createBudgetStore;
 
 const SLOW = { write: 1e7, realtime: 1e7, interval: 1e7 };   // no automatic syncs unless a test asks for them
 const PW = "secret123";
@@ -20,8 +24,9 @@ const T0 = Date.UTC(2026, 9, 8, 9, 0, 0);
 const devices = [];
 
 class Device {
-  constructor({ server = null, win = null, clock = T0, config = "file", seed = fakeSeed, delays = SLOW, storeOpts = {}, ...winOpts } = {}) {
+  constructor({ server = null, win = null, clock = T0, config = "file", seed = fakeSeed, delays = SLOW, storeOpts = {}, factory = createBudgetStore, ...winOpts } = {}) {
     this.server = server;
+    this.factory = factory;
     this.t = clock;
     const cfg = server && config === "file" ? { supabaseUrl: server.url, supabaseAnonKey: server.anonKey } : null;
     this.win = win || createWindow({ server, seed, config: cfg, ...winOpts });
@@ -35,12 +40,14 @@ class Device {
   tick(ms = 1000) { this.t += ms; return this.t; }
   start(extra = {}) {
     this.snap = null;
-    this.store = createBudgetStore({ window: this.win, now: this.now, delays: this.delays, ...this.storeOpts, ...extra });
+    this.store = this.factory({ window: this.win, now: this.now, delays: this.delays, ...this.storeOpts, ...extra });
     this.store.init(s => { this.snap = s; this.snaps.push(s); });
     return this;
   }
   async ready() { await waitFor(() => this.snap && this.snap.status === "ready", { what: "ready" }); return this; }
   async restart(extra) { await this.store.destroy(); this.start(extra); return this.ready(); }
+  // the app on this device updates to another store version (same IndexedDB, same localStorage)
+  async upgrade(factory = createBudgetStore) { this.factory = factory; return this.restart(); }
   get tx() { return [...this.snap.tx].sort((a, b) => (a.id < b.id ? -1 : 1)); }
   ids() { return this.tx.map(t => t.id); }
   find(id) { return this.snap.tx.find(t => t.id === id); }
@@ -65,7 +72,18 @@ function assertV2(st) {
   assert.ok(Array.isArray(st.goals) && Array.isArray(st.categories));
   if ("example" in st) assert.ok(!("goal" in st.example) && Object.keys(st.example).length > 0);
 }
+// snap.settings / export settings of v3: the v2 fields, accounts and defaultAccount only when set, no stamps
+function assertV3(st) {
+  assert.ok(st && typeof st === "object");
+  const keys = Object.keys(st).filter(k => k !== "example");
+  assert.ok(["categories", "goals", "limits", "startBalance"].every(k => keys.includes(k)));
+  assert.ok(keys.every(k => ["categories", "goals", "limits", "startBalance", "accounts", "defaultAccount"].includes(k)), keys.join());
+  if ("accounts" in st) assert.ok(Array.isArray(st.accounts) && st.accounts.length > 0);
+  if ("example" in st) assert.ok(!("goal" in st.example) && !("defaultAccount" in st.example) && Object.keys(st.example).length > 0);
+}
 const without = (o, ...keys) => { const c = { ...o }; for (const k of keys) delete c[k]; return c; };
+// field stamps of the v3 settings fields (accounts, defaultAccount) of a document that never had any
+const NO_ACC_MS = { accounts: 0, defaultAccount: 0 };
 async function rejects(p, code, message) {
   await assert.rejects(p, e => {
     assert.equal(e.code, code, `code ${e.code} (${e.message})`);
@@ -176,7 +194,7 @@ test("first run seeds the example budget as device-only records", async () => {
   assert.deepEqual(d.progress, [2, 2]);
   await d.store.saveSettings({ startBalance: 0, goals: [], limits: {}, categories: [] });
   assert.equal(d.kv().settings.localOnly, true);
-  assert.deepEqual(d.kv().settings.fieldMs, { startBalance: 0, goals: 0, limits: 0, categories: 0 }, "reset example fields keep stamp 0");
+  assert.deepEqual(d.kv().settings.fieldMs, { startBalance: 0, goals: 0, limits: 0, categories: 0, ...NO_ACC_MS }, "reset example fields keep stamp 0");
   assert.equal(d.sync.pending, 1);
 
   // the example is not seeded again on the next start
@@ -194,14 +212,23 @@ test("no BudgetSeed: starts empty; the real src/seed.js seeds a valid example", 
   const { BudgetSeed } = loadScript(SEED_SRC);
   const d = await new Device({ seed: BudgetSeed, clock: new Date(2026, 9, 8, 12).getTime() }).ready();
   assert.ok(d.snap.tx.length > 20);
-  assert.ok(d.snap.tx.every(t => t.example === true && t.date <= "2026-10-08"));
-  // v2 shape whatever shape the seed has (an older seed.js had goal instead of goals)
-  assertV2(d.snap.settings);
+  // nothing in the future except the later parts of a split purchase (obligations of the months ahead)
+  assert.ok(d.snap.tx.every(t => t.example === true && (t.date <= "2026-10-08" || t.plan)));
+  // v2/v3 shape whatever shape the seed has (an older seed.js had goal instead of goals)
+  assertV3(d.snap.settings);
   assert.ok(d.snap.settings.goals.length >= 1);
   assert.ok(Object.keys(d.snap.settings.example).length >= 3);
-  assert.ok(Object.keys(d.snap.settings.example).every(k => ["startBalance", "goals", "limits", "categories"].includes(k)));
+  assert.ok(Object.keys(d.snap.settings.example).every(k => ["startBalance", "goals", "limits", "categories", "accounts"].includes(k)));
   const goalIds = new Set(d.snap.settings.goals.map(g => g.id));
   assert.ok(d.snap.tx.every(t => t.goalId === undefined || (t.type === "saving" && goalIds.has(t.goalId))), "example savings point at example goals");
+  // v3 seed: every operation names an example account, transfers go between two of them, split parts are whole
+  const accIds = new Set((d.snap.settings.accounts || []).map(a => a.id));
+  assert.ok(accIds.size >= 2 && d.snap.settings.example.accounts === true && accIds.has(d.snap.settings.defaultAccount));
+  assert.ok(d.snap.tx.every(t => accIds.has(t.account)), "example operations point at example accounts");
+  const transfers = d.snap.tx.filter(t => t.type === "transfer");
+  assert.ok(transfers.length >= 2 && transfers.every(t => accIds.has(t.toAccount) && t.toAccount !== t.account), "the example's transfers are kept");
+  const parts = d.snap.tx.filter(t => t.plan);
+  assert.ok(parts.length >= 2 && parts.every(t => t.type === "expense" && parts.filter(x => x.plan.id === t.plan.id).length === t.plan.of));
   assert.equal(d.sync.pending, 0);
 });
 
@@ -480,7 +507,8 @@ test("push/pull round trip between two devices; examples are never uploaded", as
   const [row] = server.rows("transactions");
   assert.deepEqual(without(row, "updated_at"), {
     user_id: uid, id, type: "expense", amount: 290, category: "cafe", note: "Кофе", date: "2026-10-08",
-    created_ms: 42, goal_id: null, example: false, deleted: false, client_updated_ms: a.t,
+    created_ms: 42, goal_id: null, account: null, to_account: null, plan_id: null, plan_n: null, plan_of: null,
+    example: false, deleted: false, client_updated_ms: a.t,
   });
   assert.match(row.updated_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}\+00:00$/);
   const [srow] = server.rows("budget_settings");
@@ -947,7 +975,7 @@ test("sign-out pushes pending changes, ends only this device's session and wipes
   assert.equal(a.sync.phase, "off");
   assert.equal(a.sync.pending, 0);
   assert.deepEqual(a.kv().tx, {});
-  assert.deepEqual(a.kv().meta, { seeded: true, userId: null, cursorTx: null, cursorSettings: null, lastSyncAt: null });
+  assert.deepEqual(a.kv().meta, { seeded: true, userId: null, cursorTx: null, cursorSettings: null, lastSyncAt: null, version: 3, fullPull: false });
   assert.equal(a.win.localStorage.getItem("budget-pwa-auth"), null);
   await b.store.sync.syncNow();                             // the other device is still signed in
   assert.equal(b.sync.phase, "idle");
@@ -1038,11 +1066,11 @@ test("backup export has the documented shape; import validates every record", as
   await d.store.saveSettings({ startBalance: 10, goals: [], limits: {}, categories: [] });
   const out = d.store.backup.export();
   assert.equal(out.app, "budget");
-  assert.equal(out.version, 2);
+  assert.equal(out.version, 3);
   assert.equal(out.exportedAt, new Date(T0).toISOString());
   assert.deepEqual(out.settings, { startBalance: 10, goals: [], limits: {}, categories: [] });
   assert.equal(out.settingsUpdatedAt, T0);
-  assert.deepEqual(out.settingsFieldsUpdatedAt, { startBalance: T0, goals: 0, limits: 0, categories: 0 });
+  assert.deepEqual(out.settingsFieldsUpdatedAt, { startBalance: T0, goals: 0, limits: 0, categories: 0, ...NO_ACC_MS });
   assert.equal(out.tx.length, 4);
   assert.deepEqual(Object.keys(out.tx.find(t => t.id === id)).sort(), ["amount", "category", "createdAt", "date", "id", "note", "type", "updatedAt"]);
   assert.ok(out.tx.filter(t => t.example).every(t => t.updatedAt === undefined));
@@ -1053,14 +1081,15 @@ test("backup export has the documented shape; import validates every record", as
   await rejects(imp(null), "invalid", "Файл не похож на резервную копию бюджета.");
   await rejects(imp("{not json"), "invalid", /не похож/);
   await rejects(imp({ app: "other", version: 1, tx: [] }), "invalid", /не похож/);
-  await rejects(imp({ app: "budget", version: 3, tx: [] }), "invalid", /более новой версией/);
+  await rejects(imp({ app: "budget", version: 4, tx: [] }), "invalid", /более новой версией/);
   await rejects(imp({ app: "budget", version: 0, tx: [] }), "invalid", /не похож/);
   const ok = { id: "ok1", type: "income", amount: 5, category: "salary", note: "", date: "2026-10-01", createdAt: 1 };
   await rejects(imp(file([ok, ok, { ...ok, id: "x", amount: -1 }])), "invalid", /операция №3: сумма/);
   await rejects(imp(file([{ ...ok, id: "with space" }])), "invalid", /№1: неверный идентификатор/);
   await rejects(imp(file([{ ...ok, id: "a".repeat(65) }])), "invalid", /идентификатор/);
   await rejects(imp(file([{ ...ok, date: "2026-02-30" }])), "invalid", /дата/);
-  await rejects(imp(file([{ ...ok, type: "transfer" }])), "invalid", /тип/);
+  await rejects(imp(file([{ ...ok, type: "loan" }])), "invalid", /тип/);
+  await rejects(imp(file([{ ...ok, type: "transfer", account: "a_bank" }])), "invalid", /№1: перевод без двух разных счетов/);
   await rejects(imp(file([{ ...ok, note: 5 }])), "invalid");
   await rejects(imp({ ...file([]), settings: { startBalance: "a lot" } }), "invalid", /настройки/);
   await rejects(imp({ ...file([]), settings: { startBalance: 1, goals: "many" } }), "invalid", /настройки/);
@@ -1647,7 +1676,7 @@ test("v2 goalId: backup export and import keep it; a bad goalId in a file is dro
   const d = await new Device({ seed: null }).ready();
   const id = await d.store.saveTx(null, saving({ goalId: "g_car" }));
   const out = d.store.backup.export();
-  assert.equal(out.version, 2);
+  assert.equal(out.version, 3);
   assert.equal(out.tx.find(t => t.id === id).goalId, "g_car");
   const fresh = await new Device({ seed: null }).ready();
   assert.equal((await fresh.store.backup.import(JSON.parse(JSON.stringify(out)))).added, 1);
@@ -1673,7 +1702,7 @@ test("v2 goalId: a project still on the old schema.sql (no goal_id column) asks 
   const a = await new Device({ server, seed: null }).ready();
   await a.signIn("anna@example.com");
   await a.store.saveTx(null, saving({ goalId: "g_car" }));
-  await rejects(a.store.sync.syncNow(), "invalid", /устарела.*schema\.sql/);
+  await rejects(a.store.sync.syncNow(), "invalid", /Обновите базу.*schema\.sql/);
   assert.equal(a.sync.phase, "error");
   assert.match(a.sync.error, /ещё раз/);
   assert.equal(a.sync.pending, 1, "kept on the device");
@@ -1691,19 +1720,19 @@ test("v2 settings: a v1 record on the device migrates (goal → goals with the g
   assertV2(d.snap.settings);
   const out = d.store.backup.export();
   assertV2(out.settings);
-  assert.deepEqual(out.settingsFieldsUpdatedAt, { startBalance: 100, goals: 200, limits: 300, categories: 0 }, "goal's stamp → goals; the record held no categories");
+  assert.deepEqual(out.settingsFieldsUpdatedAt, { startBalance: 100, goals: 200, limits: 300, categories: 0, ...NO_ACC_MS }, "goal's stamp → goals; the record held no categories");
   assert.equal(d.sync.pending, 1);
   // the next write stores v2 only; the fields it did not change keep their stamps
   d.tick(); await uiSaveSettings(d, { limits: { cafe: 400 } });
   let kv = d.kv().settings;
   assert.deepEqual(Object.keys(kv.data).sort(), ["categories", "goals", "limits", "startBalance"]);
-  assert.deepEqual(kv.fieldMs, { startBalance: 100, goals: 200, limits: d.t, categories: 0 });
+  assert.deepEqual(kv.fieldMs, { startBalance: 100, goals: 200, limits: d.t, categories: 0, ...NO_ACC_MS });
 
   // a v1 record from before field stamps: every field it holds counts as changed at updatedMs, categories at 0
   poke({ data: { startBalance: 1, goal: null, limits: {} }, updatedMs: 777, dirty: false, localOnly: false });
   await d.restart();
   assert.deepEqual(d.snap.settings, { ...DEFAULT_SETTINGS, startBalance: 1 });
-  assert.deepEqual(d.store.backup.export().settingsFieldsUpdatedAt, { startBalance: 777, goals: 777, limits: 777, categories: 0 });
+  assert.deepEqual(d.store.backup.export().settingsFieldsUpdatedAt, { startBalance: 777, goals: 777, limits: 777, categories: 0, ...NO_ACC_MS });
 
   // the v1 example (device-only, example.goal): flagged as goals; «Удалить пример» resets it with stamp 0
   poke({ data: { startBalance: 5240, goal: GOAL_V1, limits: { cafe: 800 }, example: { startBalance: true, goal: true, limits: true } }, fieldMs: { startBalance: 0, goal: 0, limits: 0 }, updatedMs: 0, dirty: false, localOnly: true });
@@ -1714,7 +1743,7 @@ test("v2 settings: a v1 record on the device migrates (goal → goals with the g
   assert.deepEqual(d.snap.settings, DEFAULT_SETTINGS);
   kv = d.kv().settings;
   assert.deepEqual([kv.localOnly, kv.dirty], [true, false], "still device-only");
-  assert.deepEqual(kv.fieldMs, { startBalance: 0, goals: 0, limits: 0, categories: 0 });
+  assert.deepEqual(kv.fieldMs, { startBalance: 0, goals: 0, limits: 0, categories: 0, ...NO_ACC_MS });
   assert.equal(d.sync.pending, 0);
 
   // an older src/seed.js (v1 settings) seeds a v2 example
@@ -1734,7 +1763,7 @@ test("v2 settings: a v1 server row migrates and merges per field with a v2 devic
   await a.signIn("anna@example.com");
   assert.deepEqual(a.snap.settings, { startBalance: 1000, goals: [GOAL_V1_AS_V2], limits: { cafe: 300 }, categories: [] });
   assertV2(a.snap.settings);
-  assert.deepEqual(a.kv().settings.fieldMs, { startBalance: T1 - 2000, goals: T1 - 1000, limits: T1, categories: 0 },
+  assert.deepEqual(a.kv().settings.fieldMs, { startBalance: T1 - 2000, goals: T1 - 1000, limits: T1, categories: 0, ...NO_ACC_MS },
     "the v1 _ms.goal stamps goals; the row holds no categories");
   assert.equal(a.sync.pending, 0, "a v1 row is read as is, not rewritten");
 
@@ -1817,7 +1846,7 @@ test("v2 settings: a v1 backup file migrates and merges per field; categories it
   d.t = 100_000;
   assert.equal((await d.store.backup.import(v1file)).settingsUpdated, true);
   assert.deepEqual(d.snap.settings, { startBalance: 777, goals: [GOAL, GOAL_V1_AS_V2], limits: { cafe: 5 }, categories: [CAT] });
-  assert.deepEqual(d.kv().settings.fieldMs, { startBalance: 15_000, goals: 20_000, limits: 15_000, categories: 10_000 });
+  assert.deepEqual(d.kv().settings.fieldMs, { startBalance: 15_000, goals: 20_000, limits: 15_000, categories: 10_000, ...NO_ACC_MS });
 
   // goals older on the device: the file's goal arrives as goals = [g_main], with the file's goal stamp
   const e = await new Device({ seed: null, clock: 10_000 }).ready();
@@ -1865,7 +1894,7 @@ test("v2 settings: a v1 record left in the localStorage fallback migrates and me
   assert.deepEqual(d.snap.settings, { startBalance: 100, goals: [GOAL_V1_AS_V2], limits: { cafe: 7 }, categories: [CAT] });
   const kv = d.kv().settings;
   assert.equal("goal" in kv.data, false);
-  assert.deepEqual(kv.fieldMs, { startBalance: T0, goals: T0 + 5000, limits: T0 + 6000, categories: T0 });
+  assert.deepEqual(kv.fieldMs, { startBalance: T0, goals: T0 + 5000, limits: T0 + 6000, categories: T0, ...NO_ACC_MS });
   assert.equal(kv.dirty, true);
 });
 
@@ -1924,7 +1953,7 @@ test("v2 settings: goals, categories and limits are checked entry by entry; whol
   assert.deepEqual(d.snap.settings, before);
 });
 
-test("v2 settings: the largest document the app can make is saved, pushed (server size check) and pulled whole", async () => {
+test("v3 settings: the largest document the app can make (20 goals, 60 categories, 100 limits, 20 accounts) is saved, pushed (server size check) and pulled whole", async () => {
   const doc = without(maxSettings(), "example");
   const server = createFakeSupabase();
   server.addUser("anna@example.com");
@@ -1935,10 +1964,11 @@ test("v2 settings: the largest document the app can make is saved, pushed (serve
   await a.store.sync.syncNow();
   assert.deepEqual([a.sync.phase, a.sync.pending], ["idle", 0]);
   const row = server.rows("budget_settings")[0];
-  assert.deepEqual(without(row.data, "_ms"), doc);
+  assert.deepEqual(without(row.data, "_ms", "_ms3"), doc);
+  assert.equal(row.data.accounts.length, MAX_ACCOUNTS);
   const bytes = pgJsonBytes(row.data);
-  assert.ok(bytes > 25_000 && bytes < 65536 - 30_000, `octet_length(data::text) = ${bytes}: far below the 64 KB check`);
-  assert.ok(bytes > 32768 - 8000, "it would come close to the old 32 KB check");
+  assert.ok(bytes > 35_000 && bytes < 65536 - 15_000, `octet_length(data::text) = ${bytes}: well below the 64 KB check`);
+  assert.ok(bytes > 32768, "it would not fit the 32 KB check of an older schema.sql");
   const b = await new Device({ server, seed: null }).ready();
   await b.signIn("anna@example.com");
   assert.deepEqual(b.snap.settings, doc);
@@ -1982,7 +2012,7 @@ test("v2 settings: «Удалить пример» on the v2 example resets ever
   assert.equal(ipad.snap.settings.example.categories, true);
   await uiClearExamples(ipad);
   assert.deepEqual(ipad.snap.settings, DEFAULT_SETTINGS);
-  assert.deepEqual(ipad.kv().settings.fieldMs, { startBalance: 0, goals: 0, limits: 0, categories: 0 });
+  assert.deepEqual(ipad.kv().settings.fieldMs, { startBalance: 0, goals: 0, limits: 0, categories: 0, ...NO_ACC_MS });
   assert.equal(ipad.kv().settings.localOnly, true);
   assert.equal(ipad.sync.pending, 0);
   await ipad.signIn("anna@example.com");
@@ -1996,9 +2026,8 @@ const G4 = { id: "g_sofa", name: "Диван", target: 4000, deadline: "", initi
 const C3 = { id: "c_vaad01", type: "expense", name: "Ваад байт", icon: "Building2" };
 const C4 = { id: "c_btl001", type: "income", name: "Пособие", icon: "HandCoins" };
 
-async function twoSignedIn(initial) {
-  const server = createFakeSupabase();
-  server.addUser("anna@example.com");
+async function twoSignedIn(initial, server = null) {
+  if (!server) { server = createFakeSupabase(); server.addUser("anna@example.com"); }
   const a = await new Device({ server, seed: null }).ready();
   await a.signIn("anna@example.com");
   if (initial) { await a.store.saveSettings(initial); await a.store.sync.syncNow(); }
@@ -2236,7 +2265,7 @@ test("v2 entries: malformed entry stamps in a row or a file are ignored, never c
 test("v2 entries: backups carry entry stamps and tombstones; a restored device does not bring back a goal deleted in the account", async () => {
   const { a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, goals: [GOAL, GOAL2] });
   const file = JSON.parse(JSON.stringify(b.store.backup.export()));            // GOAL, GOAL2
-  assert.deepEqual(Object.keys(file.settingsItemsUpdatedAt).sort(), ["categories", "goals"]);
+  assert.deepEqual(Object.keys(file.settingsItemsUpdatedAt).sort(), ["accounts", "categories", "goals"]);
   a.tick(60_000); await uiSaveSettings(a, { goals: [GOAL] }); await a.store.sync.syncNow();
   b.tick(120_000); await b.store.sync.syncNow();
   b.tick(1000); await b.store.backup.import(file);
@@ -2267,18 +2296,598 @@ test("v2 entries: pinning: only live savings without goalId; example records, ex
   assert.equal("goalId" in x.find(real), false);
 });
 
-test("v2 entries: the largest stamps the store adds (_ms with entry stamps and MAX_GONE tombstones) fit next to the largest document it accepts", async () => {
-  const wire = maxSettingsWire();
-  const msBytes = pgJsonBytes({ _ms: wire._ms }) - 2;
-  assert.ok(57000 + msBytes < 65536, `57 000 + ${msBytes} bytes of _ms must stay under the server's 65 536`);
+test("v3 entries: the largest stamps the store adds (_ms and _ms3 with entry stamps and MAX_GONE tombstones) fit next to the largest document it accepts", async () => {
+  const msBytes = stampBytes();
+  assert.ok(SETTINGS_CAP + msBytes <= 65536, `${SETTINGS_CAP} + ${msBytes} bytes of _ms and _ms3 must stay under the server's 65 536`);
+  assert.ok(pgJsonBytes(maxSettings()) < SETTINGS_CAP - 15_000, "the largest document of known fields leaves room for fields of newer versions");
   const d = await new Device({ seed: null }).ready();
   const pad = n => ({ ...DEFAULT_SETTINGS, notes: "x".repeat(n) });
-  await d.store.saveSettings(pad(56_900));
-  await rejects(d.store.saveSettings(pad(57_100)), "invalid");
+  await d.store.saveSettings(pad(SETTINGS_CAP - 100));
+  await rejects(d.store.saveSettings(pad(SETTINGS_CAP + 100)), "invalid");
+  // the stamps the store really pushes for the largest document have the measured shape (no key the helper misses)
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings(without(maxSettings(), "example"));
+  for (let i = 0; i < 3; i++) { a.tick(); await uiSaveSettings(a, { accounts: a.snap.settings.accounts.slice(1) }); }
+  await a.store.sync.syncNow();
+  const data = server.rows("budget_settings")[0].data, wire = maxSettingsWire();
+  assert.deepEqual(Object.keys(data._ms).sort(), Object.keys(wire._ms).sort());
+  assert.deepEqual(Object.keys(data._ms3).filter(k => k !== "example").sort(), Object.keys(wire._ms3).filter(k => k !== "example").sort());
+  assert.deepEqual(Object.keys(data._ms3.items.accounts).sort(), ["gone", "ms", "since"]);
+  assert.equal(Object.keys(data._ms3.items.accounts.gone).length, 3);
   // the store keeps exactly MAX_GONE tombstones per list (tests/helpers/max-settings.mjs measures that many)
   for (let i = 0; i < MAX_GONE + 5; i++) { d.tick(); await d.store.saveSettings({ ...DEFAULT_SETTINGS, goals: [{ ...GOAL, id: "g_t" + i }] }); }
   d.tick(); await d.store.saveSettings(DEFAULT_SETTINGS);
   assert.equal(Object.keys(d.kv().settings.items.goals.gone).length, MAX_GONE);
+});
+
+/* ── v3: accounts, transfers, installments (docs/ARCHITECTURE.md, v3) ─────────────────────── */
+const A1 = { id: "a_leumi", kind: "bank", name: "Леуми", icon: "Landmark", opening: 5000, createdAt: 1 };
+const A2 = { id: "a_cash", kind: "cash", name: "Наличные", icon: "Banknote", opening: 300, createdAt: 2 };
+const A3 = { id: "a_max", kind: "card", name: "Max", icon: "CreditCard", opening: 1200, billingDay: 10, payFrom: "a_leumi", creditLimit: 15000, createdAt: 3 };
+const A4 = { id: "a_paybox", kind: "wallet", name: "PayBox", icon: "Smartphone", opening: 0, createdAt: 4 };
+const ACCT = { ...DEFAULT_SETTINGS, accounts: [A1, A2, A3], defaultAccount: A1.id };
+const transfer = (over = {}) => tx({ type: "transfer", category: "transfer", amount: 400, account: A1.id, toAccount: A2.id, ...over });
+const part = (n, of = 3, over = {}) => tx({ amount: 400, account: A3.id, plan: { id: "p_vacuum1", n, of }, ...over });
+// the v3 fields of an operation as the UI sees it
+const v3Of = t => { const o = {}; for (const k of ["account", "toAccount", "plan"]) if (t && k in t) o[k] = t[k]; return o; };
+const v3Cols = r => Object.fromEntries(V3_COLS.map(k => [k, r[k]]));
+const NO_COLS = { account: null, to_account: null, plan_id: null, plan_n: null, plan_of: null };
+const accIds = d => (d.snap.settings.accounts || []).map(a => a.id);
+// mirror of the deployed v2 app.js saveSettings(patch): it builds the document from the four fields it knows
+function uiV2SaveSettings(d, patch) {
+  const s = d.snap.settings || DEFAULT_SETTINGS;
+  const next = { startBalance: s.startBalance, goals: s.goals, limits: s.limits, categories: s.categories, ...(s.example ? { example: { ...s.example } } : {}), ...patch };
+  if (next.example) { for (const k of Object.keys(patch)) delete next.example[k]; if (!Object.keys(next.example).length) delete next.example; }
+  return d.store.saveSettings(JSON.parse(JSON.stringify(next)));
+}
+
+test("v3 tx: account, toAccount and plan are stored, pushed (all five columns, null when unset), pulled and edited", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const { a, b } = await twoSignedIn(null, server);
+  const e1 = await a.store.saveTx(null, tx({ account: A3.id }));
+  const t1 = await a.store.saveTx(null, transfer({ category: "" }));
+  const p2 = await a.store.saveTx(null, part(2));
+  const s1 = await a.store.saveTx(null, saving({ goalId: "g_car", account: A1.id }));
+  const plain = await a.store.saveTx(null, tx());
+  assert.deepEqual(without(a.find(t1), "id", "updatedAt"),
+    { type: "transfer", amount: 400, category: "transfer", note: "", date: "2026-10-08", createdAt: 1, account: A1.id, toAccount: A2.id });
+  assert.deepEqual([v3Of(a.find(e1)), v3Of(a.find(p2)), v3Of(a.find(s1)), v3Of(a.find(plain))],
+    [{ account: A3.id }, { account: A3.id, plan: { id: "p_vacuum1", n: 2, of: 3 } }, { account: A1.id }, {}]);
+  assert.deepEqual(v3Of(a.kv().tx[t1]), { account: A1.id, toAccount: A2.id }, "kept in IndexedDB");
+  assert.deepEqual(v3Of(a.kv().tx[p2]), { account: A3.id, plan: { id: "p_vacuum1", n: 2, of: 3 } });
+
+  let sent = [];
+  server.hooks.beforeUpsert = (table, rows) => { if (table === "transactions") sent.push(...rows); };
+  await a.store.sync.syncNow();
+  assert.equal(sent.length, 5);
+  assert.ok(sent.every(r => V3_COLS.every(k => k in r)), "every row names all five columns (null clears)");
+  const row = id => server.rows("transactions").find(r => r.id === id);
+  assert.deepEqual(v3Cols(row(t1)), { ...NO_COLS, account: A1.id, to_account: A2.id });
+  assert.deepEqual(v3Cols(row(p2)), { ...NO_COLS, account: A3.id, plan_id: "p_vacuum1", plan_n: 2, plan_of: 3 });
+  assert.deepEqual(v3Cols(row(plain)), NO_COLS);
+  assert.equal(row(t1).type, "transfer");
+
+  await b.store.sync.syncNow();
+  for (const id of [e1, t1, p2, s1, plain]) assert.deepEqual(b.find(id), a.find(id), id);
+  // a split part turned into an income loses its plan, a transfer turned into an expense its destination: the
+  // columns are cleared on the server and on the other device
+  b.tick(1000);
+  await b.store.saveTx(p2, { ...without(b.find(p2), "id", "updatedAt"), type: "income", category: "salary" });
+  await b.store.saveTx(t1, { ...without(b.find(t1), "id", "updatedAt"), type: "expense", category: "cafe" });
+  await b.store.saveTx(e1, { ...without(b.find(e1), "id", "updatedAt", "account") });   // back to the default account
+  await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  assert.deepEqual([v3Cols(row(p2)), v3Cols(row(t1)), v3Cols(row(e1))], [{ ...NO_COLS, account: A3.id }, { ...NO_COLS, account: A1.id }, NO_COLS]);
+  assert.deepEqual([v3Of(a.find(p2)), v3Of(a.find(t1)), v3Of(a.find(e1))], [{ account: A3.id }, { account: A1.id }, {}]);
+  // a deleted transfer travels as a tombstone that keeps its accounts
+  const t2 = await a.store.saveTx(null, transfer());
+  await a.store.sync.syncNow();
+  a.tick(1000); await a.store.deleteTx(t2); await a.store.sync.syncNow(); await b.store.sync.syncNow();
+  assert.deepEqual([row(t2).deleted, row(t2).account, row(t2).to_account], [true, A1.id, A2.id]);
+  assert.equal(b.find(t2), undefined);
+  assert.equal(a.sync.pending + b.sync.pending, 0);
+});
+
+test("v3 tx: invalid account, toAccount and plan values are dropped exactly like the artifact store's txBody; a transfer needs two different accounts", async () => {
+  const d = await new Device({ seed: null }).ready();
+  const art = artifactStore();
+  await waitFor(() => art.snap && art.snap.status === "ready", { what: "artifact ready" });
+  const P = { id: "p_1", n: 1, of: 2 };
+  const cases = [
+    tx({ account: "a_ok" }), tx({ account: "bad id" }), tx({ account: "a".repeat(33) }), tx({ account: "a".repeat(32) }), tx({ account: 5 }), tx({ account: "" }),
+    tx({ toAccount: A2.id }), saving({ account: A1.id, toAccount: A2.id }), tx({ type: "income", category: "salary", toAccount: A2.id }),
+    transfer(), transfer({ account: "a_x", toAccount: "a_y" }), transfer({ account: "a-1", toAccount: "B_2" }),
+    tx({ plan: P }), tx({ plan: { id: "p_1", n: 36, of: 36 } }), tx({ plan: { ...P, extra: 1 } }),
+    tx({ type: "income", category: "salary", plan: P }), saving({ plan: P }), transfer({ plan: P }),
+    tx({ plan: { id: "p_1", n: 3, of: 2 } }), tx({ plan: { id: "p_1", n: 0, of: 2 } }), tx({ plan: { id: "p_1", n: 1, of: 37 } }),
+    tx({ plan: { id: "p 1", n: 1, of: 2 } }), tx({ plan: { id: "p".repeat(33), n: 1, of: 2 } }), tx({ plan: { id: "p_1", n: 1.5, of: 2 } }),
+    tx({ plan: { id: "p_1", n: "1", of: 2 } }), tx({ plan: "p_1" }), tx({ plan: { id: "p_1", n: 1 } }), tx({ plan: [1, 2] }), tx({ plan: null }),
+  ];
+  for (const [i, c] of cases.entries()) {
+    const id = await d.store.saveTx(null, c);
+    const aid = await art.store.saveTx(null, c);
+    const doc = art.docs.get("data/users/viewer1/budget/tx/" + aid);
+    assert.deepEqual(v3Of(d.find(id)), v3Of(doc), `case ${i}: ${JSON.stringify(c)}`);
+    assert.deepEqual(v3Of(d.kv().tx[id]), v3Of(doc), `case ${i} (stored)`);
+  }
+  // the server refuses a plan of one part (plan_of ≥ 2): the PWA store drops it (store-artifact's txBody keeps it)
+  assert.equal("plan" in d.find(await d.store.saveTx(null, tx({ plan: { id: "p_1", n: 1, of: 1 } }))), false);
+  // a transfer without a valid source and a different, valid destination would block the sync (server check)
+  for (const bad of [transfer({ toAccount: undefined }), transfer({ account: undefined }), transfer({ toAccount: A1.id }),
+    transfer({ toAccount: "bad id" }), transfer({ account: "x".repeat(33) })]) {
+    await rejects(d.store.saveTx(null, bad), "invalid", /счёт/);
+  }
+  const n = d.snap.tx.length;
+  await rejects(d.store.restoreTx("r1", transfer({ toAccount: undefined })), "invalid");
+  assert.equal(d.snap.tx.length, n);
+});
+
+test("v3 tx: rows other clients wrote with missing or malformed v3 columns never crash the app; bad values are dropped", async () => {
+  const server = createFakeSupabase();
+  const u = server.addUser("anna@example.com");
+  const b = await new Device({ server, seed: null }).ready();
+  await b.signIn("anna@example.com");
+  const base = { user_id: u.id, amount: 5, date: "2026-10-01", client_updated_ms: 1 };
+  server.put("transactions", { ...base, id: "w1", type: "transfer", category: "transfer" });                                   // no accounts at all
+  server.put("transactions", { ...base, id: "w2", type: "transfer", account: "a_x", to_account: "a_x" });                      // same account twice
+  server.put("transactions", { ...base, id: "w3", type: "income", account: "a_x", to_account: "a_y", plan_id: "p_1", plan_n: 1, plan_of: 2 });
+  server.put("transactions", { ...base, id: "w4", type: "expense", plan_id: "p_1", plan_n: 3, plan_of: 2 });
+  server.put("transactions", { ...base, id: "w5", type: "expense", account: "bad id", plan_id: "p_1", plan_n: 2, plan_of: 2 });
+  server.put("transactions", { ...base, id: "w6", type: "expense", plan_id: "p_1", plan_n: null, plan_of: 2 });
+  server.put("transactions", { ...base, id: "w7", type: "transfer", account: "a_x", to_account: "a_y", deleted: true });
+  server.put("transactions", { ...base, id: "w8", type: "transfer", account: 7, to_account: { id: "a_y" }, amount: 1 });
+  await b.store.sync.syncNow();
+  assert.deepEqual(["w1", "w2", "w3", "w4", "w5", "w6", "w8"].map(id => v3Of(b.find(id))),
+    [{}, { account: "a_x" }, { account: "a_x" }, {}, { plan: { id: "p_1", n: 2, of: 2 } }, {}, {}]);
+  assert.equal(b.find("w1").type, "transfer", "a transfer without accounts is still shown (as the default account's)");
+  assert.equal(b.find("w7"), undefined);
+  assert.equal(b.kv().tx.w7.deleted, true);
+  assert.deepEqual([b.sync.phase, b.sync.pending, b.sync.error], ["idle", 0, null]);
+  JSON.parse(JSON.stringify(b.store.backup.export()));
+});
+
+test("v3 tx: backups (version 3) keep account, toAccount and plan; older files import; bad values in a file are dropped", async () => {
+  const d = await new Device({ seed: null }).ready();
+  const ids = [await d.store.saveTx(null, transfer()), await d.store.saveTx(null, part(1)), await d.store.saveTx(null, tx({ account: A2.id })), await d.store.saveTx(null, tx())];
+  await d.store.saveSettings(ACCT);
+  const out = JSON.parse(JSON.stringify(d.store.backup.export()));
+  assert.equal(out.version, 3);
+  for (const id of ids) assert.deepEqual(out.tx.find(t => t.id === id), d.find(id));
+  assert.deepEqual(out.settings, ACCT);
+  assert.deepEqual(Object.keys(out.settingsFieldsUpdatedAt).sort(), ["accounts", "categories", "defaultAccount", "goals", "limits", "startBalance"]);
+  assert.deepEqual(Object.keys(out.settingsItemsUpdatedAt).sort(), ["accounts", "categories", "goals"]);
+  assert.deepEqual(Object.keys(out.settingsItemsUpdatedAt.accounts.ms).sort(), [A1.id, A2.id, A3.id].sort());
+  const fresh = await new Device({ seed: null }).ready();
+  assert.equal((await fresh.store.backup.import(out)).added, 4);
+  for (const id of ids) assert.deepEqual(fresh.find(id), d.find(id));
+  assert.deepEqual(fresh.snap.settings, ACCT);
+  assert.deepEqual(fresh.kv().settings.fieldMs, d.kv().settings.fieldMs);
+  assert.deepEqual(fresh.kv().settings.items, d.kv().settings.items);
+  // bad values are dropped, not refused (like goalId); a transfer without two accounts is refused
+  const f = { amount: 5, note: "", date: "2026-10-01", createdAt: 0 };
+  const res = await fresh.store.backup.import({ app: "budget", version: 3, exportedAt: "", settings: null, tx: [
+    { ...f, id: "f1", type: "expense", category: "cafe", account: "bad id", toAccount: A1.id, plan: { id: "p_1", n: 4, of: 3 } },
+    { ...f, id: "f2", type: "income", category: "salary", account: A1.id, plan: { id: "p_1", n: 1, of: 3 } },
+  ] });
+  assert.equal(res.added, 2);
+  assert.deepEqual([v3Of(fresh.find("f1")), v3Of(fresh.find("f2"))], [{}, { account: A1.id }]);
+  await rejects(fresh.store.backup.import({ app: "budget", version: 3, exportedAt: "", settings: null, tx: [{ ...f, id: "f3", type: "transfer", category: "transfer", account: A1.id, toAccount: A1.id }] }),
+    "invalid", /№1: перевод/);
+  // a v2 file says nothing about accounts: the device's accounts stay
+  const v2file = { app: "budget", version: 2, exportedAt: "", settings: { ...DEFAULT_SETTINGS, startBalance: 1 }, settingsUpdatedAt: fresh.t + 10, tx: [] };
+  fresh.tick(100);
+  await fresh.store.backup.import(v2file);
+  assert.deepEqual(fresh.snap.settings, { ...ACCT, startBalance: 1 });
+  // a v3 file leaves accounts and defaultAccount out once they were cleared, but stamps them: cleared here too when later
+  const g = await new Device({ seed: null, clock: fresh.t + 10_000 }).ready();
+  await g.store.saveSettings(ACCT);
+  g.tick(1000); await g.store.saveSettings(DEFAULT_SETTINGS);
+  const cleared = JSON.parse(JSON.stringify(g.store.backup.export()));
+  assert.deepEqual([cleared.settings, cleared.settingsFieldsUpdatedAt.accounts, cleared.settingsFieldsUpdatedAt.defaultAccount], [DEFAULT_SETTINGS, g.t, g.t]);
+  fresh.t = g.t + 1000;
+  await fresh.store.backup.import(cleared);
+  assert.deepEqual(fresh.snap.settings, { ...DEFAULT_SETTINGS, startBalance: 1 }, "accounts and default cleared; the newer start balance stays");
+});
+
+test("v3 tx: a project still on the v2 schema.sql (no account columns, no 'transfer' type) asks to update the base; data stays on the device, unsynced, without a retry loop", async () => {
+  for (const flag of ["noV3Columns", "noTransferType"]) {
+    const server = createFakeSupabase();
+    server.addUser("anna@example.com");
+    server[flag] = true;
+    const a = await new Device({ server, seed: null, delays: { write: 5, realtime: 5, interval: 1e7 } }).ready();
+    await a.signIn("anna@example.com");
+    const synced = a.sync.lastSyncAt;
+    a.tick(5000);
+    const t1 = await a.store.saveTx(null, transfer());
+    const e1 = await a.store.saveTx(null, tx());
+    await rejects(a.store.sync.syncNow(), "invalid", /Обновите базу.*supabase\/schema\.sql ещё раз/);
+    await sleep(30);
+    assert.equal(a.sync.phase, "error", flag);
+    assert.match(a.sync.error, /^Обновите базу: выполните supabase\/schema\.sql ещё раз \(SQL Editor в Supabase\)/);
+    assert.equal(a.sync.pending, 2, "kept on the device, not marked synced");
+    assert.deepEqual([a.kv().tx[t1].dirty, a.kv().tx[e1].dirty], [true, true]);
+    assert.ok(a.find(t1) && a.find(e1));
+    assert.equal(server.rows("transactions").length, 0);
+    assert.equal(a.sync.lastSyncAt, synced, "no successful sync recorded");
+    const upserts = () => server.log.filter(l => l.op === "upsert" && l.table === "transactions").length;
+    const n = upserts();
+    await sleep(250);
+    assert.equal(upserts(), n, "no automatic retry until the next trigger (a write, the minute timer, coming back)");
+    a.win.setVisible(false); a.win.setVisible(true);
+    await sleep(100);
+    assert.equal(upserts(), n + 1, "a trigger retries once");
+    // the user ran schema.sql again: everything goes up
+    server[flag] = false;
+    await a.store.sync.syncNow();
+    assert.deepEqual([a.sync.phase, a.sync.pending, a.sync.error], ["idle", 0, null]);
+    assert.deepEqual(v3Cols(server.rows("transactions").find(r => r.id === t1)), { ...NO_COLS, account: A1.id, to_account: A2.id });
+  }
+});
+
+test("v3 accounts: two devices add different accounts offline: both survive; the same account edited on both: the later edit wins", async () => {
+  const { server, a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, accounts: [A1, A2], defaultAccount: A1.id });
+  a.win.setOnline(false); b.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { accounts: [...a.snap.settings.accounts, A3] });
+  const ta = await a.store.saveTx(null, tx({ account: A3.id }));
+  b.tick(120_000); await uiSaveSettings(b, { accounts: [...b.snap.settings.accounts, A4] });
+  const tb = await b.store.saveTx(null, transfer({ toAccount: A4.id }));
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) {
+    assert.deepEqual(accIds(d).sort(), [A1.id, A2.id, A3.id, A4.id].sort());
+    assert.equal(d.snap.settings.defaultAccount, A1.id);
+    for (const t of [ta, tb]) assert.ok(accIds(d).includes(d.find(t).account) && (!d.find(t).toAccount || accIds(d).includes(d.find(t).toAccount)));
+  }
+  assert.equal(server.rows("budget_settings")[0].data.accounts.length, 4);
+  // the same account renamed on both devices offline: the later rename wins, the other accounts are untouched
+  a.win.setOnline(false); b.win.setOnline(false);
+  const rename = (d, name) => uiSaveSettings(d, { accounts: d.snap.settings.accounts.map(x => (x.id === A1.id ? { ...x, name } : x)) });
+  b.tick(60_000); await rename(b, "Леуми (b)");
+  a.t = b.t + 60_000; await rename(a, "Леуми (a)");
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) {
+    assert.equal(d.snap.settings.accounts.find(x => x.id === A1.id).name, "Леуми (a)");
+    assert.equal(d.snap.settings.accounts.length, 4);
+  }
+  assert.equal(a.sync.pending + b.sync.pending, 0);
+});
+
+test("v3 accounts: a deleted account does not come back from a stale device; an edit made after the delete does; tombstones are capped", async () => {
+  const { server, a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, accounts: [A1, A2, A3], defaultAccount: A1.id });
+  const c = await new Device({ server, seed: null }).ready();
+  await c.signIn("anna@example.com");
+  c.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { accounts: [A1, A3] }); await a.store.sync.syncNow();
+  b.tick(70_000); await b.store.sync.syncNow();
+  c.tick(80_000); await uiSaveSettings(c, { accounts: [...c.snap.settings.accounts, A4] });    // stale: still holds A2
+  c.win.setOnline(true); await c.store.sync.syncNow();
+  await a.store.sync.syncNow(); await b.store.sync.syncNow();
+  for (const d of [a, b, c]) assert.deepEqual(accIds(d), [A1.id, A3.id, A4.id]);
+  // b edits A4 offline after a deletes it: the later edit wins (like goals)
+  b.win.setOnline(false);
+  a.tick(100_000); await uiSaveSettings(a, { accounts: [A1, A3] }); await a.store.sync.syncNow();
+  b.tick(200_000); await uiSaveSettings(b, { accounts: [A1, A3, { ...A4, name: "PayBox 2" }] });
+  b.win.setOnline(true); await b.store.sync.syncNow(); await a.store.sync.syncNow(); await c.store.sync.syncNow();
+  for (const d of [a, b, c]) assert.deepEqual(d.snap.settings.accounts.map(x => [x.id, x.name]), [[A1.id, A1.name], [A3.id, A3.name], [A4.id, "PayBox 2"]]);
+  // tombstones: at most MAX_GONE; dropping old ones still keeps their accounts deleted on a stale device
+  const acc = i => ({ ...A2, id: "a_k" + String(i).padStart(3, "0"), name: "Счёт " + i });
+  a.tick(1000); await uiSaveSettings(a, { accounts: [0, 1, 2, 3, 4].map(acc) }); await a.store.sync.syncNow();
+  await b.store.sync.syncNow();
+  b.win.setOnline(false);
+  for (let i = 5; i < 41; i++) { a.tick(1000); await uiSaveSettings(a, { accounts: [...a.snap.settings.accounts.slice(1), acc(i)] }); }
+  await a.store.sync.syncNow();
+  const items = server.rows("budget_settings")[0].data._ms3.items.accounts;
+  assert.equal(Object.keys(items.gone).length, 30);
+  assert.equal(Object.keys(a.kv().settings.items.accounts.gone).length, 30);
+  assert.ok(items.since > 0);
+  b.tick(100_000); await uiSaveSettings(b, { accounts: [...b.snap.settings.accounts, { ...A2, id: "a_new" }] });   // stale: holds a_k000…a_k004
+  b.win.setOnline(true); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) assert.deepEqual(accIds(d), ["a_k036", "a_k037", "a_k038", "a_k039", "a_k040", "a_new"]);
+});
+
+test("v3 accounts: defaultAccount merges per field; sign-in after anonymous use with accounts keeps the account's list and default", async () => {
+  const { a, b } = await twoSignedIn(ACCT);
+  a.win.setOnline(false); b.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { defaultAccount: A2.id });
+  b.tick(120_000); await uiSaveSettings(b, { limits: { cafe: 700 } });
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  for (const d of [a, b]) assert.deepEqual([d.snap.settings.defaultAccount, d.snap.settings.limits], [A2.id, { cafe: 700 }]);
+  b.tick(1000); await uiSaveSettings(b, { defaultAccount: A3.id }); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  assert.equal(a.snap.settings.defaultAccount, A3.id);
+
+  // a phone used without an account adds a wallet of its own, then signs in: the account's accounts and default stay
+  const phone = await new Device({ server: a.server, seed: null, clock: a.t + 3_600_000 }).ready();
+  await phone.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: [A4] });
+  const own = await phone.store.saveTx(null, tx({ account: A4.id }));
+  await phone.signIn("anna@example.com");
+  await a.store.sync.syncNow();
+  for (const d of [a, phone]) {
+    assert.deepEqual(accIds(d), [A1.id, A2.id, A3.id, A4.id], "union, the account's accounts first");
+    assert.equal(d.snap.settings.defaultAccount, A3.id);
+  }
+  assert.equal(a.find(own).account, A4.id);
+});
+
+test("v3 accounts: entries are checked one by one (a_main accepted); whole-field errors reject; the UI never sees stamps", async () => {
+  const d = await new Device({ seed: null }).ready();
+  const good = [
+    { ...A1, name: "  Леуми  ", extra: "dropped" },
+    { id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", opening: -250.5, createdAt: 0 },
+    { ...A3, billingDay: 29, payFrom: "bad id", creditLimit: -5 },
+    { ...A4, icon: "no such icon!", billingDay: 10, payFrom: A1.id, creditLimit: 100 },        // card-only fields on a wallet
+    { id: "a_long", kind: "cash", name: "Н".repeat(60), opening: 1, createdAt: 9 },
+    { id: "a_self", kind: "card", name: "Сам себе", icon: "CreditCard", opening: 0, payFrom: "a_self", billingDay: 1.5, createdAt: 5 },
+  ];
+  const bad = [
+    { ...A2, id: "acc1" }, { ...A2, id: "a_" }, { ...A2, id: "a_" + "x".repeat(31) }, { ...A2, id: "a_bad id" }, { ...A2, kind: "loan" },
+    { ...A2, name: "   " }, { ...A2, name: 5 }, { ...A2, opening: NaN }, { ...A2, opening: 1e10 }, { ...A2, opening: "5" }, null, "a_cash",
+    { ...A1, name: "duplicate" },
+  ];
+  await d.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: [...good, ...bad], defaultAccount: "a_main" });
+  assert.deepEqual(d.snap.settings.accounts, [
+    { ...A1 },
+    { id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", opening: -250.5, createdAt: 0 },
+    without(A3, "billingDay", "payFrom", "creditLimit"),
+    { ...A4, icon: "Smartphone" },
+    { id: "a_long", kind: "cash", name: "Н".repeat(40), icon: "Banknote", opening: 1, createdAt: 9 },
+    { id: "a_self", kind: "card", name: "Сам себе", icon: "CreditCard", opening: 0, createdAt: 5 },
+  ]);
+  assert.equal(d.snap.settings.defaultAccount, "a_main");
+  assertV3(d.snap.settings);
+  // at most 20 accounts (the first ones); a bad default is dropped
+  const many = Array.from({ length: 25 }, (_, i) => ({ ...A2, id: "a_n" + i }));
+  await d.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: many, defaultAccount: "bad id" });
+  assert.deepEqual(accIds(d), many.slice(0, 20).map(x => x.id));
+  assert.equal("defaultAccount" in d.snap.settings, false);
+  await d.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: [A1], defaultAccount: 7 });
+  assert.equal("defaultAccount" in d.snap.settings, false);
+  // no accounts: the field is left out (v2 shape), like the app writes it
+  await d.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: [], defaultAccount: "" });
+  assert.deepEqual(d.snap.settings, DEFAULT_SETTINGS);
+  await rejects(d.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: { a_cash: A2 } }), "invalid", /проверьте введённые значения/);
+  await rejects(d.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: "a_cash" }), "invalid");
+  // stamps never come from the UI and never reach it
+  await d.store.saveSettings({ ...ACCT, _ms3: { accounts: 9e15, defaultAccount: 9e15, at: 9e15, items: { accounts: { since: 9e15, ms: {}, gone: {} } } } });
+  assert.equal("_ms3" in d.snap.settings, false);
+  assert.equal("_ms3" in d.kv().settings.data, false);
+  assert.equal("_ms3" in d.store.backup.export().settings, false);
+  assert.ok(d.kv().settings.fieldMs.accounts < 9e15 && d.kv().settings.items.accounts.since < 9e15);
+});
+
+test("v3 accounts: rows of older versions follow the existing rules: a v2 row says nothing about accounts; a row holding accounts without stamps counts as a whole", async () => {
+  const { server, a } = await twoSignedIn(ACCT);
+  const u = a.sync.user;
+  // a v2 row: no accounts, no _ms3 (a v2 app saved its four fields): the device keeps its accounts and pushes them back
+  const t1 = a.t + 60_000;
+  server.put("budget_settings", { user_id: u.id, client_updated_ms: t1,
+    data: { ...DEFAULT_SETTINGS, startBalance: 42, _ms: { startBalance: t1, goals: 0, limits: 0, categories: 0, at: t1 } } });
+  a.tick(120_000); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings, { ...ACCT, startBalance: 42 });
+  assert.deepEqual(server.rows("budget_settings")[0].data.accounts, ACCT.accounts, "pushed back");
+  // a row with accounts but no stamps for them (a version that knew no stamps): the list counts as changed as a whole
+  // at client_updated_ms: an account added here earlier and not in it is gone, one added later stays
+  a.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { accounts: [...a.snap.settings.accounts, A4] });       // older than the row
+  const t2 = a.t + 60_000;
+  server.put("budget_settings", { user_id: u.id, client_updated_ms: t2,
+    data: { ...DEFAULT_SETTINGS, accounts: [{ ...A1, name: "Леуми 2" }], defaultAccount: A1.id, _ms: { startBalance: 0, goals: 0, limits: 0, categories: 0, at: t2 } } });
+  a.tick(120_000); await uiSaveSettings(a, { accounts: [...a.snap.settings.accounts, { ...A2, id: "a_new" }] });   // newer than the row
+  a.win.setOnline(true); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings.accounts.map(x => [x.id, x.name]), [[A1.id, "Леуми 2"], ["a_new", A2.name]]);
+  // malformed _ms3 never crashes and never reaches the UI
+  const t3 = a.t + 60_000;
+  server.put("budget_settings", { user_id: u.id, client_updated_ms: t3,
+    data: { ...ACCT, _ms3: { accounts: "x", defaultAccount: -1, at: t3, items: { accounts: { since: "x", ms: { [A1.id]: 9e15, __proto__x: 1 }, gone: JSON.parse('{"__proto__": 5, "bad id": 7}') } }, example: "yes" } } });
+  a.tick(120_000); await a.store.sync.syncNow();
+  // the bad stamps count as the row's own time; its entry list (since 0, no tombstones) deletes nothing; the merged
+  // list holds both sides' accounts, so startBalance is their net opening (5000 + 300 − 1200 + 300)
+  assert.deepEqual(a.snap.settings, { ...ACCT, startBalance: 4400, accounts: [A1, A2, A3, { ...A2, id: "a_new" }] });
+  assert.equal(a.sync.phase, "idle");
+  assertV3(a.snap.settings);
+  // _ms3 written after the row (at > client_updated_ms) is not trusted: the list counts as a whole at the row's time
+  const t4 = a.t + 60_000;
+  server.put("budget_settings", { user_id: u.id, client_updated_ms: t4, data: { ...ACCT, _ms3: { accounts: t4, at: t4 + 5 } } });
+  a.tick(1000); await a.store.sync.syncNow();
+  assert.deepEqual(a.snap.settings, ACCT);
+});
+
+// an example budget with accounts, a transfer and a split part (like src/seed.js v3)
+const exampleSeed = { make: () => ({ settings: { ...ACCT, startBalance: 6500, accounts: [A1, A2], example: { startBalance: true, accounts: true } },
+  tx: [{ id: "ex01", ...transfer(), example: true }, { id: "ex02", ...part(1), example: true }] }) };
+test("v3 accounts: the example's accounts never join an account's accounts; «Удалить пример» keeps device-only settings; examples stay device-only", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const phone = await new Device({ server, seed: null }).ready();
+  await phone.signIn("anna@example.com");
+  await phone.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: [A3, A4], defaultAccount: A4.id });
+  await phone.store.sync.syncNow();
+  const ipad = await new Device({ server, seed: exampleSeed }).ready();
+  assert.deepEqual([accIds(ipad), ipad.snap.settings.defaultAccount, ipad.snap.settings.example], [[A1.id, A2.id], A1.id, { startBalance: true, accounts: true }]);
+  assert.deepEqual(v3Of(ipad.find("ex01")), { account: A1.id, toAccount: A2.id });
+  assert.equal(ipad.kv().settings.localOnly, true);
+  assert.deepEqual(ipad.kv().settings.fieldMs, { startBalance: 0, goals: 0, limits: 0, categories: 0, accounts: 0, defaultAccount: 0 }, "the example's default goes with its accounts");
+  // a save that keeps the example values keeps them device-only
+  await uiSaveSettings(ipad, {});
+  assert.equal(ipad.kv().settings.localOnly, true);
+  await ipad.signIn("anna@example.com");
+  assert.deepEqual([accIds(ipad), ipad.snap.settings.defaultAccount], [[A3.id, A4.id], A4.id]);
+  assert.equal("example" in ipad.snap.settings, false);
+  assert.deepEqual(ipad.ids(), []);
+  // a third device shows the example while signed into an empty account and sets a limit of its own: the example
+  // accounts travel flagged as the example (stamp 0); a device that signs in resets them, and they lose to real ones
+  const server2 = createFakeSupabase();
+  server2.addUser("anna@example.com");
+  const c = await new Device({ server: server2, seed: exampleSeed }).ready();
+  await c.signIn("anna@example.com");
+  c.tick(); await uiSaveSettings(c, { limits: { cafe: 100 } });
+  await c.store.sync.syncNow();
+  const row = server2.rows("budget_settings")[0].data;
+  assert.deepEqual([row.example, row._ms3.accounts, row._ms3.defaultAccount, row._ms3.example], [{ startBalance: true, accounts: true }, 0, 0, true]);
+  const e = await new Device({ server: server2, seed: null, clock: c.t + 1000 }).ready();
+  await e.signIn("anna@example.com");
+  e.tick(); await uiSaveSettings(e, { accounts: [A3], defaultAccount: A3.id });
+  await e.store.sync.syncNow(); await c.store.sync.syncNow();
+  for (const d of [c, e]) assert.deepEqual([accIds(d), d.snap.settings.defaultAccount, d.snap.settings.example, d.snap.settings.startBalance], [[A3.id], A3.id, undefined, 0]);
+});
+
+/* ── v2 ⇄ v3: deployed v2 apps keep running until they update ─────────────────── */
+
+test("v2 client with v3 rows: transfers stay invisible and untouched; its edits and deletes keep account and plan on the server", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings(ACCT);
+  const e1 = await a.store.saveTx(null, part(1, 2, { note: "Пылесос" }));
+  const e2 = await a.store.saveTx(null, part(2, 2, { note: "Пылесос", date: "2026-11-08" }));
+  const t1 = await a.store.saveTx(null, transfer());
+  const i1 = await a.store.saveTx(null, tx({ type: "income", category: "salary", account: A1.id }));
+  await a.store.sync.syncNow();
+  const row = id => server.rows("transactions").find(r => r.id === id);
+  const before = { t1: { ...row(t1) } };
+  const mark = server.log.length;
+
+  const v2 = await new Device({ server, seed: null, factory: createV2Store }).ready();
+  await v2.signIn("anna@example.com");
+  assert.deepEqual(v2.ids(), [e1, e2, i1].sort(), "a v2 client does not show transfers");
+  assert.deepEqual(v3Of(v2.find(e1)), {}, "nor the v3 fields");
+  assert.equal(v2.kv().tx[t1], undefined, "and does not store them");
+  v2.tick(1000);
+  await v2.store.saveTx(e1, { ...without(v2.find(e1), "id", "updatedAt"), note: "Пылесос Dyson" });
+  await v2.store.deleteTx(i1);
+  await v2.store.sync.syncNow();
+  assert.deepEqual([v2.sync.phase, v2.sync.pending], ["idle", 0]);
+  assert.deepEqual([row(e1).note, v3Cols(row(e1))], ["Пылесос Dyson", { ...NO_COLS, account: A3.id, plan_id: "p_vacuum1", plan_n: 1, plan_of: 2 }], "an update names only the columns v2 knows");
+  assert.deepEqual([row(i1).deleted, row(i1).account], [true, A1.id]);
+  assert.deepEqual(row(t1), before.t1, "the transfer row was never written");
+  assert.ok(!server.log.slice(mark).some(l => l.op === "upsert" && l.table === "transactions" && l.ids.includes(t1)));
+  await a.store.sync.syncNow();
+  assert.deepEqual([a.find(e1).note, v3Of(a.find(e1))], ["Пылесос Dyson", { account: A3.id, plan: { id: "p_vacuum1", n: 1, of: 2 } }]);
+  assert.equal(a.find(i1), undefined);
+  assert.deepEqual(v3Of(a.find(t1)), { account: A1.id, toAccount: A2.id });
+  // a transfer deleted on v3 reaches v2 as a tombstone it stores and never shows
+  a.tick(1000); await a.store.deleteTx(t1); await a.store.sync.syncNow(); await v2.store.sync.syncNow();
+  assert.equal(v2.find(t1), undefined);
+  assert.equal(v2.sync.pending, 0);
+
+  // known limitation: v2 turning a split part into an income keeps plan_id on the server (an update sets only the
+  // columns it names), which the server refuses: v2 keeps the change on the device and shows the sync error
+  v2.tick(1000);
+  await v2.store.saveTx(e2, { ...without(v2.find(e2), "id", "updatedAt"), type: "income", category: "salary" });
+  await rejects(v2.store.sync.syncNow(), "invalid", /отклонил/);
+  assert.equal(row(e2).type, "expense");
+  assert.equal(v2.sync.pending, 1);
+});
+
+test("v2 client with v3 settings: its merges carry accounts with their stamps; a document without them (a row its pull missed) is repaired by v3 devices", async () => {
+  const { server, a, b: c } = await twoSignedIn(ACCT);
+  const v2 = await new Device({ server, seed: null, factory: createV2Store }).ready();
+  await v2.signIn("anna@example.com");
+  assert.deepEqual(v2.snap.settings.accounts, ACCT.accounts, "a v2 store keeps fields it does not know");
+  // a adds an account offline; c deletes one and syncs; v2 changes a limit and merges c's row before pushing
+  a.win.setOnline(false);
+  a.tick(60_000); await uiSaveSettings(a, { accounts: [...a.snap.settings.accounts, A4] });
+  c.tick(70_000); await uiSaveSettings(c, { accounts: [A1, A3] }); await c.store.sync.syncNow();
+  v2.tick(80_000); await uiV2SaveSettings(v2, { limits: { cafe: 500 } });
+  await v2.store.sync.syncNow();
+  let data = server.rows("budget_settings")[0].data;
+  assert.deepEqual([data.accounts, data.limits, data._ms3.at < data._ms.at], [[A1, A3], { cafe: 500 }, true], "v2 carried c's accounts and _ms3");
+  a.win.setOnline(true); await a.store.sync.syncNow(); await c.store.sync.syncNow(); await v2.store.sync.syncNow();
+  for (const d of [a, c]) {
+    assert.deepEqual(accIds(d), [A1.id, A3.id, A4.id], "a's offline account survives, c's deletion holds");
+    assert.deepEqual(d.snap.settings.limits, { cafe: 500 });
+  }
+  assert.deepEqual(v2.snap.settings.accounts.map(x => x.id), [A1.id, A3.id, A4.id]);
+
+  // the deployed v2 app saves only its four fields, but its sync pulls the current row first (its settings cursor is
+  // that row's updated_at, and it reads from cursor − 2 min) and merges it: the accounts stay
+  v2.tick(1000); await uiV2SaveSettings(v2, { limits: { cafe: 550 } }); await v2.store.sync.syncNow();
+  data = server.rows("budget_settings")[0].data;
+  assert.deepEqual([data.accounts.map(x => x.id), data.defaultAccount, data.limits, data._ms3.at < data._ms.at], [[A1.id, A3.id, A4.id], A1.id, { cafe: 550 }, true]);
+  // a row its pull did not return (simulated: the row's updated_at moved behind v2's cursor) leaves nothing to merge,
+  // and v2 pushes a document without accounts
+  const srow = [...server.tables.budget_settings.values()][0];
+  srow.updated_at = fmtUs(tsUs(srow.updated_at) - 10 * 60e6);
+  v2.tick(1000); await uiV2SaveSettings(v2, { limits: { cafe: 600 } }); await v2.store.sync.syncNow();
+  data = server.rows("budget_settings")[0].data;
+  assert.deepEqual(["accounts" in data, "defaultAccount" in data, "_ms3" in data], [false, false, false], "v2 dropped them");
+  await c.store.sync.syncNow();
+  data = server.rows("budget_settings")[0].data;
+  assert.deepEqual([data.accounts.map(x => x.id), data.defaultAccount, data.limits], [[A1.id, A3.id, A4.id], A1.id, { cafe: 600 }], "a v3 device puts them back");
+  await a.store.sync.syncNow(); await v2.store.sync.syncNow();
+  for (const d of [a, c]) assert.deepEqual([accIds(d), d.snap.settings.defaultAccount, d.snap.settings.limits], [[A1.id, A3.id, A4.id], A1.id, { cafe: 600 }]);
+  assert.equal(a.sync.pending + c.sync.pending, 0);
+});
+
+test("v2 client with the v3 example: example accounts it carries along stay the example's (_ms3.example)", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const c = await new Device({ server, seed: exampleSeed }).ready();
+  await c.signIn("anna@example.com");                                    // an empty account: the example stays
+  c.tick(); await uiSaveSettings(c, { limits: { cafe: 100 } }); await c.store.sync.syncNow();
+  const v2 = await new Device({ server, seed: null, factory: createV2Store }).ready();
+  await v2.signIn("anna@example.com");          // resets what it sees as the example (startBalance), carries the accounts
+  const data = server.rows("budget_settings")[0].data;
+  assert.deepEqual([data.example, data.accounts.map(x => x.id), data._ms3.example], [undefined, [A1.id, A2.id], true], "v2 dropped example.accounts");
+  const e = await new Device({ server, seed: null }).ready();
+  await e.signIn("anna@example.com");
+  assert.equal(e.snap.settings.accounts, undefined, "still the example's: reset like every example value");
+  assert.equal(e.snap.settings.defaultAccount, undefined);
+  await c.store.sync.syncNow();
+  assert.deepEqual([c.snap.settings.accounts, c.snap.settings.limits], [undefined, { cafe: 100 }]);
+});
+
+test("v2 → v3 update on one device: a full pull brings the transfers and v3 fields the v2 store skipped; its unsynced edits keep account and plan", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings(ACCT);
+  const e1 = await a.store.saveTx(null, part(1, 2));
+  const e2 = await a.store.saveTx(null, part(2, 2, { date: "2026-11-08" }));
+  const t1 = await a.store.saveTx(null, transfer());
+  const i1 = await a.store.saveTx(null, tx({ type: "income", category: "salary", account: A2.id }));
+  await a.store.sync.syncNow();
+
+  const d = await new Device({ server, seed: null, factory: createV2Store }).ready();
+  await d.signIn("anna@example.com");
+  assert.deepEqual(d.ids(), [e1, e2, i1].sort());
+  d.win.setOnline(false);
+  d.tick(1000);
+  await d.store.saveTx(e1, { ...without(d.find(e1), "id", "updatedAt"), note: "edited on v2" });
+  await d.store.saveTx(e2, { ...without(d.find(e2), "id", "updatedAt"), type: "income", category: "salary" });
+  await uiV2SaveSettings(d, { limits: { cafe: 900 } });                     // the v2 app's save drops the accounts here
+  // the app updates while offline: same IndexedDB, v3 store; the server's rows are older than the pull overlap
+  await d.upgrade(createBudgetStore);
+  assert.equal(d.snap.settings.accounts, undefined);
+  assert.equal(d.sync.pending, 3);
+  for (const t of Object.values(server.tables)) for (const r of t.values()) r.updated_at = fmtUs(tsUs(r.updated_at) - 10 * 60e6);
+  d.win.setOnline(true);
+  await d.store.sync.syncNow();
+  assert.deepEqual([d.sync.phase, d.sync.pending], ["idle", 0]);
+  assert.deepEqual(d.ids(), [e1, e2, i1, t1].sort(), "the transfer the v2 store skipped is there");
+  assert.deepEqual(d.find(t1), a.find(t1));
+  assert.deepEqual(v3Of(d.find(i1)), { account: A2.id }, "a record the v2 store held without its account gets it");
+  assert.deepEqual([d.find(e1).note, v3Of(d.find(e1))], ["edited on v2", { account: A3.id, plan: { id: "p_vacuum1", n: 1, of: 2 } }], "the v2 edit keeps account and plan");
+  assert.deepEqual([d.find(e2).type, v3Of(d.find(e2))], ["income", { account: A3.id }], "a split part turned into an income keeps its account, not the plan");
+  const row = id => server.rows("transactions").find(r => r.id === id);
+  assert.deepEqual([row(e1).note, v3Cols(row(e1))], ["edited on v2", { ...NO_COLS, account: A3.id, plan_id: "p_vacuum1", plan_n: 1, plan_of: 2 }]);
+  assert.deepEqual([row(e2).type, v3Cols(row(e2))], ["income", { ...NO_COLS, account: A3.id }]);
+  assert.deepEqual([d.snap.settings.accounts, d.snap.settings.defaultAccount, d.snap.settings.limits], [ACCT.accounts, A1.id, { cafe: 900 }],
+    "the settings row is read again: the accounts the v2 app dropped here come back instead of being pushed away");
+  await a.store.sync.syncNow();
+  for (const id of [e1, e2, i1, t1]) assert.deepEqual(a.find(id), d.find(id));
+  assert.deepEqual([a.snap.settings.accounts, a.snap.settings.limits], [ACCT.accounts, { cafe: 900 }]);
+  // the full pull happens once
+  const selects = () => server.log.filter(l => l.op === "select" && l.table === "transactions" && l.filters.some(f => f[0] === "gt" && f[2] === "1970-01-01T00:00:00.000Z")).length;
+  const n = selects();
+  await d.store.sync.syncNow(); await d.restart(); await d.store.sync.syncNow();
+  assert.equal(selects(), n);
 });
 
 /* ── store-artifact.js (claude.ai artifact) ─────────────────────────────── */
@@ -2356,4 +2965,279 @@ test("artifact store: deleting the first goal (also a v1 document's goal) keeps 
   await waitFor(() => b.snap && b.snap.status === "ready", { what: "artifact ready" });
   await b.store.saveSettings(DEFAULT_SETTINGS);
   assert.equal("goalId" in b.docs.get(T("s1")), false);
+});
+
+/* ── v3 review: regressions (each failed before its fix) ──────────────────────────── */
+// a_main = the implicit default account: app.js writes it out (opening = startBalance) with the first real account
+const MAIN_ACC = { id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", opening: 0, createdAt: 0 };
+const netOf = accs => Math.round(accs.reduce((n, a) => n + (a.kind === "card" ? -a.opening : a.opening), 0) * 100) / 100;
+// what the v3 balances start from (app.js: the accounts' openings, or the implicit a_main holding startBalance)
+const netOpeningOf = s => netOf(s.accounts && s.accounts.length ? s.accounts : [{ kind: "bank", opening: s.startBalance }]);
+// a new phone used before its first sign-in: example cleared, then the user adds an account (app.js account editor)
+async function anonymousPhoneWithAccount(server, clock, acc) {
+  const phone = await new Device({ server, seed: null, clock }).ready();
+  await phone.store.saveSettings({ ...DEFAULT_SETTINGS, accounts: [MAIN_ACC, acc], defaultAccount: "a_main", startBalance: netOf([MAIN_ACC, acc]) });
+  return phone;
+}
+
+test("v3 review: sign-in after anonymous use: the phone's untouched a_main does not overwrite the account's a_main (name, opening)", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await uiSaveSettings(a, { startBalance: 12000 });
+  a.tick(60_000);
+  // the first account added on a: app.js writes a_main out with the start balance; the user renamed it
+  await uiSaveSettings(a, { accounts: [{ ...MAIN_ACC, name: "Леуми", opening: 12000 }, A3], defaultAccount: "a_main", startBalance: 12000 - A3.opening });
+  await a.store.sync.syncNow();
+  const phone = await anonymousPhoneWithAccount(server, a.t + 3_600_000, A2);
+  await phone.signIn("anna@example.com");
+  await a.store.sync.syncNow();
+  for (const d of [a, phone]) {
+    const s = d.snap.settings;
+    assert.deepEqual(s.accounts.map(x => [x.id, x.name, x.opening]), [["a_main", "Леуми", 12000], [A3.id, A3.name, 1200], [A2.id, A2.name, 300]]);
+    assert.equal(s.startBalance, 12000 - 1200 + 300, "startBalance is the net opening of the merged accounts (v2 clients)");
+    assert.equal(s.defaultAccount, "a_main");
+  }
+});
+
+test("v3 review: sign-in after anonymous use: the default a_main the app wrote by itself does not replace the account's chosen default", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await uiSaveSettings(a, { accounts: [{ ...MAIN_ACC, opening: 1000 }, A1], defaultAccount: A1.id, startBalance: 6000 });
+  await a.store.sync.syncNow();
+  const phone = await anonymousPhoneWithAccount(server, a.t + 3_600_000, A2);
+  await phone.signIn("anna@example.com");
+  await a.store.sync.syncNow();
+  for (const d of [a, phone]) {
+    assert.equal(d.snap.settings.defaultAccount, A1.id);
+    assert.deepEqual(d.snap.settings.accounts.map(x => [x.id, x.opening]), [["a_main", 1000], [A1.id, 5000], [A2.id, 300]]);
+    assert.equal(d.snap.settings.startBalance, 6300);
+  }
+});
+
+test("v3 review: sign-in after anonymous use with an account of its own: the account's start balance (no accounts yet: the implicit a_main) is kept", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await uiSaveSettings(a, { startBalance: 5000 });          // a v2 app, or v3 before any account was added
+  await a.store.sync.syncNow();
+  const phone = await anonymousPhoneWithAccount(server, a.t + 3_600_000, A2);
+  await phone.signIn("anna@example.com");
+  await a.store.sync.syncNow();
+  for (const d of [a, phone]) {
+    const s = d.snap.settings;
+    assert.equal(netOpeningOf(s), 5300, "the account's 5 000 and the phone's cash 300");
+    assert.deepEqual(s.accounts.map(x => [x.id, x.opening]), [["a_main", 5000], [A2.id, 300]]);
+    assert.equal(s.startBalance, 5300, "what v2 clients show");
+  }
+  assert.equal(phone.sync.pending, 0);
+  // an account whose start balance is still the example's has nothing to keep: the phone's accounts stay as they are
+  const s2 = createFakeSupabase();
+  s2.addUser("boris@example.com");
+  const b = await new Device({ server: s2, seed: null }).ready();
+  await b.signIn("boris@example.com");
+  await b.store.saveSettings({ ...DEFAULT_SETTINGS, startBalance: 777, example: { startBalance: true } });
+  b.tick(1000); await b.store.saveSettings({ ...DEFAULT_SETTINGS, startBalance: 777, limits: { cafe: 100 }, example: { startBalance: true } });
+  await b.store.sync.syncNow();
+  const p2 = await anonymousPhoneWithAccount(s2, b.t + 3_600_000, A2);
+  await p2.signIn("boris@example.com");
+  assert.deepEqual([p2.snap.settings.accounts.map(x => [x.id, x.opening]), p2.snap.settings.startBalance], [[["a_main", 0], [A2.id, 300]], 300]);
+});
+
+test("v3 review: two devices add different accounts offline: startBalance (what v2 clients show) is the net opening of the merged list", async () => {
+  const { server, a, b } = await twoSignedIn({ ...DEFAULT_SETTINGS, startBalance: 1000, accounts: [{ ...MAIN_ACC, opening: 1000 }], defaultAccount: "a_main" });
+  a.win.setOnline(false); b.win.setOnline(false);
+  const add = (d, acc) => { const accounts = [...d.snap.settings.accounts, acc]; return uiSaveSettings(d, { accounts, startBalance: netOf(accounts) }); };
+  a.tick(60_000); await add(a, A1);                       // + 5 000
+  b.tick(120_000); await add(b, A2);                      // + 300
+  a.win.setOnline(true); b.win.setOnline(true);
+  await a.store.sync.syncNow(); await b.store.sync.syncNow(); await a.store.sync.syncNow();
+  const row = server.rows("budget_settings")[0].data;
+  assert.deepEqual(row.accounts.map(x => x.id).sort(), ["a_main", A1.id, A2.id].sort());
+  assert.equal(row.startBalance, 6300);
+  for (const d of [a, b]) assert.deepEqual([d.snap.settings.startBalance, d.sync.pending], [6300, 0]);
+  // a backup from b imported on a third device that added another account: the same rule
+  const file = JSON.parse(JSON.stringify(b.store.backup.export()));
+  const c = await new Device({ seed: null, clock: b.t + 60_000 }).ready();
+  await c.store.saveSettings({ ...DEFAULT_SETTINGS, startBalance: 1000 + A4.opening, accounts: [{ ...MAIN_ACC, opening: 1000 }, { ...A4, opening: 50 }], defaultAccount: "a_main" });
+  c.tick(1000); await c.store.backup.import(file);
+  assert.deepEqual(c.snap.settings.accounts.map(x => x.id).sort(), ["a_main", A1.id, A2.id, A4.id].sort());
+  assert.equal(c.snap.settings.startBalance, 6350);
+});
+
+test("v3 review: v2 → v3 update: a record edited in v3 before the first (full) pull keeps the server's account and plan; a transfer made meanwhile keeps its own", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings(ACCT);
+  const e1 = await a.store.saveTx(null, part(1, 2, { note: "Пылесос" }));
+  const i1 = await a.store.saveTx(null, tx({ type: "income", category: "salary", account: A2.id }));
+  const x1 = await a.store.saveTx(null, tx({ account: A2.id }));
+  const y1 = await a.store.saveTx(null, tx({ note: "без счёта" }));          // no v3 fields: the v2 copy is the same
+  await a.store.sync.syncNow();
+  const row = id => server.rows("transactions").find(r => r.id === id);
+  // a device still on v2 pulls them (without account and plan); nothing is pending there
+  const d = await new Device({ server, seed: null, factory: createV2Store }).ready();
+  await d.signIn("anna@example.com");
+  assert.equal(d.sync.pending, 0);
+  // the app updates to v3 and is opened offline; before the full pull the records are the v2 store's copies
+  d.win.setOnline(false);
+  await d.upgrade(createBudgetStore);
+  assert.deepEqual(v3Of(d.find(e1)), {});
+  d.tick(1000);
+  // the note of the split part (the UI sends a plan only when the record has one); the income with the account the
+  // UI preselects (the default, A1); the expense turned into a transfer A1 → A2
+  await d.store.saveTx(e1, { ...without(d.find(e1), "id", "updatedAt"), note: "Пылесос Dyson" });
+  await d.store.saveTx(i1, { ...without(d.find(i1), "id", "updatedAt"), note: "аванс", account: A1.id });
+  await d.store.saveTx(x1, { ...without(d.find(x1), "id", "updatedAt"), type: "transfer", category: "transfer", account: A1.id, toAccount: A2.id });
+  d.win.setOnline(true);
+  await d.store.sync.syncNow();
+  assert.deepEqual([d.sync.phase, d.sync.pending], ["idle", 0]);
+  assert.deepEqual([row(e1).note, v3Cols(row(e1))], ["Пылесос Dyson", { ...NO_COLS, account: A3.id, plan_id: "p_vacuum1", plan_n: 1, plan_of: 2 }],
+    "the v3 push does not wipe the account and plan the device never had (the v2 app's own edit keeps them)");
+  assert.deepEqual([row(i1).note, v3Cols(row(i1))], ["аванс", { ...NO_COLS, account: A2.id }]);
+  assert.deepEqual([row(x1).type, v3Cols(row(x1))], ["transfer", { ...NO_COLS, account: A1.id, to_account: A2.id }]);
+  assert.deepEqual(v3Of(d.find(e1)), { account: A3.id, plan: { id: "p_vacuum1", n: 1, of: 2 } });
+  // the marks are gone after the full pull (also of the record that was not touched): a later edit is taken as it is
+  assert.ok(d.find(y1));
+  assert.deepEqual(Object.values(d.kv().tx).filter(r => "legacy" in r).map(r => r.id), []);
+  d.tick(1000);
+  await d.store.saveTx(i1, { ...without(d.find(i1), "id", "updatedAt"), account: A1.id });
+  await d.store.sync.syncNow();
+  assert.equal(row(i1).account, A1.id);
+});
+
+test("v3 review: the first start after the v2 → v3 update on a full disk shows the user's data; the upgrade is done before the first sync", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings(ACCT);
+  const e1 = await a.store.saveTx(null, part(1, 2));
+  await a.store.sync.syncNow();
+  const d = await new Device({ server, seed: fakeSeed, factory: createV2Store }).ready();
+  await d.signIn("anna@example.com");
+  d.win.setOnline(false);
+  d.tick(1000);
+  await d.store.saveTx(e1, { ...without(d.find(e1), "id", "updatedAt"), note: "edited on v2" });
+  // the v2 app itself starts fine on a full disk: its start-up only reads
+  d.win.idbCtl.failNextCommit = "QuotaExceededError";
+  await d.restart();
+  assert.equal(d.find(e1).note, "edited on v2");
+  // the app updates to v3 on that full disk: the upgrade write fails
+  d.win.idbCtl.failNextCommit = "QuotaExceededError";
+  await d.upgrade(createBudgetStore);
+  assert.equal(d.win.idbCtl.failNextCommit, null, "the upgrade write was tried");
+  assert.equal(d.find(e1).note, "edited on v2", "the user's operation is shown");
+  assert.equal(d.snap.notice || null, null, "no 'the browser does not allow saving' notice");
+  assert.ok(!d.snap.tx.some(t => t.example), "no example instead of the user's data");
+  assert.equal(d.kv().meta.version || 0, 0);
+  // once there is room again the first sync upgrades first: the pending v2 edit keeps account and plan
+  d.win.setOnline(true);
+  await d.store.sync.syncNow();
+  assert.equal(d.kv().meta.version, 3);
+  const r = server.rows("transactions").find(x => x.id === e1);
+  assert.deepEqual([r.note, v3Cols(r)], ["edited on v2", { ...NO_COLS, account: A3.id, plan_id: "p_vacuum1", plan_n: 1, plan_of: 2 }]);
+});
+
+test("v3 review: importing a backup of the deployed v2 app (it never holds account and plan) does not wipe them", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings(ACCT);
+  const e1 = await a.store.saveTx(null, part(1, 2, { note: "Пылесос" }));
+  const i1 = await a.store.saveTx(null, tx({ type: "income", category: "salary", account: A2.id }));
+  await a.store.sync.syncNow();
+  const row = id => server.rows("transactions").find(r => r.id === id);
+  // a phone still on v2 pulls them, fixes the notes offline and exports a backup
+  const v2 = await new Device({ server, seed: null, factory: createV2Store, clock: a.t + 1000 }).ready();
+  await v2.signIn("anna@example.com");
+  v2.win.setOnline(false);
+  v2.tick(1000);
+  await v2.store.saveTx(e1, { ...without(v2.find(e1), "id", "updatedAt"), note: "Пылесос Dyson" });
+  await v2.store.saveTx(i1, { ...without(v2.find(i1), "id", "updatedAt"), note: "аванс" });
+  const file = JSON.parse(JSON.stringify(v2.store.backup.export()));
+  assert.equal(file.version, 2);
+  // restored on the v3 device: the newer notes are taken, the account and plan stay
+  a.t = v2.t + 60_000;
+  const res = await a.store.backup.import(file);
+  assert.equal(res.updated, 2);
+  assert.deepEqual([v3Of(a.find(e1)), v3Of(a.find(i1))], [{ account: A3.id, plan: { id: "p_vacuum1", n: 1, of: 2 } }, { account: A2.id }]);
+  await a.store.sync.syncNow();
+  assert.deepEqual([row(e1).note, row(i1).note], ["Пылесос Dyson", "аванс"]);
+  assert.deepEqual([v3Cols(row(e1)), v3Cols(row(i1))],
+    [{ ...NO_COLS, account: A3.id, plan_id: "p_vacuum1", plan_n: 1, plan_of: 2 }, { ...NO_COLS, account: A2.id }]);
+  // restored on a device that does not hold those records yet: it takes the server's in the next (full) pull
+  const c = await new Device({ server, seed: null, clock: a.t + 1000 }).ready();
+  const ce1 = await c.store.saveTx(e1, { ...without(file.tx.find(t => t.id === e1), "id", "updatedAt") });
+  assert.equal(ce1, e1);
+  const f2 = JSON.parse(JSON.stringify(file));
+  for (const t of f2.tx) t.updatedAt = c.t + 5000;
+  c.tick(10_000);
+  await c.store.backup.import(f2);
+  await c.signIn("anna@example.com");
+  assert.deepEqual([v3Cols(row(e1)), v3Cols(row(i1))],
+    [{ ...NO_COLS, account: A3.id, plan_id: "p_vacuum1", plan_n: 1, plan_of: 2 }, { ...NO_COLS, account: A2.id }]);
+  assert.equal(c.sync.pending, 0);
+});
+
+test("v3 review: a backup of the deployed v2 app that carries the account's accounts and _ms3 does not bring back an account deleted since", async () => {
+  const server = createFakeSupabase();
+  server.addUser("anna@example.com");
+  const a = await new Device({ server, seed: null }).ready();
+  await a.signIn("anna@example.com");
+  await a.store.saveSettings(ACCT);
+  await a.store.sync.syncNow();
+  const v2 = await new Device({ server, seed: null, factory: createV2Store, clock: a.t + 1000 }).ready();
+  await v2.signIn("anna@example.com");
+  // the v3 device, offline, deletes the card
+  a.win.setOnline(false);
+  a.tick(60_000);
+  await uiSaveSettings(a, { accounts: [A1, A2] });
+  // the v2 phone changes a limit and syncs: its merge keeps the server's accounts (and _ms3) in its settings
+  v2.t = a.t + 60_000;
+  await uiV2SaveSettings(v2, { limits: { cafe: 500 } });
+  await v2.store.sync.syncNow();
+  assert.deepEqual(v2.snap.settings.accounts.map(x => x.id), [A1.id, A2.id, A3.id]);
+  // the v3 device comes back: its delete (later than the accounts' stamps in _ms3) wins on the server
+  a.win.setOnline(true);
+  await a.store.sync.syncNow();
+  assert.deepEqual(accIds(a), [A1.id, A2.id]);
+  // the v2 phone's backup (version 2) holds the accounts it carried, and their _ms3
+  const file = JSON.parse(JSON.stringify(v2.store.backup.export()));
+  assert.equal(file.version, 2);
+  assert.deepEqual([file.settings.accounts.map(x => x.id), typeof file.settings._ms3], [[A1.id, A2.id, A3.id], "object"]);
+  a.t = v2.t + 60_000;
+  await a.store.backup.import(file);
+  assert.deepEqual(a.snap.settings.limits, { cafe: 500 });
+  assert.deepEqual(accIds(a), [A1.id, A2.id], "the file's accounts date from _ms3 (before the delete), not from its settingsUpdatedAt");
+  assertV3(a.snap.settings);
+});
+
+test("v3 review: supabase/README.md quotes the outdated-schema message the store shows (troubleshooting table)", () => {
+  const msg = /oldSchema: "([^"]+)"/.exec(readFileSync(SRC, "utf8"))[1];
+  const head = msg.slice(0, msg.indexOf(" ещё раз") + " ещё раз".length);   // «Обновите базу: выполните supabase/schema.sql ещё раз»
+  const readme = readFileSync(new URL("../supabase/README.md", import.meta.url).pathname, "utf8");
+  const rows = readme.split("\n").filter(l => l.startsWith("| «"));
+  assert.ok(rows.some(l => l.startsWith("| «" + head)), "a row for the message the sync shows when the project's schema.sql is older than the app");
+  assert.ok(readme.split("«" + head).length - 1 >= 2, "the upgrade notes quote it too");
+});
+
+// src/store-artifact.js is not part of this change: its txBody (line 54) still keeps a plan of one part, which the
+// contract (2 ≤ of ≤ 36), the server (transactions_plan_range) and the PWA store refuse. Fix there:
+// `… && p.n <= p.of && p.of >= 2 && p.of <= 36)`; then drop `todo` here.
+test("v3 review: the artifact store and the PWA store treat a one-part plan the same way", { todo: "src/store-artifact.js txBody must require plan.of >= 2" }, async () => {
+  const d = await new Device({ seed: null }).ready();
+  const art = artifactStore();
+  await waitFor(() => art.snap && art.snap.status === "ready", { what: "artifact ready" });
+  const c = tx({ account: A3.id, plan: { id: "p_1", n: 1, of: 1 } });
+  const id = await d.store.saveTx(null, c);
+  const aid = await art.store.saveTx(null, c);
+  assert.deepEqual(v3Of(art.docs.get("data/users/viewer1/budget/tx/" + aid)), v3Of(d.find(id)));
 });

@@ -40,19 +40,32 @@
   const GOAL_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;   // Goal.id = Tx.goalId = transactions.goal_id (schema check)
   const CAT_ID_RE = /^c_[a-z0-9]{4,20}$/;       // CustomCategory.id
   const LIMIT_KEY_RE = /^[A-Za-z0-9_-]{1,32}$/; // limits: expense category id (built-in or custom)
+  // Account.id: the app mints "a_" + [a-z0-9]{2,20}; "a_main" is the implicit default account. Any a_ id that fits
+  // the server's account column (32 characters) is kept, so an account of a newer version is never dropped.
+  const ACC_ID_RE = /^a_[A-Za-z0-9_-]{1,30}$/;
+  // Tx.account / Tx.toAccount / Tx.plan.id = transactions.account / to_account / plan_id (schema check; = store-artifact.js txBody)
+  const REF_RE = /^[A-Za-z0-9_-]{1,32}$/;
   const ICON_RE = /^[A-Za-z0-9_-]{1,40}$/;      // lucide icon name
-  const MAX_GOALS = 20, MAX_CATEGORIES = 60, MAX_LIMITS = 100;
-  const MAX_GONE = 30;                          // tombstones kept per list (goals, categories); see mergeEntries
+  const ACCOUNT_ICONS = { bank: "Landmark", cash: "Banknote", wallet: "Smartphone", card: "CreditCard" };   // kind → default icon
+  const MAX_GOALS = 20, MAX_CATEGORIES = 60, MAX_LIMITS = 100, MAX_ACCOUNTS = 20;
+  const MAX_PLAN = 36;                          // parts of a split purchase: 2…36 (schema check)
+  const MAX_GONE = 30;                          // tombstones kept per list (goals, categories, accounts); see mergeEntries
   const MAX_DATE_MS = 8.64e15;
   // Settings documents larger than this are refused by saveSettings / backup import. Measured like the server's
-  // check (octet_length(data::text) <= 65536, jsonb text has ", " and ": " separators), with room left for _ms
-  // (field stamps, entry stamps of 20 goals and 60 categories, MAX_GONE tombstones per list: under 7 000 bytes).
-  const MAX_SETTINGS_BYTES = 57000;
+  // check (octet_length(data::text) <= 65536, jsonb text has ", " and ": " separators), with room left for the stamps
+  // the store adds when it pushes: _ms and _ms3 (field stamps, entry stamps of 20 goals, 60 categories and 20 accounts,
+  // MAX_GONE tombstones per list) take at most 9 829 bytes (tests/helpers/max-settings.mjs). The largest document of
+  // known fields is 35 423 bytes; the rest is room for fields of newer versions.
+  const MAX_SETTINGS_BYTES = 55000;
   const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  const TYPES = ["income", "expense", "saving"];
-  const SETTINGS_KEYS = ["startBalance", "goals", "limits", "categories"];
-  const SETTINGS_DEFAULTS = { startBalance: 0, goals: [], limits: {}, categories: [] };
-  const BACKUP_VERSION = 2;                   // 2: settings v2 (goals, categories), tx.goalId; files of version 1 import too
+  const TYPES = ["income", "expense", "saving", "transfer"];
+  const SETTINGS_KEYS = ["startBalance", "goals", "limits", "categories", "accounts", "defaultAccount"];
+  const V3_KEYS = ["accounts", "defaultAccount"];   // stamped in data._ms3 on the server (see settingsWire)
+  // accounts and defaultAccount are left out of a document while unset (the v2 shape, as the app writes it)
+  const SETTINGS_DEFAULTS = { startBalance: 0, goals: [], limits: {}, categories: [], accounts: [], defaultAccount: "" };
+  const BACKUP_VERSION = 3;                   // 3: accounts, defaultAccount, transfers, tx.account/toAccount/plan;
+                                              // 2: settings v2 (goals, categories), tx.goalId; files of versions 1 and 2 import too
+  const STORE_VERSION = 3;                    // meta.version: the data in this IndexedDB was last upgraded by this store version
   const ID_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const STALE = { stale: true };              // thrown to abandon a sync whose account is gone
 
@@ -62,6 +75,7 @@
     txAmount: "Сумма должна быть больше нуля и меньше 10 000 000 000 ₪.",
     txDate: "Укажите дату операции.",
     txId: "Не удалось сохранить: неверный идентификатор операции.",
+    txTransfer: "Для перевода выберите два разных счёта: откуда и куда.",
     settingsInvalid: "Не удалось сохранить: проверьте введённые значения.",
     quota: "На устройстве закончилось место для данных. Освободите память и повторите.",
     storage: "Не удалось сохранить данные на устройстве. Повторите попытку.",
@@ -92,7 +106,7 @@
     noLibrary: "Модуль синхронизации не загрузился. Обновите страницу.",
     badKey: "Неверный ключ проекта. Проверьте ключ в настройках синхронизации.",
     noSchema: "В проекте Supabase нет таблиц бюджета. Выполните supabase/schema.sql в SQL Editor.",
-    oldSchema: "Схема базы в проекте Supabase устарела. Выполните supabase/schema.sql в SQL Editor ещё раз: записи сохранятся.",
+    oldSchema: "Обновите базу: выполните supabase/schema.sql ещё раз (SQL Editor в Supabase). Записи на сервере сохранятся, а изменения пока хранятся на этом устройстве.",
     serverReadOnly: "Проект Supabase сейчас открыт только для чтения (закончилось место). Изменения сохраняются на устройстве.",
     serverFull: "В проекте Supabase закончилось место. Изменения сохраняются на устройстве.",
     serverRejected: "Сервер отклонил данные. Проверьте, что схема базы обновлена (supabase/schema.sql).",
@@ -166,6 +180,8 @@
       cursorTx: str(m.cursorTx),
       cursorSettings: str(m.cursorSettings),
       lastSyncAt: finite(m.lastSyncAt) ? m.lastSyncAt : null,
+      version: finite(m.version) ? m.version : 0,     // STORE_VERSION that last upgraded this data (0: v2 or older)
+      fullPull: m.fullPull === true,                  // the next pull reads every row again (see upgradeData)
     };
   }
 
@@ -197,7 +213,7 @@
     if (d.category != null && typeof d.category !== "string") throw badTx("неверная категория", M.txInvalid);
     if (d.note != null && typeof d.note !== "string") throw badTx("неверный комментарий", M.txInvalid);
     let category = cleanText((d.category || "").trim(), 32, true);
-    if (!category) category = d.type === "income" ? "other_in" : d.type === "saving" ? "savings" : "other";
+    if (!category) category = d.type === "income" ? "other_in" : d.type === "saving" ? "savings" : d.type === "transfer" ? "transfer" : "other";
     const out = {
       type: d.type, amount, category,
       note: cleanText(d.note || "", 80, false),
@@ -206,7 +222,26 @@
     };
     // the goal a saving went to; anything else (other types, bad ids) is dropped: missing = the first goal
     if (d.type === "saving" && typeof d.goalId === "string" && GOAL_ID_RE.test(d.goalId)) out.goalId = d.goalId;
+    Object.assign(out, txRefs(d));
+    // the server refuses a live transfer without two different accounts, which would block every later sync
+    if (d.type === "transfer" && !(out.account && out.toAccount)) throw badTx("перевод без двух разных счетов", M.txTransfer);
     if (d.example === true) out.example = true;
+    return out;
+  }
+  const refId = v => typeof v === "string" && REF_RE.test(v);
+  // a split purchase's part: expenses only, part n of `of` (2…36); anything else is dropped
+  function planOf(type, p) {
+    if (type !== "expense" || !isObj(p) || !refId(p.id) || !Number.isInteger(p.n) || !Number.isInteger(p.of)) return null;
+    return p.of >= 2 && p.of <= MAX_PLAN && p.n >= 1 && p.n <= p.of ? { id: p.id, n: p.n, of: p.of } : null;
+  }
+  // v3 fields of an operation, invalid values dropped exactly like store-artifact.js txBody (plus plan.of ≥ 2, which
+  // the server requires): account on any type; toAccount on transfers only and not the source; plan on expenses only
+  function txRefs(d) {
+    const out = {};
+    if (refId(d.account)) out.account = d.account;
+    if (d.type === "transfer" && refId(d.toAccount) && d.toAccount !== out.account) out.toAccount = d.toAccount;
+    const plan = planOf(d.type, d.plan);
+    if (plan) out.plan = plan;
     return out;
   }
 
@@ -246,6 +281,23 @@
     if (c.archived === true) out.archived = true;
     return out;
   }
+  // Account (v3): kind bank | cash | wallet | card; billingDay (1–28), payFrom and creditLimit on cards only
+  function accountOf(a) {
+    if (!isObj(a) || typeof a.id !== "string" || !ACC_ID_RE.test(a.id) || typeof a.kind !== "string"
+      || !Object.prototype.hasOwnProperty.call(ACCOUNT_ICONS, a.kind) || typeof a.name !== "string") return null;
+    const name = cleanText(a.name.trim(), 40, true).trim();
+    const opening = a.opening == null ? 0 : a.opening;
+    if (!name || !finite(opening) || Math.abs(opening) > MAX_AMOUNT) return null;
+    const out = { id: a.id, kind: a.kind, name, icon: iconOf(a.icon, ACCOUNT_ICONS[a.kind]), opening: r2(opening) };
+    if (a.kind === "card") {
+      if (Number.isInteger(a.billingDay) && a.billingDay >= 1 && a.billingDay <= 28) out.billingDay = a.billingDay;
+      if (typeof a.payFrom === "string" && ACC_ID_RE.test(a.payFrom) && a.payFrom !== a.id) out.payFrom = a.payFrom;
+      if (finite(a.creditLimit) && a.creditLimit <= MAX_AMOUNT && r2(a.creditLimit) > 0) out.creditLimit = r2(a.creditLimit);
+    }
+    if (a.archived === true) out.archived = true;
+    out.createdAt = finite(a.createdAt) && a.createdAt >= 0 && a.createdAt <= MAX_DATE_MS ? Math.round(a.createdAt) : 0;
+    return out;
+  }
   // entries of a list with valid, unique ids, at most max of them
   function listOf(arr, max, entry) {
     const out = [], ids = new Set();
@@ -267,6 +319,7 @@
     let out;
     try { out = JSON.parse(JSON.stringify(s)); } catch (e) { if (strict) throw bad(); out = {}; s = {}; }
     delete out._ms;                                                         // field stamps are the store's own, never taken from outside
+    delete out._ms3;
     delete out.goal;                                                        // v1 field: migrated into goals, never written again
     const sb = s.startBalance == null ? 0 : s.startBalance;
     if (finite(sb) && Math.abs(sb) <= MAX_AMOUNT) out.startBalance = r2(sb);
@@ -287,34 +340,53 @@
     const cats = s.categories == null ? [] : s.categories;
     if (!Array.isArray(cats) && strict) throw bad();
     out.categories = Array.isArray(cats) ? listOf(cats, MAX_CATEGORIES, categoryOf) : [];
+    // v3: accounts and the default account; left out while unset
+    const accs = s.accounts == null ? [] : s.accounts;
+    if (!Array.isArray(accs) && strict) throw bad();
+    out.accounts = Array.isArray(accs) ? listOf(accs, MAX_ACCOUNTS, accountOf) : [];
+    out.defaultAccount = typeof s.defaultAccount === "string" && ACC_ID_RE.test(s.defaultAccount) ? s.defaultAccount : "";
+    tidy(out);
     const ex = isObj(s.example) ? s.example : {};
-    const flags = SETTINGS_KEYS.filter(k => ex[k] === true || (k === "goals" && ex.goal === true));   // v1 flag example.goal
+    // defaultAccount has no flag of its own: it is the example's while the accounts are (see exFlag)
+    const flags = SETTINGS_KEYS.filter(k => k !== "defaultAccount" && (ex[k] === true || (k === "goals" && ex.goal === true)));   // v1 flag example.goal
     if (flags.length) { out.example = {}; for (const k of flags) out.example[k] = true; }
     else delete out.example;
     if (strict && pgJsonBytes(out) > MAX_SETTINGS_BYTES) throw bad();
     return out;
   }
+  // the optional v3 fields are left out while unset, so a document without accounts keeps the v2 shape
+  function tidy(d) {
+    if (!Array.isArray(d.accounts) || !d.accounts.length) delete d.accounts;
+    if (typeof d.defaultAccount !== "string" || !d.defaultAccount) delete d.defaultAccount;
+    return d;
+  }
   const hasExampleFlags = d => !!(d && isObj(d.example) && Object.keys(d.example).length);
+  // what app.js keeps startBalance at once there are accounts (for v2 clients): non-card openings minus card openings
+  const netOpening = accounts => r2(accounts.reduce((n, a) => n + (a.kind === "card" ? -a.opening : a.opening), 0));
+  // the implicit default account of a document without accounts (docs/ARCHITECTURE.md, "Migration v2 → v3")
+  const IMPLICIT_MAIN = { id: "a_main", kind: "bank", name: "Основной счёт", icon: "Landmark", createdAt: 0 };
   // whether a raw (maybe v1) document holds field k at all
   const hasField = (raw, k) => isObj(raw) && (raw[k] !== undefined || (k === "goals" && raw.goal !== undefined));
   function isDefaultField(k, v) {
-    if (k === "startBalance") return !v;
-    if (k === "goals" || k === "categories") return !Array.isArray(v) || !v.length;
+    if (k === "startBalance" || k === "defaultAccount") return !v;
+    if (k === "goals" || k === "categories" || k === "accounts") return !Array.isArray(v) || !v.length;
     return !isObj(v) || !Object.keys(v).length;
   }
 
   /* ── settings: per-field last writer wins ──────
-   * The settings document has four independent fields (startBalance, goals, limits, categories). Each local record
-   * keeps a timestamp per field (rec.fieldMs); on the server they travel inside the document as
-   * data._ms = { startBalance, goals, limits, categories, at } (at = the row's client_updated_ms). Merging takes every
-   * field from the side that changed it last, so offline edits of different fields on two devices both survive.
-   * Example values and values reset by «Удалить пример» carry 0: they never beat a real value.
-   * The UI never sees _ms: settingsData() drops it and the stamps are recomputed on every save.
+   * The settings document has six independent fields (startBalance, goals, limits, categories; v3: accounts,
+   * defaultAccount). Each local record keeps a timestamp per field (rec.fieldMs); on the server they travel inside the
+   * document as data._ms = { startBalance, goals, limits, categories, at } and, for the v3 fields,
+   * data._ms3 = { accounts, defaultAccount, at } (at = the row's client_updated_ms when this version wrote them; see
+   * settingsWire). Merging takes every field from the side that changed it last, so offline edits of different fields
+   * on two devices both survive. Example values and values reset by «Удалить пример» carry 0: they never beat a real
+   * value. The UI never sees _ms / _ms3: settingsData() drops them and the stamps are recomputed on every save.
    * v1 records and rows stamp the goal as goal: that stamp applies to goals. */
-  const ZERO_MS = { startBalance: 0, goals: 0, limits: 0, categories: 0 };
+  const ZERO_MS = { startBalance: 0, goals: 0, limits: 0, categories: 0, accounts: 0, defaultAccount: 0 };
   // stamp of a value from a backup file without any timestamps: newer than "not the user's value" (0), older than any edit
   const UNTIMED_MS = 1;
-  const exFlag = (d, k) => !!(d && isObj(d.example) && d.example[k] === true);
+  // field k holds the example's value; the default account is the example's while the accounts are
+  const exFlag = (d, k) => !!(d && isObj(d.example) && (d.example[k] === true || (k === "defaultAccount" && d.example.accounts === true)));
   function sameJson(a, b) {
     if (a === b) return true;
     if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((v, i) => sameJson(v, b[i]));
@@ -324,6 +396,7 @@
   }
   function sameValue(k, a, b) {
     if (k === "startBalance") return (a || 0) === (b || 0);
+    if (k === "defaultAccount") return (a || "") === (b || "");
     return sameJson(a == null ? SETTINGS_DEFAULTS[k] : a, b == null ? SETTINGS_DEFAULTS[k] : b);
   }
   const sameField = (k, da, db) => sameValue(k, da[k], db[k]) && exFlag(da, k) === exFlag(db, k);
@@ -348,10 +421,11 @@
    * A list without entry stamps (older app versions, v1 data, backups made before them) counts as a whole: every
    * entry is stamped with the field's stamp and since = the field's stamp, which is exactly "the later list wins"
    * for entries older than it. Example lists never merge entry by entry (they carry 0 and lose as a whole).
-   * Locally the info is rec.items; on the server it travels as data._ms.items (trusted like the field stamps). */
-  const ENTRY_KEYS = ["goals", "categories"];
-  const ENTRY_RE = { goals: GOAL_ID_RE, categories: CAT_ID_RE };
-  const ENTRY_MAX = { goals: MAX_GOALS, categories: MAX_CATEGORIES };
+   * Locally the info is rec.items; on the server it travels as data._ms.items (goals, categories) and
+   * data._ms3.items (accounts), trusted like the field stamps. v3 accounts merge exactly like goals and categories. */
+  const ENTRY_KEYS = ["goals", "categories", "accounts"];
+  const ENTRY_RE = { goals: GOAL_ID_RE, categories: CAT_ID_RE, accounts: ACC_ID_RE };
+  const ENTRY_MAX = { goals: MAX_GOALS, categories: MAX_CATEGORIES, accounts: MAX_ACCOUNTS };
   const own = (o, k) => isObj(o) && Object.prototype.hasOwnProperty.call(o, k);
   const entryId = (k, id) => typeof id === "string" && id !== "__proto__" && ENTRY_RE[k].test(id);
   function pruneGone(info) {
@@ -392,23 +466,46 @@
   // field. A v1 record's fieldMs.goal becomes the stamp of goals; a field the record does not hold at all
   // (categories in v1) gets 0, so it never beats a value set elsewhere. A record without entry stamps (saved by an
   // older version) gets them from its field stamps (see entriesOf).
+  // A record saved by the v2 store holds the v3 fields it got from a server row as fields it does not know, together
+  // with that row's data._ms3 (see ms3Of): their stamps come from there.
   function normSettingsRec(rec) {
     if (!isObj(rec) || !isObj(rec.data)) return null;
     const raw = rec.data;
-    const data = settingsData(raw, false);
-    const fm = isObj(rec.fieldMs) ? rec.fieldMs : {};
     const updatedMs = finite(rec.updatedMs) && rec.updatedMs > 0 ? rec.updatedMs : 0;
+    const m3 = ms3Of(raw, MAX_DATE_MS);
+    const data = carryExample(settingsData(raw, false), m3);
+    const fm = isObj(rec.fieldMs) ? rec.fieldMs : {};
     const ok = v => finite(v) && v >= 0;
     const fieldMs = {};
     for (const k of SETTINGS_KEYS) {
       let v = fm[k];
       if (k === "goals" && !ok(v) && !Array.isArray(raw.goals)) v = fm.goal;
+      if (!ok(v) && m3 && V3_KEYS.includes(k)) v = m3Stamp(m3, k);
       if (!ok(v)) v = rec.localOnly || !hasField(raw, k) ? 0 : updatedMs;
       fieldMs[k] = exFlag(data, k) ? 0 : v;
     }
     const out = { data, fieldMs, updatedMs, dirty: !!rec.dirty, localOnly: !!rec.localOnly };
-    out.items = entryInfo({ ...out, items: rec.items });
+    const items = isObj(rec.items) ? Object.assign({}, rec.items) : {};
+    if (!isObj(items.accounts) && m3 && isObj(m3.items)) items.accounts = m3.items.accounts;
+    out.items = entryInfo({ ...out, items });
     return out;
+  }
+  /* data._ms3: stamps of the v3 fields (accounts, defaultAccount) and the accounts' entry stamps, written next to _ms.
+   * The v2 store rebuilds _ms on every push but keeps document fields it does not know as they are: a v2 client that
+   * merges a v3 row carries accounts, defaultAccount and _ms3 along together, so _ms3 (with its own `at`, the time of
+   * the v3 write) still describes exactly the values carried with it. It is trusted when 0 ≤ at ≤ the row's
+   * client_updated_ms; a stamp of a field the document does not hold means the field was cleared then. (The deployed
+   * v2 app saves its own changes as a document of its four fields: then accounts, defaultAccount and _ms3 are all
+   * gone, the fields count as unknown (stamp 0), and v3 devices put their copy back.) */
+  function ms3Of(raw, top) {
+    const m = isObj(raw) && isObj(raw._ms3) ? raw._ms3 : null;
+    return m && finite(m.at) && m.at >= 0 && m.at <= top ? m : null;
+  }
+  const m3Stamp = (m3, k) => (finite(m3[k]) && m3[k] >= 0 && m3[k] <= m3.at ? m3[k] : -1);
+  // the v2 store drops example.accounts (it keeps only the flags it knows): _ms3.example remembers it
+  function carryExample(data, m3) {
+    if (m3 && m3.example === true && Array.isArray(data.accounts) && !exFlag(data, "accounts")) data.example = Object.assign({}, data.example, { accounts: true });
+    return data;
   }
   // A server row's stamps are trusted only when _ms.at equals its client_updated_ms: an app version without
   // per-field stamps keeps an old _ms when it rewrites the document, and its row then counts as changed as a whole.
@@ -416,9 +513,15 @@
   // changed at client_updated_ms; a field the document does not hold at all gets 0 (it says nothing about it).
   function rowStamps(raw, data, cum) {
     const m = isObj(raw) && isObj(raw._ms) && raw._ms.at === cum ? raw._ms : null;
+    const m3 = ms3Of(raw, cum);
     const ok = v => finite(v) && v >= 0 && v <= cum;
     const out = {};
     for (const k of SETTINGS_KEYS) {
+      if (V3_KEYS.includes(k)) {                                                      // see ms3Of
+        const v = m3 ? m3Stamp(m3, k) : -1;
+        out[k] = exFlag(data, k) ? 0 : v >= 0 ? v : !hasField(raw, k) ? 0 : cum;
+        continue;
+      }
       let v = m ? m[k] : undefined;
       if (m && k === "goals" && !ok(v) && !Array.isArray(raw.goals)) v = m.goal;     // a v1 row
       out[k] = exFlag(data, k) || !hasField(raw, k) ? 0 : ok(v) ? v : cum;
@@ -469,22 +572,36 @@
   function mergeFields(base, other) {
     const data = clone(base.data), ms = Object.assign({}, base.ms), items = clone(base.items);
     const ex = Object.assign({}, isObj(data.example) ? data.example : {});
+    let union = false;
     for (const k of SETTINGS_KEYS) {
       if (ENTRY_KEYS.includes(k) && other.ms[k] >= 0 && other.items && other.items[k] && !exFlag(base.data, k) && !exFlag(other.data, k)) {
         const m = mergeEntries(k, base, other);
         data[k] = m.list;
         items[k] = m.info;
         ms[k] = Math.max(base.ms[k], other.ms[k]);
+        if (k === "accounts" && m.list.length && !sameValue(k, m.list, base.data[k]) && !sameValue(k, m.list, other.data[k])) union = true;
         continue;
       }
       if (!wins(other, base, k)) continue;
       data[k] = clone(other.data[k]);
       ms[k] = other.ms[k];
       if (ENTRY_KEYS.includes(k)) items[k] = clone(other.items[k]);
+      if (k === "defaultAccount") continue;                     // its example flag is the accounts' one
       if (exFlag(other.data, k)) ex[k] = true; else delete ex[k];
     }
+    // app.js keeps startBalance at the net opening of the accounts (what v2 clients show): a list merged from both
+    // sides (two devices added different accounts) matches neither side's startBalance
+    if (union) keepNetOpening(data, ms, ex);
     if (Object.keys(ex).length) data.example = ex; else delete data.example;
-    return { data, ms, items };
+    return { data: tidy(data), ms, items };
+  }
+  // startBalance = the net opening of data's accounts, stamped no older than the accounts
+  function keepNetOpening(data, ms, ex) {
+    const n = netOpening(data.accounts);
+    if (n === data.startBalance) return;
+    data.startBalance = n;
+    ms.startBalance = Math.max(ms.startBalance, ms.accounts);
+    if (ex) delete ex.startBalance;
   }
   // stamps for a document the user saved over prev: only the fields whose value changed get time t
   function stampFields(prev, data, t) {
@@ -521,47 +638,60 @@
     }
     return out;
   }
-  // on the server: data._ms = { startBalance, goals, limits, categories, at, items: { goals, categories } }
+  // on the server: data._ms = { startBalance, goals, limits, categories, at, items: { goals, categories } } (the v2
+  // shape, which the v2 store reads) and data._ms3 = { accounts, defaultAccount, at, items: { accounts }, example? }
+  // (see ms3Of). _ms3 is left out while it has nothing to say (no accounts ever), so v2-only documents stay as they were.
   function settingsWire(rec) {
     const at = Math.max(0, Math.round(rec.updatedMs || 0));
     const st = fieldStamps(rec);
-    const _ms = {};
-    for (const k of SETTINGS_KEYS) _ms[k] = Math.min(at, Math.max(0, Math.round(st[k])));
-    _ms.at = at;
     const cap = v => Math.min(at, Math.max(0, Math.round(v)));
     const info = entryInfo(rec);
-    _ms.items = {};
-    for (const k of ENTRY_KEYS) {
-      const i = info[k], ms = {}, gone = {};
+    const wireInfo = i => {
+      const ms = {}, gone = {};
       for (const id of Object.keys(i.ms)) ms[id] = cap(i.ms[id]);
       for (const id of Object.keys(i.gone)) gone[id] = cap(i.gone[id]);
-      _ms.items[k] = { since: cap(i.since), ms, gone };
-    }
-    return Object.assign(clone(rec.data), { _ms });
+      return { since: cap(i.since), ms, gone };
+    };
+    const _ms = {};
+    for (const k of SETTINGS_KEYS) if (!V3_KEYS.includes(k)) _ms[k] = cap(st[k]);
+    _ms.at = at;
+    _ms.items = { goals: wireInfo(info.goals), categories: wireInfo(info.categories) };
+    const out = Object.assign(clone(rec.data), { _ms });
+    const _ms3 = { accounts: cap(st.accounts), defaultAccount: cap(st.defaultAccount), at, items: { accounts: wireInfo(info.accounts) } };
+    if (exFlag(rec.data, "accounts")) _ms3.example = true;
+    const ia = _ms3.items.accounts;
+    if (_ms3.accounts || _ms3.defaultAccount || _ms3.example || ia.since || Object.keys(ia.ms).length || Object.keys(ia.gone).length
+      || V3_KEYS.some(k => hasField(rec.data, k))) out._ms3 = _ms3;
+    return out;
   }
   // entry info of a server row: trusted under the same rule as its field stamps (_ms.at = client_updated_ms)
   function rowEntries(raw, data, fieldMs, cum) {
     const m = isObj(raw) && isObj(raw._ms) && raw._ms.at === cum && isObj(raw._ms.items) ? raw._ms.items : null;
+    const m3 = ms3Of(raw, cum);
     const out = {};
-    for (const k of ENTRY_KEYS) out[k] = entriesOf(k, m ? m[k] : null, data[k], fieldMs[k], exFlag(data, k), cum);
+    for (const k of ENTRY_KEYS) {
+      if (k === "accounts") out[k] = entriesOf(k, m3 && isObj(m3.items) ? m3.items.accounts : null, data[k], fieldMs[k], exFlag(data, k), m3 ? m3.at : cum);
+      else out[k] = entriesOf(k, m ? m[k] : null, data[k], fieldMs[k], exFlag(data, k), cum);
+    }
     return out;
   }
   // true when nothing in the settings is the user's own value: every field is an example or a default
-  const onlyExampleOrDefault = d => SETTINGS_KEYS.every(k => (isObj(d.example) && d.example[k] === true) || isDefaultField(k, d[k]));
+  const onlyExampleOrDefault = d => SETTINGS_KEYS.every(k => exFlag(d, k) || isDefaultField(k, d[k]));
   function stripExample(d) {
     const out = clone(d);
-    if (isObj(out.example)) for (const k of Object.keys(out.example)) if (k in SETTINGS_DEFAULTS) out[k] = clone(SETTINGS_DEFAULTS[k]);
+    for (const k of SETTINGS_KEYS) if (exFlag(d, k)) out[k] = clone(SETTINGS_DEFAULTS[k]);
     delete out.example;
-    return out;
+    return tidy(out);
   }
 
   // what the UI and backups see of a settings document (field stamps stay inside the store)
-  function publicSettings(d) { const out = clone(d); delete out._ms; delete out.goal; return out; }
+  function publicSettings(d) { const out = clone(d); delete out._ms; delete out._ms3; delete out.goal; return out; }
 
   function toTx(r) {
     const t = { id: r.id, type: r.type, amount: r.amount, category: r.category || "", note: r.note || "", date: r.date, createdAt: r.createdAt || 0 };
     const g = goalIdOf(r);
     if (g) t.goalId = g;
+    Object.assign(t, txRefs(r));
     if (r.updatedMs > 0) t.updatedAt = r.updatedMs;
     if (r.example === true) t.example = true;
     return t;
@@ -587,11 +717,15 @@
 
   /* ── Supabase rows ⇄ local records ─────────── */
   function recToRow(r, uid) {
+    const x = txRefs(r);
     return {
       user_id: uid, id: r.id, type: r.type, amount: r.amount,
       category: r.category || "", note: r.note || "", date: r.date,
       created_ms: Math.max(0, Math.round(r.createdAt || 0)),
       goal_id: goalIdOf(r),             // always sent: null clears a goal the record no longer has
+      // v3, always sent for the same reason (a project on an older schema.sql answers PGRST204: see syncError)
+      account: x.account || null, to_account: x.toAccount || null,
+      plan_id: x.plan ? x.plan.id : null, plan_n: x.plan ? x.plan.n : null, plan_of: x.plan ? x.plan.of : null,
       example: r.example === true, deleted: !!r.deleted,
       client_updated_ms: Math.max(0, Math.round(r.updatedMs || 0)),
     };
@@ -609,6 +743,9 @@
       dirty: false, localOnly: false,
     };
     if (rec.type === "saving" && typeof row.goal_id === "string" && GOAL_ID_RE.test(row.goal_id)) rec.goalId = row.goal_id;
+    // v3 columns (missing on a project with an older schema.sql); a transfer without valid accounts is kept as it is
+    Object.assign(rec, txRefs({ type: rec.type, account: row.account, toAccount: row.to_account,
+      plan: row.plan_id != null ? { id: row.plan_id, n: row.plan_n, of: row.plan_of } : null }));
     if (row.example === true) rec.example = true;
     if (!rec.deleted && !(TYPES.includes(rec.type) && rec.amount > 0 && validDate(rec.date))) return null;
     return rec;
@@ -616,8 +753,8 @@
   // a v1 document (goal) is migrated; a malformed field falls back to its default
   function settingsRowToRec(row) {
     const raw = isObj(row.data) ? row.data : {};
-    const data = settingsData(raw, false);
     const updatedMs = Number(row.client_updated_ms) || 0;
+    const data = carryExample(settingsData(raw, false), ms3Of(raw, updatedMs));
     const fieldMs = rowStamps(raw, data, updatedMs);
     return { data, fieldMs, items: rowEntries(raw, data, fieldMs, updatedMs), updatedMs, dirty: false, localOnly: false };
   }
@@ -664,8 +801,10 @@
       if (status === 429) return fail("rate", M.rate, e);
       if (code === "25006") return fail("read_only", M.serverReadOnly, e);
       if (/^53[1-4]00$/.test(code) || status === 507) return fail("quota", M.serverFull, e);
-      // a column of a newer schema is missing (transactions.goal_id): the project still has an older schema.sql
+      // a column of a newer schema is missing (transactions.goal_id, v3: account, to_account, plan_*), or the type
+      // check does not know 'transfer' yet: the project still has an older schema.sql
       if (code === "42703" || code === "PGRST204") return fail("invalid", M.oldSchema, e);
+      if (code === "23514" && /transactions_type_valid/.test(msg)) return fail("invalid", M.oldSchema, e);
       if (code === "42P01" || code === "42P10" || code === "42883" || /^PGRST20[0-9]$/.test(code) || status === 404) return fail("invalid", M.noSchema, e);
       if ([502, 503, 504, 520, 521, 522, 523, 524].includes(status)) return fail("network", M.server, e);
       if (/^(22|23)/.test(code) || status === 400 || status === 409) return fail("invalid", M.serverRejected, e);
@@ -1015,6 +1154,10 @@
         }
       }
       if (destroyed) return;
+      // The one-time upgrade write may fail (a full disk): the data stays readable as it is (the v2 store's start-up
+      // only read it), and doSync does the upgrade before it pulls or pushes anything.
+      try { await upgradeData(); } catch (e) { /* retried by doSync and on the next start */ }
+      if (destroyed) return;
       status = "ready";
       scheduleEmit();
       setupBroadcast();
@@ -1040,6 +1183,24 @@
           st.settings = { data: settingsData(data.settings, false), fieldMs: Object.assign({}, ZERO_MS), updatedMs: 0, dirty: false, localOnly: true };
         }
         st.meta.seeded = true;
+      });
+    }
+    // Data an older store version left in this IndexedDB (v2: before accounts, transfers and installments). The v2
+    // store skipped transfer rows and dropped the account and plan of the rows it pulled, and its cursors are past
+    // them: the next pull reads every row and the settings row again (meta.fullPull). Until that pull is done, every
+    // record here is a copy without the v3 columns: they are marked legacy, also when they are changed meanwhile
+    // (writeTx keeps the mark), and a changed one takes them from the server's row in that pull (mergeRows), so the
+    // push, which sends every column, does not clear them. The pull ends by dropping the marks.
+    function upgradeData() {
+      if (S.meta.version >= STORE_VERSION) return Promise.resolve();
+      return commit(ALL, st => {
+        if (st.meta.version >= STORE_VERSION) return;
+        for (const id of Object.keys(st.tx)) {
+          const r = st.tx[id];
+          if (isObj(r) && !r.localOnly) st.tx[id] = Object.assign({}, r, { legacy: true });
+        }
+        st.meta.fullPull = true;
+        st.meta.version = STORE_VERSION;
       });
     }
     async function migrateLocalFallback() {
@@ -1102,6 +1263,7 @@
         }
         const localOnly = fields.example === true && (!prev || !!prev.localOnly);
         st.tx[key] = Object.assign({ id: key }, fields, { deleted: false, updatedMs: bumpMs(t, prev), dirty: !localOnly, localOnly });
+        if (prev && prev.legacy && !localOnly) st.tx[key].legacy = true;   // edited from a copy without the v3 fields (see upgradeData)
         return key;
       });
       afterWrite();
@@ -1380,11 +1542,18 @@
               // fields left at their defaults on a device that was not signed in never override the account's values
               const ms = fieldStamps(s);
               for (const k of SETTINGS_KEYS) if (isDefaultField(k, s.data[k])) ms[k] = 0;
+              // v3: app.js writes the implicit default account a_main out as the default with the first account:
+              // that says nothing about the account's choice
+              if (s.data.defaultAccount === "a_main") ms.defaultAccount = 0;
               s.fieldMs = ms;
-              // goals and categories of this device join the account's (entry by entry): what was deleted or never
-              // held here says nothing about the account's entries (no tombstones, since 0)
+              // goals, categories and accounts of this device join the account's (entry by entry): what was deleted
+              // or never held here says nothing about the account's entries (no tombstones, since 0)
               s.items = entryInfo(s);
               for (const k of ENTRY_KEYS) { s.items[k].since = 0; s.items[k].gone = {}; }
+              // a_main has the same id on every device (app.js writes the implicit default account out with the first
+              // account): this device's copy with no opening of its own never beats the account's
+              const main = Array.isArray(s.data.accounts) ? s.data.accounts.find(a => a.id === "a_main") : null;
+              if (main && !main.opening && own(s.items.accounts.ms, "a_main")) s.items.accounts.ms.a_main = 0;
               s.dirty = true;
             }
           }
@@ -1472,6 +1641,7 @@
       try {
         await SY.adoptChain;
         await boot();
+        await upgradeData();                       // nothing is pulled or pushed before it is done (see start)
         ensureAlive(uid, gen);
         const first = !S.meta.cursorTx;
         const remote = await pull(client, uid, gen);
@@ -1522,7 +1692,8 @@
     async function pull(client, uid, gen) {
       const out = { hasData: false, again: false };
       const cursor = S.meta.cursorTx;
-      const lower = cursor ? tsShift(cursor, -OVERLAP_MS) : EPOCH;   // fixed lower bound for every page
+      const full = S.meta.fullPull;                                  // once after an update of the store (upgradeData)
+      const lower = cursor && !full ? tsShift(cursor, -OVERLAP_MS) : EPOCH;   // fixed lower bound for every page
       const seen = new Set();
       let offset = 0, maxTs = cursor;
       for (;;) {
@@ -1551,16 +1722,23 @@
       ensureAlive(uid, gen);
       const sres = await client.from("budget_settings").select("*")
         .eq("user_id", uid)
-        .gt("updated_at", sCursor ? tsShift(sCursor, -OVERLAP_MS) : EPOCH);
+        .gt("updated_at", sCursor && !full ? tsShift(sCursor, -OVERLAP_MS) : EPOCH);
       if (!sres || sres.error) throw { res: sres || {} };
       const srow = Array.isArray(sres.data) && sres.data.length ? sres.data[0] : null;
       if (srow) out.hasData = true;
       ensureAlive(uid, gen);
-      await commit(["settings", "meta"], st => {
+      await commit(full ? ALL : ["settings", "meta"], st => {
         if (st.meta.userId !== uid) return;
-        if (srow) mergeSettingsRow(st, srow);
+        if (srow) mergeSettingsRow(st, srow, !sCursor);
         st.meta.cursorTx = nextCursor;
         st.meta.cursorSettings = srow && tsLater(srow.updated_at, sCursor) ? srow.updated_at : sCursor || EPOCH;
+        if (full && !out.again) {                  // every row was read: the records are no copies of v2 any more
+          st.meta.fullPull = false;
+          for (const id of Object.keys(st.tx)) {
+            const r = st.tx[id];
+            if (isObj(r) && r.legacy) { const c = Object.assign({}, r); delete c.legacy; st.tx[id] = c; }
+          }
+        }
       });
       return out;
     }
@@ -1573,18 +1751,42 @@
         const cur = st.tx[rec.id];
         // tombstones are kept even for records this device never had: a later backup import must not bring them back
         if (!cur) { st.tx[rec.id] = rec; continue; }
-        if (!cur.localOnly && cur.dirty && cur.updatedMs > rec.updatedMs) continue;
-        if (!cur.localOnly && !cur.dirty && cur.updatedMs === rec.updatedMs && !!cur.deleted === rec.deleted) continue;
+        if (!cur.localOnly && cur.dirty && cur.updatedMs > rec.updatedMs) {
+          if (cur.legacy) st.tx[rec.id] = adoptRefs(cur, rec);    // see upgradeData
+          continue;
+        }
+        // the same version: kept unless it differs (a record the v2 store pulled without the v3 columns)
+        if (!cur.localOnly && !cur.dirty && cur.updatedMs === rec.updatedMs && !!cur.deleted === rec.deleted && sameJson(toTx(cur), toTx(rec))) continue;
         st.tx[rec.id] = rec;
       }
     }
-    // per field: the value changed last wins (see fieldStamps); a union that differs from the server's copy is pushed
-    function mergeSettingsRow(st, row) {
+    // a change the v2 store made (it never saw account, toAccount, plan) with the server's values of them, as far as
+    // they fit its type (a split part turned into an income keeps its account, not the plan)
+    function adoptRefs(cur, rec) {
+      const out = Object.assign({}, cur);
+      delete out.legacy;
+      if (cur.type === "transfer") return out;   // made a transfer here since (v2 had none): its accounts were chosen then
+      return Object.assign(out, txRefs({ type: cur.type, account: rec.account, toAccount: rec.toAccount, plan: rec.plan }));
+    }
+    // per field: the value changed last wins (see fieldStamps); a union that differs from the server's copy is pushed.
+    // first: the first settings row since this device signed in (its cursor is reset then, see doAdopt)
+    function mergeSettingsRow(st, row, first) {
       const remote = settingsRowToRec(row);
       const cur = st.settings;
       if (!cur) { st.settings = remote; return; }
       if (!cur.localOnly && !cur.dirty && cur.updatedMs === remote.updatedMs) return;   // our own write coming back
-      const m = mergeFields(docOf(remote), docOf(cur));
+      let rdoc = docOf(remote);
+      // Signing in with accounts made on this device before: an account whose document never held accounts has the
+      // implicit a_main holding its startBalance. It joins as an entry stamped like that startBalance, so it beats
+      // this device's a_main that never got an opening (doAdopt), and the start balance is not lost: the merged list
+      // holds both sides' accounts, so startBalance becomes their net opening (mergeFields).
+      const joining = first && !cur.localOnly && Array.isArray(cur.data.accounts) && !exFlag(cur.data, "accounts");
+      if (joining && !Array.isArray(remote.data.accounts) && remote.fieldMs.accounts === 0 && !exFlag(remote.data, "startBalance")) {
+        const main = Object.assign({}, IMPLICIT_MAIN, { opening: remote.data.startBalance || 0 });
+        rdoc = { data: Object.assign({}, rdoc.data, { accounts: [main] }), ms: rdoc.ms,
+          items: Object.assign({}, rdoc.items, { accounts: { since: 0, ms: { a_main: rdoc.ms.startBalance }, gone: {} } }) };
+      }
+      const m = mergeFields(rdoc, docOf(cur));   // the merged accounts' net opening becomes startBalance (keepNetOpening)
       if (sameSettings(m.data, remote.data)) { st.settings = remote; return; }
       // keep the local stamp when the local copy is the result and already newer; otherwise outdate both copies
       const keep = !cur.localOnly && cur.updatedMs > remote.updatedMs && sameSettings(m.data, cur.data);
@@ -1638,7 +1840,7 @@
     function parseBackup(data) {
       if (typeof data === "string") { try { data = JSON.parse(data); } catch (e) { throw fail("invalid", M.notBackup); } }
       if (!isObj(data) || data.app !== "budget" || !Array.isArray(data.tx)) throw fail("invalid", M.notBackup);
-      if (data.version !== 1 && data.version !== BACKUP_VERSION) throw fail("invalid", finite(data.version) && data.version > BACKUP_VERSION ? M.backupVersion : M.notBackup);
+      if (![1, 2, BACKUP_VERSION].includes(data.version)) throw fail("invalid", finite(data.version) && data.version > BACKUP_VERSION ? M.backupVersion : M.notBackup);
       const t = now();
       const items = data.tx.map((raw, i) => {
         try {
@@ -1653,22 +1855,28 @@
       });
       let settings = null;
       const rawSettings = data.settings;
+      // a file of the v2 app holds the v3 fields it carried along from a server row together with that row's _ms3
+      // (see normSettingsRec): their stamps come from there, not from the file's settingsUpdatedAt
+      const m3 = data.version < 3 ? ms3Of(rawSettings, t) : null;
       if (rawSettings != null) {
-        try { settings = settingsData(rawSettings, true); } catch (e) { throw fail("invalid", M.backupSettings); }   // v1: goal → goals
+        try { settings = carryExample(settingsData(rawSettings, true), m3); } catch (e) { throw fail("invalid", M.backupSettings); }   // v1: goal → goals
       }
       const sts = finite(data.settingsUpdatedAt) && data.settingsUpdatedAt > 0 ? Math.min(Math.round(data.settingsUpdatedAt), t) : null;
       // per-field stamps (written since they exist); older files: every field counts as changed at settingsUpdatedAt.
       // A file with no stamps at all (made by hand or by another tool) is older than every value the user set here,
       // but its own values still beat an example, a default or no settings at all (stamp 0): they get UNTIMED_MS.
-      // A field the file does not hold at all (categories in a v1 file) is not imported (-1); v1 files stamp the
-      // goal as goal, which applies to goals.
+      // A field the file does not hold at all (categories in a v1 file, accounts in a v2 file) is not imported (-1),
+      // except a v3 field that a v3 file stamps (accounts, defaultAccount are left out once cleared); v1 files stamp
+      // the goal as goal, which applies to goals.
       const fms = isObj(data.settingsFieldsUpdatedAt) ? data.settingsFieldsUpdatedAt : {};
       const stamp = v => finite(v) && v >= 0;
       const settingsMs = {};
       for (const k of SETTINGS_KEYS) {
         let v = fms[k];
         if (k === "goals" && !stamp(v) && settings && !Array.isArray(rawSettings.goals)) v = fms.goal;
-        settingsMs[k] = !settings || !hasField(rawSettings, k) ? -1
+        if (!stamp(v) && m3 && V3_KEYS.includes(k) && m3Stamp(m3, k) >= 0) v = m3Stamp(m3, k);
+        const holds = hasField(rawSettings, k) || (data.version >= 3 && V3_KEYS.includes(k) && stamp(v));
+        settingsMs[k] = !settings || !holds ? -1
           : stamp(v) ? Math.min(Math.round(v), t)
           : sts || (!isDefaultField(k, settings[k]) ? UNTIMED_MS : 0);
       }
@@ -1678,9 +1886,10 @@
       const fis = isObj(data.settingsItemsUpdatedAt) ? data.settingsItemsUpdatedAt : {};
       const settingsItems = {};
       for (const k of ENTRY_KEYS) {
-        settingsItems[k] = settings && settingsMs[k] > UNTIMED_MS ? entriesOf(k, fis[k], settings[k], settingsMs[k], exFlag(settings, k), t) : null;
+        const raw = k === "accounts" && !isObj(fis.accounts) && m3 && isObj(m3.items) ? m3.items.accounts : fis[k];
+        settingsItems[k] = settings && settingsMs[k] > UNTIMED_MS ? entriesOf(k, raw, settings[k], settingsMs[k], exFlag(settings, k), t) : null;
       }
-      return { items, settings, settingsTs: sts, settingsMs, settingsItems };
+      return { items, settings, settingsTs: sts, settingsMs, settingsItems, version: data.version };
     }
     function importInto(st, parsed) {
       let added = 0, updated = 0, skipped = 0, settingsUpdated = false;
@@ -1696,7 +1905,13 @@
         const cur = st.tx[it.id];
         // records without a timestamp count as older than anything already here
         if (cur && (it.ts == null || it.ts <= (cur.updatedMs || 0))) { skipped++; continue; }
-        st.tx[it.id] = Object.assign({ id: it.id }, it.fields, { deleted: false, updatedMs: it.ts || 0, dirty: true, localOnly: false });
+        // Files of versions 1 and 2 never hold account, toAccount and plan (the app that made them did not know them):
+        // the record keeps this device's, as far as they fit its type, and is marked legacy, so the next pull, which
+        // reads every row again, gives a record this device holds without them the server's (see upgradeData)
+        const old = parsed.version < 3;
+        const refs = old && cur && it.fields.type !== "transfer" ? txRefs({ type: it.fields.type, account: cur.account, plan: cur.plan }) : {};
+        st.tx[it.id] = Object.assign({ id: it.id }, refs, it.fields, { deleted: false, updatedMs: it.ts || 0, dirty: true, localOnly: false });
+        if (old) { st.tx[it.id].legacy = true; st.meta.fullPull = true; }
         if (!cur || cur.deleted) added++; else updated++;
       }
       if (parsed.settings) {
@@ -1731,7 +1946,7 @@
       async import(data) {
         const parsed = parseBackup(data);
         await boot();
-        const res = await commit(["tx", "settings"], st => importInto(st, parsed));
+        const res = await commit(ALL, st => importInto(st, parsed));
         afterWrite();
         return res;
       },
@@ -1809,7 +2024,7 @@
         await commit(ALL, st => {
           st.tx = {};
           st.settings = null;
-          st.meta = Object.assign(normMeta(null), { seeded: true });
+          st.meta = Object.assign(normMeta(null), { seeded: true, version: STORE_VERSION });
         });
         SY.error = null;
         SY.phase = "off";

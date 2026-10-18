@@ -7,8 +7,11 @@
 //     row (the trigger returns NULL), an equal one is applied again;
 //   * RLS: a signed-in user reads and writes only rows with user_id = auth.uid();
 //     the anon role gets nothing;
-//   * check constraints of the schema (type, amount, date range, id format, goal_id format,
-//     settings document size measured like octet_length(data::text) of jsonb, …);
+//   * check constraints of the schema (type, amount, date range, id format, goal_id format, v3 account /
+//     to_account / plan columns, settings document size measured like octet_length(data::text) of jsonb, …),
+//     evaluated like Postgres on the row an upsert would insert and on the row its update would leave
+//     (an update only sets the columns the request names; the others keep their values);
+//   * an older schema.sql (v1: no goal_id; v2: no account / to_account / plan_* columns and no 'transfer' type);
 //   * realtime postgres_changes events to subscribed channels (filter user_id=eq.<uid>).
 // It can simulate network failure (whole server or one device), lost responses,
 // rate limits, unconfirmed e-mail, revoked sessions and late-committed rows.
@@ -23,7 +26,11 @@ export const FAKE_URL = "https://fake.supabase.co";
 export const FAKE_ANON_KEY = "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ role: "anon", iss: "supabase" })).toString("base64url") + ".c2lnbmF0dXJl";
 export const FAKE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ role: "service_role" })).toString("base64url") + ".c2lnbmF0dXJl";
 
-const TX_COLS = ["user_id", "id", "type", "amount", "category", "note", "date", "created_ms", "goal_id", "example", "deleted", "client_updated_ms", "updated_at"];
+const TX_COLS = ["user_id", "id", "type", "amount", "category", "note", "date", "created_ms", "goal_id", "account", "to_account", "plan_id", "plan_n", "plan_of", "example", "deleted", "client_updated_ms", "updated_at"];
+// columns added by the v3 schema.sql (accounts, transfers, installments)
+const V3_COLS = ["account", "to_account", "plan_id", "plan_n", "plan_of"];
+const TX_TYPES = ["income", "expense", "saving", "transfer"];
+const REF_RE = /^[A-Za-z0-9_-]{1,32}$/;
 export const SETTINGS_MAX_BYTES = 65536;   // schema: budget_settings_data_size
 
 // A JSON value as Postgres prints jsonb (data::text): keys sorted by length then bytes, ", " and ": " separators,
@@ -85,6 +92,8 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
     backdateNextMs: 0,           // next write gets updated_at this far in the past (a long transaction)
     settingsMaxBytes: SETTINGS_MAX_BYTES,   // budget_settings_data_size (an older schema.sql had 32768)
     noGoalIdColumn: false,       // the project still runs an older schema.sql (no transactions.goal_id)
+    noV3Columns: false,          // the project still runs the v2 schema.sql (no account, to_account, plan_id, plan_n, plan_of)
+    noTransferType: false,       // the type check of the v2 schema.sql (income, expense, saving only)
     refreshRetryMs: 0,           // how long getSession() keeps retrying an expired session's refresh offline
     hooks: { beforeUpsert: null, beforeSelect: null },
     changeListeners: new Set(),  // (table, [{ eventType, row, old }]) for adapters (e.g. a WebSocket mock)
@@ -137,19 +146,44 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
   function checkTx(r) {
     const bad = name => pgErr(400, "23514", `new row for relation "transactions" violates check constraint "${name}"`);
     if (typeof r.id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(r.id)) return bad("transactions_id_format");
-    if (r.type != null && !["income", "expense", "saving"].includes(r.type)) return bad("transactions_type_valid");
+    if (r.type != null && !(server.noTransferType ? TX_TYPES.slice(0, 3) : TX_TYPES).includes(r.type)) return bad("transactions_type_valid");
     if (r.amount != null && !(typeof r.amount === "number" && r.amount > 0 && r.amount < 1e10)) return bad("transactions_amount_range");
     if (r.category != null && String(r.category).length > 32) return bad("transactions_category_length");
     if (r.note != null && String(r.note).length > 200) return bad("transactions_note_length");
     if (r.date != null && !validDate(r.date)) return pgErr(400, "22008", `date/time field value out of range: "${r.date}"`);
     if (!(Number(r.created_ms ?? 0) >= 0 && Number(r.client_updated_ms ?? 0) >= 0)) return bad("transactions_ms_range");
     if (r.goal_id != null && !(typeof r.goal_id === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(r.goal_id))) return bad("transactions_goal_id_format");
-    for (const k of ["id", "category", "note", "goal_id"]) {
+    for (const k of ["id", "category", "note", "goal_id", "account", "to_account", "plan_id"]) {
       if (typeof r[k] === "string" && (r[k].includes("\u0000") || !r[k].isWellFormed())) return pgErr(400, "22P05", "unsupported Unicode escape sequence");
     }
     if (!r.deleted && (r.type == null || r.amount == null || r.date == null)) return bad("transactions_live_row_complete");
+    // v3 (a CHECK fails only on false: NULL passes, as in Postgres)
+    for (const k of ["account", "to_account", "plan_id"]) {
+      if (r[k] != null && !(typeof r[k] === "string" && REF_RE.test(r[k]))) return bad(`transactions_${k}_format`);
+    }
+    if (r.to_account != null && r.type != null && r.type !== "transfer") return bad("transactions_to_account_transfer_only");
+    if (!r.deleted && r.type === "transfer" && !(r.account != null && r.to_account != null && r.account !== r.to_account)) return bad("transactions_transfer_accounts");
+    if ((r.plan_id == null) !== (r.plan_n == null) || (r.plan_id == null) !== (r.plan_of == null)) return bad("transactions_plan_complete");
+    for (const k of ["plan_n", "plan_of"]) {
+      if (r[k] != null && !Number.isInteger(r[k])) return pgErr(400, "22P02", `invalid input syntax for type smallint: "${r[k]}"`);
+    }
+    if (r.plan_of != null && !(r.plan_of >= 2 && r.plan_of <= 36 && r.plan_n >= 1 && r.plan_n <= r.plan_of)) return bad("transactions_plan_range");
+    if (r.plan_id != null && r.type != null && r.type !== "expense") return bad("transactions_plan_expense_only");
     if ("updated_at" in r) return null;   // the trigger overwrites it anyway
     return null;
+  }
+
+  const txBase = (uid, id) => ({ user_id: uid, id, type: null, amount: null, category: "", note: "", date: null, created_ms: 0, goal_id: null,
+    account: null, to_account: null, plan_id: null, plan_n: null, plan_of: null, example: false, deleted: false, client_updated_ms: 0 });
+  // the rows Postgres checks for one upsert of r: the row it would insert (column defaults + r, after the trigger's
+  // coalesce) and, when a row with that key exists and the write is not older, the row the update leaves
+  function rowsToCheck(r, uid) {
+    const user = r.user_id ?? uid;
+    const fill = x => ({ ...x, category: x.category ?? "", note: x.note ?? "", example: x.example ?? false, deleted: x.deleted ?? false, created_ms: x.created_ms ?? 0 });
+    const out = [fill({ ...txBase(user, r.id), ...r })];
+    const old = server.tables.transactions.get(`${user}|${r.id}`);
+    if (old && !(Number(r.client_updated_ms ?? 0) < Number(old.client_updated_ms))) out.push(fill({ ...old, ...r }));
+    return out;
   }
 
   function applyUpsert(table, rows, uid) {
@@ -168,7 +202,7 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
         changes.push({ eventType: "UPDATE", row: next, old });
       } else {
         const base = table === "transactions"
-          ? { user_id: r.user_id, id: r.id, type: null, amount: null, category: "", note: "", date: null, created_ms: 0, goal_id: null, example: false, deleted: false, client_updated_ms: 0 }
+          ? txBase(r.user_id, r.id)
           : { user_id: r.user_id, data: {}, client_updated_ms: 0 };
         const next = { ...base, ...r, updated_at: server.stamp() };
         if (table === "transactions") { next.category ??= ""; next.note ??= ""; next.example ??= false; next.deleted ??= false; next.created_ms ??= 0; }
@@ -204,6 +238,7 @@ export function createFakeSupabase({ url = FAKE_URL, anonKey = FAKE_ANON_KEY, re
 
   server._applyUpsert = applyUpsert;
   server._checkTx = checkTx;
+  server._rowsToCheck = rowsToCheck;
   return server;
 }
 
@@ -300,7 +335,13 @@ class Query {
       const total = rows.length;
       if (this.rangeV) rows = rows.slice(this.rangeV[0], this.rangeV[1] + 1);
       s.log.push({ op: "select", table: this.table, uid, range: this.rangeV, n: rows.length, filters: this.filters.map(f => [...f]) });
-      return { data: rows.map(r => ({ ...r })), error: null, count: this.selectOpts?.count ? total : null, status: 200, statusText: "OK" };
+      const shape = r => {
+        const o = { ...r };
+        if (this.table === "transactions" && s.noV3Columns) for (const k of V3_COLS) delete o[k];
+        if (this.table === "transactions" && s.noGoalIdColumn) delete o.goal_id;
+        return o;
+      };
+      return { data: rows.map(shape), error: null, count: this.selectOpts?.count ? total : null, status: 200, statusText: "OK" };
     }
 
     if (this.op === "upsert") {
@@ -314,7 +355,9 @@ class Query {
         if ("updated_at" in r) return pgErr(400, "FAKE1", "client must not send updated_at");
         if (this.table === "transactions") {
           if (s.noGoalIdColumn && "goal_id" in r) return pgErr(400, "PGRST204", "Could not find the 'goal_id' column of 'transactions' in the schema cache");
-          const e = s._checkTx(r); if (e) return e;
+          const missing = s.noV3Columns && Object.keys(r).find(k => V3_COLS.includes(k));
+          if (missing) return pgErr(400, "PGRST204", `Could not find the '${missing}' column of 'transactions' in the schema cache`);
+          for (const row of s._rowsToCheck(r, uid)) { const e = s._checkTx(row); if (e) return e; }
         }
         else if (!r.data || typeof r.data !== "object" || Array.isArray(r.data)) return pgErr(400, "23514", 'violates check constraint "budget_settings_data_object"');
         else {
@@ -495,4 +538,4 @@ class FakeAuth {
   async stopAutoRefresh() { this.stopped = true; }
 }
 
-export { tsUs, fmtUs, TX_COLS };
+export { tsUs, fmtUs, TX_COLS, V3_COLS };

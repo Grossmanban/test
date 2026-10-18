@@ -9,7 +9,11 @@
 -- Contract (docs/ARCHITECTURE.md, store-pwa.js):
 --   * public.transactions    one row per transaction, PK (user_id, id),
 --                            deletions are tombstones (deleted = true);
---                            goal_id = the goal a saving went to (NULL = the first goal)
+--                            goal_id = the goal a saving went to (NULL = the first goal);
+--                            account = the account it touches (a transfer's source,
+--                            NULL = the default account), to_account = a transfer's
+--                            destination, plan_id/plan_n/plan_of = part n of `of` of
+--                            one split purchase (installments)
 --   * public.budget_settings one jsonb document per user, PK user_id
 --                            ({ startBalance, goals, limits, categories, _ms })
 --   * updated_at is stamped by the server (clock_timestamp()) on every
@@ -30,7 +34,7 @@ create table if not exists public.transactions (
   user_id           uuid          not null default auth.uid()
                                   references auth.users (id) on delete cascade,
   id                text          not null,
-  type              text,                     -- 'income' | 'expense' | 'saving'
+  type              text,                     -- 'income' | 'expense' | 'saving' | 'transfer'
   amount            numeric(14,2),            -- shekels (ILS), > 0
   category          text          not null default '',
   note              text          not null default '',
@@ -56,12 +60,31 @@ create table if not exists public.budget_settings (
 -- with an older schema.sql; the existing rows get NULL (= the first goal).
 alter table public.transactions add column if not exists goal_id text;
 
+-- Added in v3 (accounts, transfers, cards, installments). Existing rows get NULL in
+-- all five: the default account, not a transfer, not part of a split purchase.
+alter table public.transactions
+  add column if not exists account    text,
+  add column if not exists to_account text,
+  add column if not exists plan_id    text,
+  add column if not exists plan_n     smallint,
+  add column if not exists plan_of    smallint;
+
 comment on table public.transactions is
-  'Money honey: операции (доходы, расходы, копилка). Удаление = deleted:true.';
+  'Money honey: операции (доходы, расходы, копилка, переводы между счетами). Удаление = deleted:true.';
 comment on table public.budget_settings is
   'Money honey: настройки пользователя (стартовый баланс, цели, лимиты, свои категории).';
 comment on column public.transactions.goal_id is
   'Saving operations: id of the goal (settings.goals[].id) the money went to. NULL = the first goal.';
+comment on column public.transactions.account is
+  'Id of the account (settings.accounts[].id) the operation touches; a transfer''s source. NULL = the default account.';
+comment on column public.transactions.to_account is
+  'Transfers only: id of the destination account (differs from account).';
+comment on column public.transactions.plan_id is
+  'Split purchase (installments): id shared by all its parts. plan_id, plan_n, plan_of are set together or not at all.';
+comment on column public.transactions.plan_n is
+  'Split purchase: number of this part, 1 .. plan_of.';
+comment on column public.transactions.plan_of is
+  'Split purchase: number of parts, 2 .. 36.';
 comment on column public.transactions.updated_at is
   'Server time of the last accepted write (trigger, clock_timestamp()). Sync cursor.';
 comment on column public.transactions.client_updated_ms is
@@ -72,7 +95,10 @@ comment on column public.transactions.client_updated_ms is
 --
 -- type / amount / date may be NULL only on tombstones (deleted = true), so a
 -- minimal tombstone push {user_id, id, deleted, client_updated_ms} never gets
--- stuck; live rows must be complete.
+-- stuck; live rows must be complete. Likewise a transfer needs both accounts
+-- only while it is live. Format and range checks apply to every row.
+-- A CHECK fails only on false, so NULL in account / to_account / plan_* passes
+-- the v3 checks: rows written with an older schema (no account, no plan) stay valid.
 -- ---------------------------------------------------------------------
 
 alter table public.transactions
@@ -85,10 +111,18 @@ alter table public.transactions
   drop constraint if exists transactions_ms_range,
   drop constraint if exists transactions_goal_id_format,
   drop constraint if exists transactions_live_row_complete,
+  drop constraint if exists transactions_account_format,
+  drop constraint if exists transactions_to_account_format,
+  drop constraint if exists transactions_to_account_transfer_only,
+  drop constraint if exists transactions_transfer_accounts,
+  drop constraint if exists transactions_plan_id_format,
+  drop constraint if exists transactions_plan_complete,
+  drop constraint if exists transactions_plan_range,
+  drop constraint if exists transactions_plan_expense_only,
   add constraint transactions_id_format
     check (char_length(id) between 1 and 64 and id ~ '^[A-Za-z0-9_-]+$'),
   add constraint transactions_type_valid
-    check (type in ('income', 'expense', 'saving')),
+    check (type in ('income', 'expense', 'saving', 'transfer')),
   add constraint transactions_amount_range
     check (amount > 0 and amount < 1e10),
   add constraint transactions_category_length
@@ -102,7 +136,26 @@ alter table public.transactions
   add constraint transactions_goal_id_format
     check (goal_id ~ '^[A-Za-z0-9_-]{1,32}$'),
   add constraint transactions_live_row_complete
-    check (deleted or (type is not null and amount is not null and date is not null));
+    check (deleted or (type is not null and amount is not null and date is not null)),
+  -- v3: accounts and transfers (ids like goal_id: settings.accounts[].id)
+  add constraint transactions_account_format
+    check (account ~ '^[A-Za-z0-9_-]{1,32}$'),
+  add constraint transactions_to_account_format
+    check (to_account ~ '^[A-Za-z0-9_-]{1,32}$'),
+  add constraint transactions_to_account_transfer_only
+    check (to_account is null or type = 'transfer'),
+  add constraint transactions_transfer_accounts
+    check (deleted or type is distinct from 'transfer'
+           or (account is not null and to_account is not null and account <> to_account)),
+  -- v3: installments, part plan_n of plan_of of one split purchase (expenses only)
+  add constraint transactions_plan_id_format
+    check (plan_id ~ '^[A-Za-z0-9_-]{1,32}$'),
+  add constraint transactions_plan_complete
+    check ((plan_id is null) = (plan_n is null) and (plan_id is null) = (plan_of is null)),
+  add constraint transactions_plan_range
+    check (plan_of between 2 and 36 and plan_n between 1 and plan_of),
+  add constraint transactions_plan_expense_only
+    check (plan_id is null or type = 'expense');
 
 alter table public.budget_settings
   drop constraint if exists budget_settings_data_object,
@@ -110,8 +163,10 @@ alter table public.budget_settings
   drop constraint if exists budget_settings_ms_range,
   add constraint budget_settings_data_object
     check (jsonb_typeof(data) = 'object'),
-  -- 64 KB: the app keeps a document (20 goals, 60 categories, limits, field
-  -- stamps) under 60 000 bytes of this measure; the rest is headroom
+  -- 64 KB: the app refuses a document over 55 000 bytes of this measure (20
+  -- goals, 60 categories, 100 limits, 20 accounts fit in ~35 KB); the stamps it
+  -- adds when pushing (_ms, _ms3) take at most 9 829 bytes, so a push is at
+  -- most 64 829
   add constraint budget_settings_data_size
     check (octet_length(data::text) <= 65536),
   add constraint budget_settings_ms_range

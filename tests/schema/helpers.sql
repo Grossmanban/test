@@ -31,6 +31,24 @@ begin
               got is not distinct from state);
 end $$;
 
+-- The statement must fail with check_violation (23514) raised by the named constraint
+-- (the name the client sees in the PostgREST error message).
+create function t.violates(name text, stmt text, conname text) returns text language plpgsql as $$
+declare
+  got text;
+  con text;
+  msg text;
+begin
+  begin
+    execute stmt;
+  exception when others then
+    get stacked diagnostics got = returned_sqlstate, con = constraint_name, msg = message_text;
+  end;
+  return t.ok(format('%s [want 23514 %s, got %s]', name, conname,
+                     coalesce(got || ' ' || coalesce(nullif(con, ''), msg), 'success')),
+              got = '23514' and con = conname);
+end $$;
+
 -- The statement must succeed and affect exactly n rows.
 create function t.affects(name text, stmt text, n bigint) returns text language plpgsql as $$
 declare
